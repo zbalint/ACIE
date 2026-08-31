@@ -23,6 +23,16 @@ both recommended options chosen):
    content snapshot (history()'s last entry), tagged `deleted: true`. Only
    entry zero carries this key; older entries don't.
 
+**Follow-up resolved post-shipment** (AskUserQuestion, recommended option
+chosen): unlike every other tool, explain's `full` toggle does NOT gate
+confidence/provenance -- those fields are always present, even at the
+default `full=False`, because they're the substance of what explain exists
+to show (how a fact's certainty/source changed across observations), not a
+secondary annotation like they are for the other 7 tools. The `full`
+parameter is kept in the signature for interface consistency with the rest
+of the tool surface, but is currently inert here (nothing else in explain's
+output is gated by it).
+
 **Local decision, not asked about**: `_symbol_entries`/`_edge_entries` are
 structurally parallel (live-or-tombstoned-fallback, then reversed history)
 but operate on different domain objects (Symbol vs Relation) with
@@ -58,10 +68,13 @@ def explain(
 
     index_generation = index_meta_store.current_generation()
 
+    # full is accepted for interface consistency with the other 7 tools but
+    # is inert here: explain always reveals confidence/provenance, since
+    # they're explain's whole point rather than a secondary annotation.
     entries = (
-        _symbol_entries(symbol_store, symbol_id, full=full)
+        _symbol_entries(symbol_store, symbol_id)
         if symbol_id is not None
-        else _edge_entries(relation_store, edge_ref, full=full)
+        else _edge_entries(relation_store, edge_ref)
     )
 
     after_key = None
@@ -85,7 +98,7 @@ def explain(
     }
 
 
-def _symbol_entries(symbol_store: SymbolStore, symbol_id: str, *, full: bool) -> list[tuple[tuple, dict]]:
+def _symbol_entries(symbol_store: SymbolStore, symbol_id: str) -> list[tuple[tuple, dict]]:
     live = symbol_store.get(symbol_id)
     history = symbol_store.history(symbol_id)
 
@@ -94,24 +107,24 @@ def _symbol_entries(symbol_store: SymbolStore, symbol_id: str, *, full: bool) ->
 
     entries: list[tuple[tuple, dict]] = []
     if live is not None:
-        entries.append((_symbol_key(live), render_symbol(live, full=full)))
+        entries.append((_symbol_key(live), render_symbol(live, full=True)))
         history = history[:-1] if history else history
     else:
         # Tombstoned: no live row, so the most recent history entry stands
         # in for entry zero, tagged deleted.
         deleted_snapshot = history[-1]
-        item = render_symbol(deleted_snapshot, full=full)
+        item = render_symbol(deleted_snapshot, full=True)
         item["deleted"] = True
         entries.append((_symbol_key(deleted_snapshot), item))
         history = history[:-1]
 
     for symbol in history:
-        entries.append((_symbol_key(symbol), render_symbol(symbol, full=full)))
+        entries.append((_symbol_key(symbol), render_symbol(symbol, full=True)))
 
     return entries
 
 
-def _edge_entries(relation_store: RelationStore, edge_ref: dict, *, full: bool) -> list[tuple[tuple, dict]]:
+def _edge_entries(relation_store: RelationStore, edge_ref: dict) -> list[tuple[tuple, dict]]:
     key = {
         "source": edge_ref["source_symbol_id"],
         "target": edge_ref["target_symbol_id"],
@@ -128,17 +141,17 @@ def _edge_entries(relation_store: RelationStore, edge_ref: dict, *, full: bool) 
 
     entries: list[tuple[tuple, dict]] = []
     if live is not None:
-        entries.append((_relation_key(live), render_relation(live, full=full)))
+        entries.append((_relation_key(live), render_relation(live, full=True)))
         history = history[:-1] if history else history
     else:
         deleted_snapshot = history[-1]
-        item = render_relation(deleted_snapshot, full=full)
+        item = render_relation(deleted_snapshot, full=True)
         item["deleted"] = True
         entries.append((_relation_key(deleted_snapshot), item))
         history = history[:-1]
 
     for relation in history:
-        entries.append((_relation_key(relation), render_relation(relation, full=full)))
+        entries.append((_relation_key(relation), render_relation(relation, full=True)))
 
     return entries
 

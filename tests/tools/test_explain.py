@@ -98,7 +98,11 @@ def test_explain_deleted_symbol_returns_history_tagged_deleted_not_symbol_not_fo
     assert envelope["results"][0]["start_line"] == 1
 
 
-def test_explain_terse_by_default_hides_confidence_and_provenance():
+def test_explain_always_reveals_confidence_and_provenance_even_when_terse():
+    # Unlike every other tool, explain's whole point is showing how a
+    # fact's confidence/provenance changed across observations -- so unlike
+    # the blanket terse/full rule, these fields are never hidden here, even
+    # at the default full=False. See ARCHITECTURE.md "MCP Tool Surface".
     symbol_store, relation_store, index_meta_store = _stores()
     foo = _symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function", line=1)
     symbol_store.upsert(foo)
@@ -108,8 +112,8 @@ def test_explain_terse_by_default_hides_confidence_and_provenance():
         symbol_id=foo.id,
     )
 
-    assert "confidence" not in envelope["results"][0]
-    assert "provenance" not in envelope["results"][0]
+    assert envelope["results"][0]["confidence"] == "EXTRACTED"
+    assert envelope["results"][0]["provenance"]["provider"] == "tree-sitter"
 
 
 def test_explain_full_reveals_confidence_and_provenance():
