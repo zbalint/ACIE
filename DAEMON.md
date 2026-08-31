@@ -132,7 +132,7 @@ This also resolves a design gap raised earlier in planning (daemon staleness dur
 
 Not open design questions — settled in direction, but with exact values or mechanics left for implementation time rather than invented here:
 
-- The exact `DAEMON_RPC_MAX_MESSAGE_BYTES` cap value.
+- ~~The exact `DAEMON_RPC_MAX_MESSAGE_BYTES` cap value.~~ **Resolved during implementation** (Slice 1, `src/acie/daemon/protocol.py`): `MAX_MESSAGE_BYTES = 16 * 1024 * 1024` (16 MiB), enforced on both `encode_frame` (send) and `decode_length_prefix` (receive).
 - Exact auto-spawn retry/backoff timing (poll interval, max attempts before giving up with a clear error).
 - `~/.acie/daemon.log` rotation/size-management policy.
 - The idle-timeout teardown mechanics named as the write-queue's upgrade trigger, once actually needed (see "Write-Queue Concurrency").
