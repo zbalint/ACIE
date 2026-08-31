@@ -19,8 +19,9 @@ class IndexMetaStore:
     guards against, not fine-grained staleness.
     """
 
-    def __init__(self, db_path: str = ":memory:") -> None:
-        self._conn = sqlite3.connect(db_path)
+    def __init__(self, db_path: str = ":memory:", *, conn: sqlite3.Connection | None = None) -> None:
+        # See SymbolStore.__init__ for why an already-open conn is accepted.
+        self._conn = conn if conn is not None else sqlite3.connect(db_path)
         self._conn.executescript(_SCHEMA)
         self._conn.execute(
             "INSERT OR IGNORE INTO index_meta (id, generation) VALUES (0, 0)"

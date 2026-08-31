@@ -30,6 +30,22 @@ def test_upsert_then_get_round_trips_symbol():
     assert store.get(symbol.id) == symbol
 
 
+def test_conn_kwarg_reuses_an_already_open_connection_instead_of_opening_its_own():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    writer = SymbolStore(conn=conn)
+    symbol = make_symbol()
+    writer.upsert(symbol)
+
+    # A second store built on the *same* conn must see the first store's
+    # write -- proving no separate sqlite3.connect() happened under the
+    # hood (a fresh :memory: connection would see an empty db instead).
+    reader = SymbolStore(conn=conn)
+
+    assert reader.get(symbol.id) == symbol
+
+
 def test_first_upsert_creates_one_history_observation():
     store = SymbolStore(":memory:")
     symbol = make_symbol()

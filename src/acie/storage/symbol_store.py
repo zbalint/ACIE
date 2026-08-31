@@ -38,8 +38,13 @@ CREATE TABLE IF NOT EXISTS symbols_history (
 
 
 class SymbolStore:
-    def __init__(self, db_path: str = ":memory:") -> None:
-        self._conn = sqlite3.connect(db_path)
+    def __init__(self, db_path: str = ":memory:", *, conn: sqlite3.Connection | None = None) -> None:
+        # `conn`, when given, is reused as-is instead of opening a new
+        # connection -- the daemon's write-queue worker thread (see
+        # daemon/write_queue.py) opens exactly one connection per repo at
+        # thread creation and passes it to every store a queued job
+        # constructs, rather than each store opening its own.
+        self._conn = conn if conn is not None else sqlite3.connect(db_path)
         self._conn.executescript(_SCHEMA)
         # SQLite's LIKE is case-insensitive for ASCII by default -- Python
         # identifiers are case-sensitive, so search() (qualname substring

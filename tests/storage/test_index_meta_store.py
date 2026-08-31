@@ -36,3 +36,15 @@ def test_generation_persists_across_store_instances_on_the_same_db_path(tmp_path
     reopened = IndexMetaStore(db_path)
 
     assert reopened.current_generation() == 2
+
+
+def test_conn_kwarg_reuses_an_already_open_connection_instead_of_opening_its_own():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    writer = IndexMetaStore(conn=conn)
+    writer.bump_generation()
+
+    reader = IndexMetaStore(conn=conn)
+
+    assert reader.current_generation() == 1

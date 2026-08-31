@@ -31,6 +31,19 @@ def make_relation(**overrides) -> Relation:
     return Relation(**defaults)
 
 
+def test_conn_kwarg_reuses_an_already_open_connection_instead_of_opening_its_own():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    writer = RelationStore(conn=conn)
+    relation = make_relation()
+    writer.upsert(relation)
+
+    reader = RelationStore(conn=conn)
+
+    assert reader.get(**_key(relation)) == relation
+
+
 def test_upsert_then_get_round_trips_relation():
     store = RelationStore(":memory:")
     relation = make_relation()

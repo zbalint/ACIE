@@ -36,8 +36,9 @@ CREATE TABLE IF NOT EXISTS relations_history (
 
 
 class RelationStore:
-    def __init__(self, db_path: str = ":memory:") -> None:
-        self._conn = sqlite3.connect(db_path)
+    def __init__(self, db_path: str = ":memory:", *, conn: sqlite3.Connection | None = None) -> None:
+        # See SymbolStore.__init__ for why an already-open conn is accepted.
+        self._conn = conn if conn is not None else sqlite3.connect(db_path)
         self._conn.executescript(_SCHEMA)
 
     def upsert(self, relation: Relation) -> None:
