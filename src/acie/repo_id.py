@@ -24,6 +24,27 @@ def resolve_git_common_dir(repo_path: str) -> str | None:
     return os.path.realpath(resolved)
 
 
+def resolve_repo_root(repo_path: str) -> str | None:
+    """The top-level working-directory root repo_path sits inside.
+
+    Unlike resolve_git_common_dir (which collapses a worktree to the
+    shared main .git dir), this resolves to the worktree's own root when
+    repo_path is inside a worktree -- the daemon dispatch layer needs the
+    actual on-disk directory to walk for source files, not the shared
+    metadata dir. None if repo_path isn't inside a git repo.
+    """
+    result = subprocess.run(
+        ["git", "-C", repo_path, "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+
+    return os.path.realpath(result.stdout.strip())
+
+
 def resolve_repo_id(repo_path: str) -> str | None:
     common_dir = resolve_git_common_dir(repo_path)
     if common_dir is None:

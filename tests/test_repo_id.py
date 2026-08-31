@@ -5,6 +5,7 @@ from acie.repo_id import (
     resolve_git_common_dir,
     resolve_index_db_path,
     resolve_repo_id,
+    resolve_repo_root,
     resolve_repo_state_dir,
 )
 
@@ -150,3 +151,47 @@ def test_resolve_index_db_path_returns_none_for_a_directory_that_is_not_a_git_re
     base = tmp_path / "acie-home"
 
     assert resolve_index_db_path(str(plain_dir), base_dir=str(base)) is None
+
+
+def test_resolve_repo_root_returns_the_repo_path_itself_for_a_plain_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+
+    assert resolve_repo_root(str(repo)) == os.path.realpath(str(repo))
+
+
+def test_resolve_repo_root_resolves_a_subdirectory_up_to_the_top_level(tmp_path):
+    repo = tmp_path / "repo"
+    subdir = repo / "pkg" / "nested"
+    subdir.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+
+    assert resolve_repo_root(str(subdir)) == os.path.realpath(str(repo))
+
+
+def test_resolve_repo_root_resolves_to_the_worktrees_own_root_not_the_main_checkout(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(
+        ["git", "-C", str(main), "commit", "-q", "--allow-empty", "-m", "init"],
+        check=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.com",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.com"},
+    )
+    worktree = tmp_path / "wt"
+    subprocess.run(
+        ["git", "-C", str(main), "worktree", "add", str(worktree)],
+        check=True,
+    )
+
+    assert resolve_repo_root(str(worktree)) == os.path.realpath(str(worktree))
+    assert resolve_repo_root(str(main)) == os.path.realpath(str(main))
+
+
+def test_resolve_repo_root_returns_none_for_a_directory_that_is_not_a_git_repo(tmp_path):
+    plain_dir = tmp_path / "not-a-repo"
+    plain_dir.mkdir()
+
+    assert resolve_repo_root(str(plain_dir)) is None

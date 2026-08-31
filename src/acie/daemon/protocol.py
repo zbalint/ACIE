@@ -74,5 +74,10 @@ def build_success_response(request_id: str, result) -> dict:
     return {"id": request_id, "ok": True, "result": result}
 
 
-def build_error_response(request_id: str, code: str, message: str) -> dict:
-    return {"id": request_id, "ok": False, "error": {"code": code, "message": message}}
+def build_error_response(
+    request_id: str, code: str, message: str, *, details: dict | None = None
+) -> dict:
+    error = {"code": code, "message": message}
+    if details:
+        error.update(details)
+    return {"id": request_id, "ok": False, "error": error}

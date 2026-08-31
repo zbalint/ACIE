@@ -110,3 +110,15 @@ def test_build_error_response_carries_code_and_message_under_matching_id():
         "ok": False,
         "error": {"code": "UNKNOWN_METHOD", "message": "no such method: bogus"},
     }
+
+
+def test_build_error_response_merges_optional_details_into_the_error_object():
+    response = build_error_response(
+        "abc-123", "INDEX_NOT_READY", "repo not ready", details={"index_generation": 0}
+    )
+
+    assert response == {
+        "id": "abc-123",
+        "ok": False,
+        "error": {"code": "INDEX_NOT_READY", "message": "repo not ready", "index_generation": 0},
+    }
