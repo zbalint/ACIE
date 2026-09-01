@@ -99,25 +99,40 @@ class DaemonServer:
         return self._server_sock.getsockname()[1]
 
     def start(self) -> None:
-        if self._election_port is not None:
-            self._election_sock = self._bind_election_port(self._election_port)
+        server_sock: socket.socket | None = None
+        discovery_published = False
+        try:
+            if self._election_port is not None:
+                self._election_sock = self._bind_election_port(self._election_port)
 
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind((self._host, self._requested_port))
-        server_sock.listen(_ACCEPT_BACKLOG)
-        self._server_sock = server_sock
+            server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_sock.bind((self._host, self._requested_port))
+            server_sock.listen(_ACCEPT_BACKLOG)
+            self._server_sock = server_sock
 
-        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
-        self._accept_thread.start()
+            if self._discovery_path is not None:
+                write_discovery_file(
+                    self._discovery_path,
+                    service_port=self.port,
+                    auth_token=self._auth_token,
+                    daemon_pid=os.getpid(),
+                )
+                discovery_published = True
 
-        if self._discovery_path is not None:
-            write_discovery_file(
-                self._discovery_path,
-                service_port=self.port,
-                auth_token=self._auth_token,
-                daemon_pid=os.getpid(),
-            )
+            self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+            self._accept_thread.start()
+        except Exception:
+            if discovery_published and self._discovery_path is not None:
+                delete_discovery_file(self._discovery_path)
+            if server_sock is not None:
+                server_sock.close()
+            self._server_sock = None
+            self._accept_thread = None
+            if self._election_sock is not None:
+                self._election_sock.close()
+                self._election_sock = None
+            raise
 
     def _bind_election_port(self, election_port: int) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

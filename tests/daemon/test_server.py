@@ -269,6 +269,76 @@ def test_election_port_is_released_on_shutdown_so_a_new_daemon_can_start(echo_di
     second.shutdown()
 
 
+def test_start_releases_election_port_when_service_bind_fails(echo_dispatch):
+    service_port = _free_port()
+    election_port = _free_port()
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", service_port))
+    try:
+        server = DaemonServer(
+            echo_dispatch, port=service_port, election_port=election_port
+        )
+        with pytest.raises(OSError):
+            server.start()
+
+        replacement = DaemonServer(echo_dispatch, port=0, election_port=election_port)
+        replacement.start()
+        replacement.shutdown()
+    finally:
+        blocker.close()
+
+
+def test_start_releases_ports_when_discovery_publication_fails(
+    echo_dispatch, monkeypatch, tmp_path
+):
+    service_port = _free_port()
+    election_port = _free_port()
+    discovery_path = str(tmp_path / "daemon.json")
+
+    def fail_discovery_write(*args, **kwargs):
+        raise OSError("discovery write failed")
+
+    monkeypatch.setattr("acie.daemon.server.write_discovery_file", fail_discovery_write)
+    server = DaemonServer(
+        echo_dispatch,
+        port=service_port,
+        election_port=election_port,
+        discovery_path=discovery_path,
+    )
+
+    with pytest.raises(OSError, match="discovery write failed"):
+        server.start()
+
+    assert read_discovery_file(discovery_path) is None
+    replacement = DaemonServer(
+        echo_dispatch, port=service_port, election_port=election_port
+    )
+    replacement.start()
+    replacement.shutdown()
+
+
+def test_start_removes_its_discovery_file_when_accept_thread_start_fails(
+    echo_dispatch, monkeypatch, tmp_path
+):
+    class FailingThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("accept thread failed")
+
+    discovery_path = str(tmp_path / "daemon.json")
+    monkeypatch.setattr("acie.daemon.server.threading.Thread", FailingThread)
+    server = DaemonServer(
+        echo_dispatch, port=0, discovery_path=discovery_path
+    )
+
+    with pytest.raises(RuntimeError, match="accept thread failed"):
+        server.start()
+
+    assert read_discovery_file(discovery_path) is None
+
+
 def test_install_signal_handlers_wires_sigterm_to_shutdown():
     calls = []
     server = DaemonServer(
@@ -291,4 +361,3 @@ def test_install_signal_handlers_wires_sigterm_to_shutdown():
     finally:
         signal.signal(signal.SIGTERM, original_term)
         signal.signal(signal.SIGINT, original_int)
-
