@@ -35,8 +35,13 @@ from acie.daemon.protocol import (
 # Semantics" names it as an RPC over the already-locked envelope, so it's
 # intercepted here before ever reaching the injected `dispatch` callable.
 _SHUTDOWN_METHOD = "shutdown"
+_PING_METHOD = "ping"
 
 _ACCEPT_BACKLOG = 128
+
+# One ACIE daemon is shared by this machine, so this deliberately fixed port
+# is an OS-level election mutex rather than a per-repository service endpoint.
+DAEMON_ELECTION_PORT = 57831
 
 
 class AnotherDaemonRunningError(Exception):
@@ -211,6 +216,9 @@ class DaemonServer:
         request_id = request.get("id")
         method = request.get("method")
 
+        if method == _PING_METHOD:
+            return build_success_response(request_id, {"status": "ok"})
+
         if method == _SHUTDOWN_METHOD:
             self.shutdown()
             return build_success_response(request_id, {"status": "shutting_down"})
@@ -251,3 +259,18 @@ def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+
+def main() -> int:
+    """Run the production daemon in the foreground until it shuts down."""
+    from acie.daemon.runtime import create_daemon
+
+    server = create_daemon(election_port=DAEMON_ELECTION_PORT)
+    install_signal_handlers(server)
+    server.start()
+    server.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
