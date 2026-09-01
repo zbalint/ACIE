@@ -2,6 +2,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import Future
 
 from acie.daemon.bootstrap import BootstrapCoordinator
 from acie.daemon.write_queue import WriteQueue
@@ -65,13 +66,22 @@ def test_repo_ready_stays_false_during_an_in_flight_bootstrap_even_once_its_sqli
 
     class SlowWriteQueue:
         def submit(self, repo_key, fn):
+            future = Future()
+
             def run():
                 conn = sqlite3.connect(db_path)  # creates the file on disk now
                 started.set()
                 release.wait(timeout=2)
-                fn(conn)
+                try:
+                    result = fn(conn)
+                except BaseException as exc:  # noqa: BLE001 -- propagated via the Future, matching WriteQueue's real contract.
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
                 conn.close()
+
             threading.Thread(target=run, daemon=True).start()
+            return future
 
     coordinator = BootstrapCoordinator(
         write_queue=SlowWriteQueue(),
@@ -174,6 +184,33 @@ def test_concurrent_registers_from_multiple_threads_only_walk_once(tmp_path):
     assert _wait_until(lambda: coordinator.repo_ready("repo-a"))
     assert walk_calls == ["repo-a"]
     write_queue.close()
+
+
+def test_register_still_becomes_ready_when_every_files_write_queue_submission_fails(tmp_path):
+    # Regression: WriteQueue.submit() returns an already-failed Future
+    # without ever invoking the job closure when writer startup itself
+    # fails (e.g. a sqlite3.connect() error). Previously the "counts
+    # toward done" bookkeeping lived only inside the job closure's own
+    # finally block, so a repo whose writer never even starts stayed
+    # wedged in INDEX_NOT_READY forever.
+    class AlwaysFailingWriteQueue:
+        def submit(self, repo_key, fn):
+            future = Future()
+            future.set_exception(RuntimeError("writer startup failed"))
+            return future
+
+    coordinator = BootstrapCoordinator(
+        write_queue=AlwaysFailingWriteQueue(),
+        db_path_for=lambda repo_key: str(tmp_path / f"{repo_key}.sqlite"),
+        walk_repo=lambda repo_key: [
+            ("pkg/mod.py", "def foo():\n    pass\n"),
+            ("pkg/other.py", "def bar():\n    pass\n"),
+        ],
+    )
+
+    coordinator.register("repo-a")
+
+    assert _wait_until(lambda: coordinator.repo_ready("repo-a")), "repo stayed wedged in INDEX_NOT_READY"
 
 
 def test_different_repos_bootstrap_independently(tmp_path):

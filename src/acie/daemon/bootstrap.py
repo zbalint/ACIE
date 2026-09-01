@@ -103,34 +103,42 @@ class BootstrapCoordinator:
         remaining = [len(files)]
         remaining_lock = threading.Lock()
 
+        def on_job_done(future) -> None:
+            # shortcut: a failing file -- or one whose submission never
+            # even reached a writer thread (e.g. a writer-startup failure
+            # in WriteQueue.submit()) -- still counts toward "done" so one
+            # bad file can't wedge the repo in INDEX_NOT_READY forever, but
+            # its exception is never surfaced anywhere else since
+            # bootstrap doesn't retain per-file futures. Upgrade trigger:
+            # add error aggregation/logging once silent per-file bootstrap
+            # failures need visibility.
+            #
+            # Attached via add_done_callback rather than embedded in the
+            # job closure's own finally block: a concurrent.futures.Future
+            # guarantees this fires exactly once whether the job ran to
+            # completion, raised, or WriteQueue.submit() failed before the
+            # job was ever enqueued at all (that Future comes back already
+            # failed, and add_done_callback on an already-done Future
+            # still calls its callback immediately).
+            with remaining_lock:
+                remaining[0] -= 1
+                done = remaining[0] == 0
+            if done:
+                self._mark_ready(repo_key)
+
         def make_job(path: str, source_text: str):
             def job(conn):
-                try:
-                    index_file(
-                        path=path, source_text=source_text,
-                        observed_at=datetime.now(timezone.utc).isoformat(),
-                        symbol_store=SymbolStore(conn=conn),
-                        relation_store=RelationStore(conn=conn),
-                        index_meta_store=IndexMetaStore(conn=conn),
-                    )
-                finally:
-                    # shortcut: a failing file still counts toward "done"
-                    # so one bad file can't wedge the repo in
-                    # INDEX_NOT_READY forever, but its exception (still
-                    # propagated onto this job's own Future by WriteQueue)
-                    # is never surfaced anywhere else since bootstrap
-                    # doesn't retain per-file futures. Upgrade trigger: add
-                    # error aggregation/logging once silent per-file
-                    # bootstrap failures need visibility.
-                    with remaining_lock:
-                        remaining[0] -= 1
-                        done = remaining[0] == 0
-                    if done:
-                        self._mark_ready(repo_key)
+                index_file(
+                    path=path, source_text=source_text,
+                    observed_at=datetime.now(timezone.utc).isoformat(),
+                    symbol_store=SymbolStore(conn=conn),
+                    relation_store=RelationStore(conn=conn),
+                    index_meta_store=IndexMetaStore(conn=conn),
+                )
             return job
 
         for path, source_text in files:
-            self._write_queue.submit(repo_key, make_job(path, source_text))
+            self._write_queue.submit(repo_key, make_job(path, source_text)).add_done_callback(on_job_done)
 
     def _mark_ready(self, repo_key: str) -> None:
         with self._lock:
