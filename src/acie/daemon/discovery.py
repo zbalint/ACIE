@@ -34,10 +34,10 @@ def write_discovery_file(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f)
+        os.replace(tmp_path, path)
     except BaseException:
         os.remove(tmp_path)
         raise
-    os.replace(tmp_path, path)
 
 
 def read_discovery_file(path: str) -> dict | None:

@@ -53,6 +53,23 @@ def test_write_leaves_no_leftover_temp_file(tmp_path):
     assert glob.glob(str(tmp_path / "*.tmp")) == []
 
 
+def test_write_removes_the_temp_file_when_the_final_replace_fails(tmp_path, monkeypatch):
+    # Regression: os.replace(tmp_path, path) sat outside the try/except
+    # that cleans up the temp file, so a rename failure after a fully
+    # written temp file leaked it permanently.
+    path = _path(tmp_path)
+
+    def failing_replace(src, dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("acie.daemon.discovery.os.replace", failing_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        write_discovery_file(path, service_port=1, auth_token=None, daemon_pid=1)
+
+    assert glob.glob(str(tmp_path / "*.tmp")) == []
+
+
 def test_write_is_atomic_a_reader_never_observes_a_partial_file(tmp_path):
     # os.replace is atomic on POSIX -- once the file exists at `path` at
     # all, it must already contain complete, valid JSON; there is no
