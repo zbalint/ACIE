@@ -132,6 +132,50 @@ def test_submit_reports_writer_connection_startup_failure_and_a_later_submit_can
     wq.close()
 
 
+def test_slow_writer_startup_for_one_repo_does_not_block_a_different_repos_first_submit():
+    # Regression: _worker_for held the single process-wide lock for the
+    # entire first-submit path, including worker.start() blocking on
+    # sqlite3.connect() -- so one repo's slow/contended disk stalled every
+    # other repo's first write, contradicting this module's own docstring
+    # guarantee of per-repo independence. repo_a_release's long timeout
+    # (5s, well past this test's 1s patience) makes a lock-scoping
+    # regression show up as repo-b's submit thread still being alive after
+    # a short join, rather than the test merely running slower.
+    repo_a_started = threading.Event()
+    repo_a_release = threading.Event()
+
+    def db_path_for(repo_key):
+        if repo_key == "repo-a":
+            repo_a_started.set()
+            repo_a_release.wait(timeout=5)
+        return ":memory:"
+
+    wq = WriteQueue(db_path_for=db_path_for)
+    result_a: dict = {}
+    result_b: dict = {}
+
+    def submit_a():
+        result_a["future"] = wq.submit("repo-a", lambda conn: "a-done")
+
+    def submit_b():
+        result_b["future"] = wq.submit("repo-b", lambda conn: "b-done")
+
+    thread_a = threading.Thread(target=submit_a, daemon=True)
+    thread_a.start()
+    assert repo_a_started.wait(timeout=1), "repo-a's worker creation never started"
+
+    thread_b = threading.Thread(target=submit_b, daemon=True)
+    thread_b.start()
+    thread_b.join(timeout=1)
+    assert not thread_b.is_alive(), "repo-b's submit is blocked behind repo-a's still-in-flight worker creation"
+    assert result_b["future"].result(timeout=1) == "b-done"
+
+    repo_a_release.set()
+    thread_a.join(timeout=2)
+    assert result_a["future"].result(timeout=1) == "a-done"
+    wq.close()
+
+
 def test_close_drains_every_queued_job_to_completion_before_returning():
     wq = WriteQueue(db_path_for=lambda repo_key: ":memory:")
     completed = []

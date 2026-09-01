@@ -41,6 +41,12 @@ class WriteQueue:
         self._db_path_for = db_path_for
         self._lock = threading.Lock()
         self._workers: dict[str, "_RepoWriter"] = {}
+        # One creation lock per repo key, guarding the (potentially slow --
+        # db_path_for and _RepoWriter.start()'s blocking sqlite3.connect())
+        # first-worker-creation path for that key only. Never garbage
+        # collected, same "no teardown, no cap" shortcut this class's own
+        # docstring already accepts for _workers.
+        self._creation_locks: dict[str, threading.Lock] = {}
 
     def submit(self, repo_key: str, fn: Callable[[sqlite3.Connection], T]) -> "Future[T]":
         """Enqueues fn to run on repo_key's writer thread; returns its Future.
@@ -60,12 +66,25 @@ class WriteQueue:
         return future
 
     def _worker_for(self, repo_key: str) -> "_RepoWriter":
+        # Double-checked locking: the fast path (worker already exists)
+        # never touches a lock at all. A first-ever call for repo_key
+        # briefly holds the global lock only to fetch/create that key's own
+        # creation lock -- the slow work (db_path_for, worker.start()'s
+        # blocking sqlite3.connect()) then runs under that per-repo lock,
+        # never the global one, so a slow repo never stalls an unrelated
+        # repo's own first submit.
+        worker = self._workers.get(repo_key)
+        if worker is not None:
+            return worker
         with self._lock:
+            creation_lock = self._creation_locks.setdefault(repo_key, threading.Lock())
+        with creation_lock:
             worker = self._workers.get(repo_key)
             if worker is None:
                 worker = _RepoWriter(self._db_path_for(repo_key))
                 worker.start()
-                self._workers[repo_key] = worker
+                with self._lock:
+                    self._workers[repo_key] = worker
             return worker
 
     def close(self, timeout: float | None = None) -> None:
