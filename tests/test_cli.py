@@ -1,5 +1,7 @@
 import json
+import threading
 
+import acie.cli
 from acie.cli import main
 from acie.daemon.client import daemon_is_running
 from acie.daemon.discovery import write_discovery_file
@@ -50,6 +52,26 @@ def test_daemon_status_json_probes_a_live_daemon(monkeypatch, tmp_path, capsys):
 
     assert exit_code == 0
     assert json.loads(capsys.readouterr().out) == {"running": True}
+
+
+def test_spawn_daemon_reaps_its_subprocess_so_it_never_zombies(monkeypatch, tmp_path):
+    # Regression: subprocess.Popen()'s return value was discarded and
+    # never waited on. If the spawned daemon exits quickly (e.g. it lost
+    # the election-port race), nothing ever reaped it, so it stayed a
+    # zombie for the entire lifetime of the long-running parent process
+    # (acie serve-mcp).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    waited = threading.Event()
+
+    class FakeProc:
+        def wait(self):
+            waited.set()
+
+    monkeypatch.setattr(acie.cli.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+
+    acie.cli._spawn_daemon()
+
+    assert waited.wait(timeout=2), "spawned subprocess was never reaped"
 
 
 def test_daemon_start_spawns_a_daemon_and_stop_shuts_it_down(monkeypatch, tmp_path):

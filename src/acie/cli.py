@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
 
@@ -92,13 +93,18 @@ def _spawn_daemon() -> None:
     os.makedirs(state_dir, exist_ok=True)
     log_path = os.path.join(state_dir, "daemon.log")
     with open(log_path, "ab") as log:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, "-m", "acie.daemon.server"],
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
             start_new_session=True,
         )
+    # Reaps the child the moment it exits (e.g. it lost the election-port
+    # race and exited immediately) so it never sits as a zombie for the
+    # rest of this process's lifetime -- nothing else here ever calls
+    # wait()/poll() on it.
+    threading.Thread(target=proc.wait, daemon=True).start()
 
 
 def _discovery_path() -> str:
