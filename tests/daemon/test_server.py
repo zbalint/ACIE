@@ -128,6 +128,31 @@ def test_malformed_frame_closes_the_connection_without_crashing_the_server(echo_
         server.shutdown()
 
 
+def test_dispatch_raising_an_unexpected_exception_returns_internal_error_instead_of_silently_closing():
+    # Regression: _handle_connection's bare `except (MalformedFrameError,
+    # OSError): pass` also caught an OSError-family exception raised
+    # inside the injected dispatch callable itself (e.g. a missing `git`
+    # binary surfacing from deep in resolve_index_db_path), silently
+    # dropping the connection with zero response and no logging --
+    # indistinguishable from "no daemon running" to the client.
+    def bad_dispatch(request):
+        raise FileNotFoundError("git binary not found")
+
+    server = DaemonServer(bad_dispatch, port=0)
+    server.start()
+    try:
+        request = build_request("find_symbol", "/repo", {})
+        response = _send_request(server.port, request)
+        assert response["ok"] is False
+        assert response["error"]["code"] == "INTERNAL_ERROR"
+
+        # Server must still be alive and serving other connections.
+        healthy = _send_request(server.port, build_request("ping", "/repo", {}))
+        assert healthy["ok"] is True
+    finally:
+        server.shutdown()
+
+
 def test_shutdown_method_runs_on_shutdown_callback_and_deletes_discovery_file(tmp_path):
     on_shutdown_calls = []
 
@@ -189,6 +214,38 @@ def test_requests_arriving_during_an_in_flight_drain_get_daemon_shutting_down_er
     )
 
 
+def test_ping_during_an_in_flight_drain_reports_shutting_down_not_ok():
+    # Regression: ping was answered before the _shutting_down check ran,
+    # so daemon_is_running() (which pings) reported a mid-drain daemon as
+    # live.
+    drain_started = threading.Event()
+    release_drain = threading.Event()
+
+    def slow_on_shutdown():
+        drain_started.set()
+        release_drain.wait(timeout=2)
+
+    server = DaemonServer(
+        lambda req: build_success_response(req["id"], {}), port=0, on_shutdown=slow_on_shutdown
+    )
+    server.start()
+    port = server.port
+
+    shutdown_thread = threading.Thread(
+        target=_send_request, args=(port, build_request("shutdown", "/repo", {}))
+    )
+    shutdown_thread.start()
+    assert drain_started.wait(timeout=2)
+
+    ping_response = _send_request(port, build_request("ping", "/repo", {}))
+
+    release_drain.set()
+    shutdown_thread.join(timeout=2)
+
+    assert ping_response["ok"] is False
+    assert ping_response["error"]["code"] == "DAEMON_SHUTTING_DOWN"
+
+
 def test_shutdown_stops_the_accept_loop_new_connections_are_refused():
     server = DaemonServer(lambda req: build_success_response(req["id"], {}), port=0)
     server.start()
@@ -235,6 +292,35 @@ def test_election_port_bind_failure_raises_and_leaves_first_server_serving(echo_
         assert response["ok"] is True
     finally:
         first.shutdown()
+
+
+def test_election_port_listen_failure_closes_the_socket_instead_of_leaking_it(monkeypatch, echo_dispatch):
+    # Regression: only sock.bind() was guarded by try/except; if sock.listen()
+    # itself raised, the socket was never closed and never stored anywhere,
+    # so the election port stayed permanently held -- every later daemon
+    # start would get a spurious AnotherDaemonRunningError forever.
+    closed = []
+
+    class FakeSocket:
+        def setsockopt(self, *args, **kwargs):
+            pass
+
+        def bind(self, addr):
+            pass
+
+        def listen(self, backlog):
+            raise OSError("listen failed")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr("acie.daemon.server.socket.socket", lambda *args, **kwargs: FakeSocket())
+    server = DaemonServer(echo_dispatch, port=0, election_port=12345)
+
+    with pytest.raises(OSError, match="listen failed"):
+        server.start()
+
+    assert closed == [True]
 
 
 def test_election_port_is_released_on_shutdown_so_a_new_daemon_can_start(echo_dispatch):

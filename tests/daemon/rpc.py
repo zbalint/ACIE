@@ -3,6 +3,7 @@
 import socket
 
 from acie.daemon.protocol import decode_frame_body, decode_length_prefix, encode_frame
+from acie.daemon.sockets import recv_exact as _recv_exact_or_none
 
 
 def send_request(port: int, request: dict, *, timeout: float = 2.0) -> dict:
@@ -14,11 +15,7 @@ def send_request(port: int, request: dict, *, timeout: float = 2.0) -> dict:
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
-    chunks = []
-    while size:
-        chunk = sock.recv(size)
-        if not chunk:
-            raise ConnectionError("peer closed before sending the expected number of bytes")
-        chunks.append(chunk)
-        size -= len(chunk)
-    return b"".join(chunks)
+    data = _recv_exact_or_none(sock, size)
+    if data is None:
+        raise ConnectionError("peer closed before sending the expected number of bytes")
+    return data

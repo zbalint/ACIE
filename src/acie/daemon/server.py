@@ -29,6 +29,7 @@ from acie.daemon.protocol import (
     decode_length_prefix,
     encode_frame,
 )
+from acie.daemon.sockets import recv_exact
 
 # `method: "shutdown"` is a transport-level control message, not one of the
 # 8 tools in dispatch.py's DISPATCH_TABLE -- DAEMON.md's "Shutdown / Stop
@@ -149,7 +150,15 @@ class DaemonServer:
                 f"election port {election_port} is already bound -- "
                 "another daemon is starting or already running"
             ) from exc
-        sock.listen(1)
+        try:
+            sock.listen(1)
+        except OSError:
+            # Not AnotherDaemonRunningError -- bind() already succeeded, so
+            # this isn't "already bound", it's a genuine local failure
+            # (e.g. resource exhaustion). Close the socket so it isn't
+            # leaked and the election port doesn't stay permanently held.
+            sock.close()
+            raise
         return sock
 
     def serve_forever(self) -> None:
@@ -195,19 +204,29 @@ class DaemonServer:
             request = self._read_request(conn)
             if request is None:
                 return
-            response = self._dispatch_one(request)
+            try:
+                response = self._dispatch_one(request)
+            except Exception as exc:  # noqa: BLE001 -- dispatch_request already wraps tool
+                # errors into INTERNAL_ERROR responses; this is a last-resort guard against
+                # a genuinely unexpected exception (e.g. a missing `git` binary) escaping
+                # dispatch entirely. It must still reach the client as a response instead of
+                # silently closing the connection, which is indistinguishable from "no
+                # daemon running" and was this bug: a bare except here used to swallow it.
+                response = build_error_response(request.get("id"), "INTERNAL_ERROR", str(exc))
             conn.sendall(encode_frame(response))
         except (MalformedFrameError, OSError):
+            # Framing failure while reading, or the peer disconnected before/while we
+            # replied -- neither has a request to answer or a connection left to answer on.
             pass
         finally:
             conn.close()
 
     def _read_request(self, conn: socket.socket) -> dict | None:
-        prefix = _recv_exact(conn, LENGTH_PREFIX_SIZE)
+        prefix = recv_exact(conn, LENGTH_PREFIX_SIZE)
         if prefix is None:
             return None
         length = decode_length_prefix(prefix)
-        body = _recv_exact(conn, length)
+        body = recv_exact(conn, length)
         if body is None:
             return None
         return decode_frame_body(body)
@@ -215,9 +234,6 @@ class DaemonServer:
     def _dispatch_one(self, request: dict) -> dict:
         request_id = request.get("id")
         method = request.get("method")
-
-        if method == _PING_METHOD:
-            return build_success_response(request_id, {"status": "ok"})
 
         if method == _SHUTDOWN_METHOD:
             self.shutdown()
@@ -227,6 +243,9 @@ class DaemonServer:
             return build_error_response(
                 request_id, "DAEMON_SHUTTING_DOWN", "daemon is shutting down"
             )
+
+        if method == _PING_METHOD:
+            return build_success_response(request_id, {"status": "ok"})
 
         return self._dispatch(request)
 
@@ -247,18 +266,6 @@ def install_signal_handlers(server: DaemonServer) -> None:
 
     signal.signal(signal.SIGTERM, _handler)
     signal.signal(signal.SIGINT, _handler)
-
-
-def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
-    chunks = []
-    remaining = n
-    while remaining > 0:
-        chunk = conn.recv(remaining)
-        if not chunk:
-            return None  # peer closed early -- not a protocol error, just no request.
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
 
 
 def main() -> int:

@@ -5,11 +5,13 @@ import socket
 from acie.daemon.discovery import read_discovery_file
 from acie.daemon.protocol import (
     LENGTH_PREFIX_SIZE,
+    MalformedFrameError,
     build_request,
     decode_frame_body,
     decode_length_prefix,
     encode_frame,
 )
+from acie.daemon.sockets import recv_exact
 
 
 def request_daemon(
@@ -30,7 +32,7 @@ def request_daemon(
     request = build_request(method, repo_path, params, token=discovery.get("auth_token"))
     try:
         return _request(port, request, timeout=timeout)
-    except (OSError, ValueError):
+    except (OSError, ValueError, MalformedFrameError):
         return None
 
 
@@ -46,17 +48,10 @@ def _request(port: int, request: dict, *, timeout: float) -> dict:
     with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
         sock.settimeout(timeout)
         sock.sendall(encode_frame(request))
-        prefix = _recv_exact(sock, LENGTH_PREFIX_SIZE)
-        body = _recv_exact(sock, decode_length_prefix(prefix))
-    return decode_frame_body(body)
-
-
-def _recv_exact(sock: socket.socket, size: int) -> bytes:
-    chunks = []
-    while size:
-        chunk = sock.recv(size)
-        if not chunk:
+        prefix = recv_exact(sock, LENGTH_PREFIX_SIZE)
+        if prefix is None:
             raise OSError("daemon closed its connection before sending a full response")
-        chunks.append(chunk)
-        size -= len(chunk)
-    return b"".join(chunks)
+        body = recv_exact(sock, decode_length_prefix(prefix))
+        if body is None:
+            raise OSError("daemon closed its connection before sending a full response")
+    return decode_frame_body(body)
