@@ -52,6 +52,20 @@ def create_daemon(
         # dispatch_request owns the malformed-repo response. It checks
         # readiness before resolving its own DB path, so do not let an
         # invalid repo reach BootstrapCoordinator's path resolver first.
+        #
+        # shortcut: resolve_index_db_path shells out to `git` and is
+        # called again here, again in the dispatch() closure below, and
+        # again inside dispatch_request/BootstrapCoordinator themselves --
+        # up to 3-4 real subprocess spawns for one request resolving the
+        # same repo_path. Left as-is (no measured profiling data yet to
+        # justify a cache, per this project's no-speculative-perf-refactor
+        # rule); a real fix would also touch dispatch.py's own separately
+        # tested resolution call and raise cache-invalidation questions
+        # (a repo_path could in principle start/stop being a git repo
+        # mid-daemon-lifetime) that deserve their own design pass. Upgrade
+        # trigger: profile real request latency under load; if
+        # git-subprocess overhead is measurably significant, consolidate
+        # behind one cached resolution shared with dispatch.py.
         if resolve_index_db_path(repo_path, base_dir=state_dir) is None:
             return True
         return bootstrap.repo_ready(repo_path)
@@ -59,6 +73,8 @@ def create_daemon(
     def dispatch(request: dict) -> dict:
         repo_path = request.get("repo_path")
         if isinstance(repo_path, str) and repo_path:
+            # shortcut: see repo_ready's docstring-adjacent comment above --
+            # same redundant resolve_index_db_path call, same deferral.
             if resolve_index_db_path(repo_path, base_dir=state_dir) is not None:
                 bootstrap.register(repo_path)
         return dispatch_request(request, repo_ready=repo_ready, base_dir=state_dir)
