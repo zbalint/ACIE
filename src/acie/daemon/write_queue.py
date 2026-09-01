@@ -50,8 +50,12 @@ class WriteQueue:
         pre-created for repos with no write yet. There is deliberately no
         teardown and no cap -- see DAEMON.md's named shortcut on this.
         """
-        worker = self._worker_for(repo_key)
         future: "Future[T]" = Future()
+        try:
+            worker = self._worker_for(repo_key)
+        except BaseException as exc:  # noqa: BLE001 -- failure is reported through submit's Future contract.
+            future.set_exception(exc)
+            return future
         worker.queue.put((fn, future))
         return future
 
@@ -84,15 +88,26 @@ class _RepoWriter:
     def __init__(self, db_path: str) -> None:
         self.queue: "queue.Queue" = queue.Queue()
         self.thread = threading.Thread(target=self._run, args=(db_path,), daemon=True)
+        self._started = threading.Event()
+        self._startup_error: BaseException | None = None
 
     def start(self) -> None:
         self.thread.start()
+        self._started.wait()
+        if self._startup_error is not None:
+            raise self._startup_error
 
     def _run(self, db_path: str) -> None:
         # Opened once at thread creation and reused for every job this
         # repo ever submits -- the deliberate contrast with dispatch.py's
         # fresh-per-call read-path stores (see this module's docstring).
-        conn = sqlite3.connect(db_path)
+        try:
+            conn = sqlite3.connect(db_path)
+        except BaseException as exc:  # noqa: BLE001 -- returned via submit's Future, never stranded in this thread.
+            self._startup_error = exc
+            self._started.set()
+            return
+        self._started.set()
         try:
             while True:
                 item = self.queue.get()

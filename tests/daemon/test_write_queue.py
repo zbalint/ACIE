@@ -1,3 +1,4 @@
+import sqlite3
 import threading
 import time
 
@@ -106,6 +107,28 @@ def test_exception_raised_by_fn_is_propagated_through_the_future_not_swallowed()
 
     with pytest.raises(ValueError, match="boom"):
         future.result(timeout=1)
+    wq.close()
+
+
+def test_submit_reports_writer_connection_startup_failure_and_a_later_submit_can_retry(tmp_path):
+    attempts = []
+    working_db_path = str(tmp_path / "working.sqlite")
+
+    def db_path_for(repo_key):
+        attempts.append(repo_key)
+        if len(attempts) == 1:
+            return str(tmp_path / "missing-directory" / "index.sqlite")
+        return working_db_path
+
+    wq = WriteQueue(db_path_for=db_path_for)
+
+    failed = wq.submit("repo-a", lambda conn: None)
+    with pytest.raises(sqlite3.OperationalError, match="unable to open database file"):
+        failed.result(timeout=1)
+
+    retried = wq.submit("repo-a", lambda conn: "connected")
+    assert retried.result(timeout=1) == "connected"
+    assert attempts == ["repo-a", "repo-a"]
     wq.close()
 
 
