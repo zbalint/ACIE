@@ -13,6 +13,7 @@ named this daemon-server slice as where that wiring lands; this slice adds
 the transport/lifecycle layer those seams plug into, not the plug itself).
 """
 
+import faulthandler
 import os
 import signal
 import socket
@@ -272,6 +273,14 @@ def main() -> int:
     """Run the production daemon in the foreground until it shuts down."""
     from acie.daemon.runtime import create_daemon
 
+    # A fatal signal (SIGSEGV/SIGABRT/SIGFPE/SIGBUS) bypasses Python's own
+    # exception/logging machinery entirely, so without this a crash leaves
+    # nothing in daemon.log to explain it (see the 2026-09-01 live-test
+    # segfault this daemon suffered with zero trace of why). faulthandler
+    # dumps the native Python frame stack to stderr right before the
+    # process dies, and _spawn_daemon (cli.py) already redirects this
+    # process's stderr to daemon.log.
+    faulthandler.enable()
     server = create_daemon(election_port=DAEMON_ELECTION_PORT)
     install_signal_handlers(server)
     server.start()
