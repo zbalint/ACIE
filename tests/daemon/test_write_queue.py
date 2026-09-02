@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 import threading
 import time
@@ -195,3 +196,42 @@ def test_close_drains_every_queued_job_to_completion_before_returning():
     assert completed == list(range(10))
     for future in futures:
         assert future.done()
+
+
+def test_close_is_bounded_and_warns_when_a_writer_thread_is_stuck(caplog):
+    # SALTMDB ebff13f5's follow-up fix: close() used to be called from
+    # runtime.py's on_shutdown() with timeout=None -- an unconditionally
+    # unbounded thread.join() -- so a single job stuck forever (a hung
+    # subprocess, a wedged syscall) could hang the daemon's shutdown()
+    # forever too. Prove close() itself now always returns within budget,
+    # and logs which repo's writer it gave up waiting on.
+    wq = WriteQueue(db_path_for=lambda repo_key: ":memory:")
+    release = threading.Event()
+    wq.submit("stuck-repo", lambda conn: release.wait())  # never released before close()
+
+    t0 = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        wq.close(timeout=0.2)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 2, f"close() should return within its budget, took {elapsed:.2f}s"
+    assert "did not finish draining" in caplog.text
+    assert "stuck-repo" in caplog.text
+
+    release.set()  # let the stuck job/writer thread actually finish, no leak past this test
+
+
+def test_submit_after_close_fails_fast_instead_of_enqueueing_into_a_dead_worker():
+    # codex review, 2026-09-02: _workers' entries are never removed by
+    # close(), so a submit() landing after a repo's writer thread has
+    # already consumed its _STOP sentinel and exited would otherwise
+    # silently reuse that dead worker's queue -- the job would sit
+    # forever, unprocessed, rather than erroring in any visible way.
+    wq = WriteQueue(db_path_for=lambda repo_key: ":memory:")
+    wq.submit("repo-a", lambda conn: None).result(timeout=1)  # create + use the worker once
+    wq.close(timeout=2)
+
+    future = wq.submit("repo-a", lambda conn: None)
+
+    with pytest.raises(RuntimeError, match="closed"):
+        future.result(timeout=1)

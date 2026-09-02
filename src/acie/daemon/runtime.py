@@ -6,6 +6,7 @@ client concerns intentionally remain outside this module.
 """
 
 import os
+import time
 
 from acie.daemon import ignore
 from acie.daemon.bootstrap import BootstrapCoordinator
@@ -18,6 +19,17 @@ from acie.daemon.write_queue import WriteQueue
 from acie.repo_id import resolve_repo_id, resolve_repo_root
 
 _NOTIFY_HOOK_METHOD = "notify_hook"
+
+# Overall budget for on_shutdown()'s whole drain (watchers.close() AND
+# write_queue.close() together, sharing one deadline -- codex review,
+# 2026-09-02: giving each call its own fresh _SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+# would let total shutdown time be 2x this, not this). Generous enough that
+# a real bootstrap backlog or a normal Observer teardown always finishes
+# well inside it under ordinary conditions, bounded so a stuck join can
+# never hang shutdown() forever (SALTMDB ebff13f5). No documented shutdown
+# time budget exists elsewhere (DAEMON.md's "Shutdown / Stop Semantics") to
+# match, so this is a fresh, deliberately generous choice.
+_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 10.0
 
 
 def create_daemon(
@@ -154,8 +166,20 @@ def create_daemon(
         return build_success_response(request_id, {"status": "accepted"})
 
     def on_shutdown() -> None:
-        watchers.close()
-        write_queue.close()
+        # Bounded, never None -- SALTMDB ebff13f5's live incident was an
+        # orphaned daemon process, permanently un-killable by SIGTERM,
+        # stuck exactly here (watchers.close()/write_queue.close() used to
+        # be called with no timeout at all, i.e. an unconditionally
+        # unbounded wait). Both close() methods now log a warning per
+        # watcher/writer that doesn't finish draining within budget, but
+        # this call itself must always return -- a daemon that can never
+        # fully exit is worse than one that occasionally abandons a slow
+        # drain in the background. One shared deadline spans both calls
+        # (not one fresh budget each) so total drain time is bounded by
+        # _SHUTDOWN_DRAIN_TIMEOUT_SECONDS overall, not 2x it.
+        deadline = time.monotonic() + _SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+        watchers.close(timeout=max(0.0, deadline - time.monotonic()))
+        write_queue.close(timeout=max(0.0, deadline - time.monotonic()))
 
     return DaemonServer(
         dispatch,

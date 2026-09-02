@@ -1,5 +1,7 @@
+import logging
 import os
 import sqlite3
+import threading
 import time
 
 from acie.daemon import ignore
@@ -253,6 +255,107 @@ def test_repo_watcher_end_to_end_indexes_a_newly_created_file(tmp_path):
     finally:
         watcher.stop(timeout=2)
         write_queue.close(timeout=2)
+
+
+class _FakeInstantObserver:
+    """A trivial Observer double whose stop()/join() both return
+    immediately -- for tests that need RepoWatcher.stop()'s surrounding
+    behavior (e.g. debounce-timer flushing) without a real watchdog thread
+    or the fake-hang behavior of _FakeHangingObserver below.
+    """
+
+    def stop(self) -> None:
+        pass
+
+    def join(self, timeout: float | None = None) -> None:
+        pass
+
+
+class _RecordingWriteQueue:
+    """A minimal WriteQueue double that just records which repo_key each
+    submit() call was for -- used where a test cares only about whether/
+    what RepoWatcher submitted, not real write-queue execution.
+    """
+
+    def __init__(self) -> None:
+        self.submitted_repo_keys: list[str] = []
+
+    def submit(self, repo_key, fn):  # noqa: ANN001 -- test double, matches WriteQueue.submit's shape loosely.
+        self.submitted_repo_keys.append(repo_key)
+
+
+def test_repo_watcher_stop_flushes_a_pending_debounce_timer_before_returning():
+    # codex review, 2026-09-02: a debounce Timer already scheduled from an
+    # edit observed just before shutdown is a separate object from the
+    # Observer and untouched by Observer.stop()/.join() -- without
+    # RepoWatcher.stop() explicitly flushing it, it would fire later on
+    # its own schedule, possibly after write_queue.close() has already
+    # stopped that repo's writer thread, silently dropping the edit.
+    write_queue = _RecordingWriteQueue()
+    watcher = RepoWatcher.__new__(RepoWatcher)
+    watcher._repo_root = "/fake/repo"
+    watcher._repo_id = "repo-id"
+    watcher._write_queue = write_queue
+    watcher._handler = _DebouncedEventHandler(
+        "/fake/repo", watcher._on_paths_changed, debounce_seconds=10.0
+    )
+    watcher._observer = _FakeInstantObserver()
+
+    watcher._handler._touch("/fake/repo/mod.py")  # schedules a 10s timer -- won't fire on its own during this test
+    assert watcher._handler._timer is not None
+
+    watcher.stop(timeout=2)
+
+    assert watcher._handler._timer is None  # cancelled, not left to fire independently
+    assert watcher._handler._pending == set()  # flushed, not silently dropped
+    assert write_queue.submitted_repo_keys == ["repo-id"]  # actually submitted before stop() returned
+
+
+class _FakeHangingObserver:
+    """Simulates watchdog's own Observer.stop() blocking forever --
+    BaseObserver.unschedule_all()'s _clear_emitters() joins each emitter
+    thread with no timeout of its own -- without any real OS-level watch
+    or watchdog thread (codex review, 2026-09-02: a real Observer whose
+    real .stop() is monkeypatched away never actually stops -- its real
+    background thread's run() loop keeps checking a _stopped_event that
+    only the real .stop() ever sets, so RepoWatcher.stop()'s helper thread
+    blocks on Observer.join() forever and leaks a real inotify watch for
+    the rest of the test process). This fake has no thread of its own at
+    all: .stop() blocks on an Event only the test itself can release.
+    """
+
+    def __init__(self) -> None:
+        self._released = threading.Event()
+
+    def stop(self) -> None:
+        self._released.wait()
+
+    def join(self, timeout: float | None = None) -> None:
+        pass
+
+
+def test_repo_watcher_stop_is_bounded_even_if_observer_teardown_hangs(caplog):
+    # SALTMDB ebff13f5 (live incident: an orphaned daemon process,
+    # permanently un-killable by SIGTERM) + its follow-up fix: RepoWatcher
+    # .stop() must bound the *whole* stop()+join() sequence from the
+    # outside, not just hand a timeout to Observer.join(). Bypass
+    # RepoWatcher.__init__ (which always constructs and starts a real
+    # Observer) so this test never touches a real watchdog thread at all.
+    watcher = RepoWatcher.__new__(RepoWatcher)
+    watcher._repo_root = "/fake/repo"
+    watcher._handler = _DebouncedEventHandler("/fake/repo", lambda paths: None)
+    watcher._observer = _FakeHangingObserver()
+
+    t0 = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        stopped = watcher.stop(timeout=0.2)
+    elapsed = time.monotonic() - t0
+
+    assert stopped is False
+    assert elapsed < 2, f"stop() should return within its budget, took {elapsed:.2f}s"
+    assert "did not finish tearing down" in caplog.text
+
+    watcher._observer._released.set()  # let the fake's blocked helper thread finish, no leak
 
 
 def test_watcher_registry_creates_exactly_one_watcher_per_repo_root(tmp_path):

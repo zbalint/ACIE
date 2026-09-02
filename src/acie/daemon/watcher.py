@@ -25,9 +25,11 @@ and two spellings of one worktree never get a duplicate Observer.
 """
 
 import hashlib
+import logging
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -41,6 +43,8 @@ from acie.storage.file_state_store import FileStateStore
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
+
+_logger = logging.getLogger(__name__)
 
 # v0 is Python-only (ARCHITECTURE.md) -- same extension bootstrap's
 # _read_source_files already scopes to.
@@ -187,6 +191,33 @@ class _DebouncedEventHandler(FileSystemEventHandler):
         if paths:
             self._on_paths_changed(paths)
 
+    def flush_pending(self) -> None:
+        """Cancels any pending debounce timer and submits its coalesced
+        paths immediately, instead of leaving it to fire on its own
+        schedule. Called once by `RepoWatcher.stop()`, after its Observer
+        has stopped dispatching new events (codex review, 2026-09-02): a
+        `threading.Timer` already scheduled from an edit observed just
+        before shutdown is a *separate* object from the Observer and isn't
+        touched by `Observer.stop()`/`.join()` at all, so without this it
+        could fire later on its own -- possibly after `on_shutdown()` has
+        already moved on to `write_queue.close()`, whose writer thread may
+        have already exited. `WriteQueue.submit()` would then silently
+        reuse that now-dead worker's queue (its `_workers` entry isn't
+        removed on close) rather than error, so the job would sit
+        forever, unprocessed -- a real, already-observed edit silently
+        dropped from the index. `Timer.cancel()` alone doesn't fully close
+        this (it's a no-op if the timer already started firing), so this
+        submits the coalesced paths right now instead of just cancelling.
+        """
+        with self._lock:
+            paths = self._pending
+            self._pending = set()
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+        if paths:
+            self._on_paths_changed(paths)
+
     def on_created(self, event) -> None:
         if not event.is_directory:
             self._touch(event.src_path)
@@ -239,9 +270,60 @@ class RepoWatcher:
         for rel_path in rel_paths:
             self._write_queue.submit(self._repo_id, _make_watch_job(self._repo_root, rel_path))
 
-    def stop(self, timeout: float | None = None) -> None:
-        self._observer.stop()
-        self._observer.join(timeout=timeout)
+    def stop(self, timeout: float | None = None) -> bool:
+        """Stops this repo's Observer, bounded by `timeout` seconds overall.
+
+        watchdog's own `Observer.stop()` can itself block indefinitely --
+        `BaseObserver.unschedule_all()`'s `_clear_emitters()` joins each of
+        its per-watch emitter threads with no timeout of its own (confirmed
+        by reading the installed watchdog 6.0.0's own source, SALTMDB
+        ebff13f5's follow-up investigation -- a live hang was not caught
+        red-handed under a real thread-stack trace despite deliberate
+        reproduction attempts against a single watcher, a large gitignored
+        watch tree, and multiple concurrent watchers under active fs
+        churn, so this remains the most plausible structural cause rather
+        than a directly observed one) -- so bounding only the subsequent
+        `Observer.join()` call, as this method used to, would not actually
+        bound anything if a hang ever does land inside `stop()` itself.
+        Running the whole stop()+join() sequence on a helper thread and
+        bounding *our own* wait on that thread is the only way to
+        guarantee this method returns within `timeout` regardless of where
+        inside watchdog's teardown a stuck native read might land -- this
+        is consistent with what let an orphaned daemon process go
+        permanently un-killable by SIGTERM in that live incident (its own
+        `shutdown()` was already stuck somewhere in this drain, so the
+        idempotency guard no-op'd every later SIGTERM's own `shutdown()`
+        call instead of unsticking anything).
+
+        Returns True if the Observer thread actually finished tearing down
+        within budget, False on timeout. On timeout the helper thread is
+        left running in the background -- always safe, since it's a daemon
+        thread and can therefore never itself block process exit, only
+        leak until (if ever) it eventually finishes.
+        """
+        finished = threading.Event()
+
+        def _stop_and_join() -> None:
+            self._observer.stop()
+            self._observer.join()
+            finished.set()
+
+        threading.Thread(target=_stop_and_join, daemon=True).start()
+        stopped = finished.wait(timeout=timeout)
+        if not stopped:
+            _logger.warning(
+                "RepoWatcher.stop() for %r did not finish tearing down its "
+                "Observer within %.1fs -- proceeding with shutdown anyway; "
+                "its watchdog thread is left running in the background.",
+                self._repo_root, timeout,
+            )
+        # Regardless of whether Observer teardown itself finished within
+        # budget: submit whatever the debounce handler had already
+        # coalesced, right now, rather than leaving its own Timer to fire
+        # independently -- see flush_pending()'s own docstring for why
+        # (codex review finding).
+        self._handler.flush_pending()
+        return stopped
 
 
 class WatcherRegistry:
@@ -273,7 +355,18 @@ class WatcherRegistry:
             self._watchers[repo_root] = RepoWatcher(repo_root, repo_id, self._write_queue)
 
     def close(self, timeout: float | None = None) -> None:
+        """Stops every registered watcher, bounded by `timeout` seconds
+        *overall* -- not per watcher (codex review, 2026-09-02: passing
+        the same `timeout` to every watcher's own `stop()` meant N stuck
+        watchers could take up to N * `timeout` to all finish, defeating
+        the point of a bounded shutdown). A deadline computed once and
+        re-diffed against the clock before each watcher's own `stop()`
+        call means a slow/stuck watcher eats into the budget remaining
+        for the rest, instead of each one starting a fresh clock.
+        """
         with self._lock:
             watchers = list(self._watchers.values())
+        deadline = None if timeout is None else time.monotonic() + timeout
         for watcher in watchers:
-            watcher.stop(timeout=timeout)
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            watcher.stop(timeout=remaining)
