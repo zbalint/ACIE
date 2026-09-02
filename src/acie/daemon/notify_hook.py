@@ -10,13 +10,18 @@ rationale behind:
   git hook types don't uniformly provide them) -- it tracks its own
   `last_indexed_head_sha` (index_meta_store.py) and diffs that against the
   repo's current HEAD itself.
-- decision 12: register() runs unconditionally first, so a repo the
-  daemon has never touched still gets bootstrapped by a git commit or an
-  agent edit, exactly like a first MCP query would.
 - decision 13: every changed/deleted path this module discovers is
   submitted through the exact same per-path job watcher.py's tier 1 uses
   (_make_watch_job) -- same mtime/hash gate, same delete/rename handling,
   no separate reindex logic duplicated here.
+
+decision 12 (register() runs unconditionally first) was superseded by
+decision 10's follow-up fix (SALTMDB f4bdfc9d, grilled to a locked plan
+2026-09-02): runtime.py's dispatch() already resolves repo_path to the
+canonical (repo_id, repo_root) pair and calls register_repo() with it
+unconditionally, before ever routing to this module -- so this module no
+longer registers or resolves repo_root itself; it trusts the caller and
+receives repo_id/repo_root directly, always already valid.
 """
 
 import json
@@ -36,33 +41,27 @@ _SOURCE_EXTENSION = ".py"
 def handle_notify_hook(
     *,
     agent: str,
-    repo_path: str,
+    repo_id: str,
+    repo_root: str,
     payload: str,
-    register: Callable[[str], None],
-    resolve_repo_root: Callable[[str], str | None],
     write_queue: WriteQueue,
     db_path_for: Callable[[str], str],
 ) -> None:
-    register(repo_path)
-    repo_root = resolve_repo_root(repo_path)
-    if repo_root is None:
-        return
-
     if agent == "git":
-        _handle_git(repo_path=repo_path, repo_root=repo_root, write_queue=write_queue, db_path_for=db_path_for)
+        _handle_git(repo_id=repo_id, repo_root=repo_root, write_queue=write_queue, db_path_for=db_path_for)
     elif agent == "claude-code":
         rel_path = _parse_claude_code_payload(payload, repo_root)
-        _submit_if_in_scope(repo_path, repo_root, write_queue, rel_path)
+        _submit_if_in_scope(repo_id, repo_root, write_queue, rel_path)
     elif agent == "codex":
         for rel_path in _parse_codex_payload(payload, repo_root):
-            _submit_if_in_scope(repo_path, repo_root, write_queue, rel_path)
+            _submit_if_in_scope(repo_id, repo_root, write_queue, rel_path)
     # An unrecognized agent name is a silent no-op, not an error --
     # ARCHITECTURE.md's whole notify-hook contract is "never break or
     # delay the caller", so a future/unknown agent name must not raise.
 
 
 def _submit_if_in_scope(
-    repo_path: str, repo_root: str, write_queue: WriteQueue, rel_path: str | None
+    repo_id: str, repo_root: str, write_queue: WriteQueue, rel_path: str | None
 ) -> None:
     if rel_path is None:
         return
@@ -70,13 +69,13 @@ def _submit_if_in_scope(
         return
     if ignore.get_ignore_matcher(repo_root).matches(rel_path):
         return
-    write_queue.submit(repo_path, _make_watch_job(repo_root, rel_path))
+    write_queue.submit(repo_id, _make_watch_job(repo_root, rel_path))
 
 
 def _handle_git(
-    *, repo_path: str, repo_root: str, write_queue: WriteQueue, db_path_for: Callable[[str], str]
+    *, repo_id: str, repo_root: str, write_queue: WriteQueue, db_path_for: Callable[[str], str]
 ) -> None:
-    conn = sqlite3.connect(db_path_for(repo_path))
+    conn = sqlite3.connect(db_path_for(repo_id))
     try:
         last_sha = IndexMetaStore(conn=conn).get_last_indexed_head_sha()
     finally:
@@ -86,26 +85,27 @@ def _handle_git(
     if current_sha is None:
         return
     if last_sha is None:
-        # Fresh repo, nothing recorded yet -- register() above already
-        # covers a from-scratch index via bootstrap; just record today's
-        # HEAD so the *next* git-hook call has something to diff from.
-        _set_head_sha(repo_path, write_queue, current_sha)
+        # Fresh repo, nothing recorded yet -- the caller's unconditional
+        # register_repo() already covers a from-scratch index via
+        # bootstrap; just record today's HEAD so the *next* git-hook call
+        # has something to diff from.
+        _set_head_sha(repo_id, write_queue, current_sha)
         return
     if current_sha == last_sha:
         return
 
     for rel_path in _git_diff_name_only(repo_root, last_sha, current_sha):
-        _submit_if_in_scope(repo_path, repo_root, write_queue, rel_path)
-    _set_head_sha(repo_path, write_queue, current_sha)
+        _submit_if_in_scope(repo_id, repo_root, write_queue, rel_path)
+    _set_head_sha(repo_id, write_queue, current_sha)
 
 
-def _set_head_sha(repo_path: str, write_queue: WriteQueue, sha: str) -> None:
+def _set_head_sha(repo_id: str, write_queue: WriteQueue, sha: str) -> None:
     def job(conn: sqlite3.Connection) -> None:
         IndexMetaStore(conn=conn).set_last_indexed_head_sha(sha)
 
     # Submitted after every per-file job above -- WriteQueue is one FIFO
     # per repo, so this always runs last for this notify-hook call.
-    write_queue.submit(repo_path, job)
+    write_queue.submit(repo_id, job)
 
 
 def _git_rev_parse_head(repo_root: str) -> str | None:

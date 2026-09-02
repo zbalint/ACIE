@@ -10,6 +10,11 @@ from acie.storage.symbol_store import SymbolStore
 
 _OBSERVED_AT = "2026-09-01T00:00:00Z"
 
+# decision 10's fix (SALTMDB f4bdfc9d, grilled 2026-09-02): register()/
+# repo_ready() are keyed on repo_id, walk_repo on repo_root -- these two
+# tests never need to differ (no real git repo here, no worktree scenario),
+# so every fake below just reuses the same opaque string for both.
+
 
 def _wait_until(predicate, timeout=2.0):
     deadline = time.monotonic() + timeout
@@ -23,14 +28,14 @@ def _wait_until(predicate, timeout=2.0):
 def _make_coordinator(tmp_path, files_by_repo, db_paths=None):
     db_paths = db_paths if db_paths is not None else {}
 
-    def db_path_for(repo_key):
-        return db_paths.setdefault(repo_key, str(tmp_path / f"{repo_key}.sqlite"))
+    def db_path_for(repo_id):
+        return db_paths.setdefault(repo_id, str(tmp_path / f"{repo_id}.sqlite"))
 
     write_queue = WriteQueue(db_path_for=db_path_for)
     coordinator = BootstrapCoordinator(
         write_queue=write_queue,
         db_path_for=db_path_for,
-        walk_repo=lambda repo_key: files_by_repo.get(repo_key, []),
+        walk_repo=lambda repo_root: files_by_repo.get(repo_root, []),
     )
     return coordinator, write_queue, db_path_for
 
@@ -47,7 +52,7 @@ def test_repo_ready_is_true_immediately_when_index_sqlite_already_exists_on_disk
     coordinator, write_queue, db_path_for = _make_coordinator(tmp_path, files_by_repo={})
     # Simulate a repo already fully indexed by a prior daemon run.
     sqlite3.connect(db_path_for("repo-a")).close()
-    coordinator._walk_repo = lambda repo_key: walk_calls.append(repo_key) or []
+    coordinator._walk_repo = lambda repo_root: walk_calls.append(repo_root) or []
 
     assert coordinator.repo_ready("repo-a") is True
     assert walk_calls == []  # pre-existing index.sqlite is trusted, never re-walked
@@ -65,7 +70,7 @@ def test_repo_ready_stays_false_during_an_in_flight_bootstrap_even_once_its_sqli
     release = threading.Event()
 
     class SlowWriteQueue:
-        def submit(self, repo_key, fn):
+        def submit(self, repo_id, fn):
             future = Future()
 
             def run():
@@ -85,11 +90,11 @@ def test_repo_ready_stays_false_during_an_in_flight_bootstrap_even_once_its_sqli
 
     coordinator = BootstrapCoordinator(
         write_queue=SlowWriteQueue(),
-        db_path_for=lambda repo_key: db_path,
-        walk_repo=lambda repo_key: [("pkg/mod.py", "def foo():\n    pass\n")],
+        db_path_for=lambda repo_id: db_path,
+        walk_repo=lambda repo_root: [("pkg/mod.py", "def foo():\n    pass\n")],
     )
 
-    coordinator.register("repo-a")
+    coordinator.register("repo-a", "repo-a")
 
     assert started.wait(timeout=2), "writer thread never started"
     assert os.path.exists(db_path), "test setup assumption broken: file should already exist"
@@ -109,7 +114,7 @@ def test_register_walks_and_indexes_every_file_then_flips_repo_ready_to_true(tmp
     coordinator, write_queue, db_path_for = _make_coordinator(tmp_path, files_by_repo=files)
 
     assert coordinator.repo_ready("repo-a") is False
-    coordinator.register("repo-a")
+    coordinator.register("repo-a", "repo-a")
 
     assert _wait_until(lambda: coordinator.repo_ready("repo-a")), "repo never became ready"
 
@@ -122,9 +127,9 @@ def test_register_on_a_repo_with_no_files_becomes_ready_without_any_write_queue_
     submitted = []
     coordinator, write_queue, _ = _make_coordinator(tmp_path, files_by_repo={"repo-a": []})
     real_submit = write_queue.submit
-    write_queue.submit = lambda repo_key, fn: submitted.append(repo_key) or real_submit(repo_key, fn)
+    write_queue.submit = lambda repo_id, fn: submitted.append(repo_id) or real_submit(repo_id, fn)
 
-    coordinator.register("repo-a")
+    coordinator.register("repo-a", "repo-a")
 
     assert _wait_until(lambda: coordinator.repo_ready("repo-a"))
     assert submitted == []
@@ -134,16 +139,16 @@ def test_register_on_a_repo_with_no_files_becomes_ready_without_any_write_queue_
 def test_register_is_idempotent_and_never_double_walks_a_repo_already_in_progress(tmp_path):
     walk_calls = []
 
-    def walk_repo(repo_key):
-        walk_calls.append(repo_key)
+    def walk_repo(repo_root):
+        walk_calls.append(repo_root)
         return [("pkg/mod.py", "def foo():\n    pass\n")]
 
     coordinator, write_queue, _ = _make_coordinator(tmp_path, files_by_repo={})
     coordinator._walk_repo = walk_repo
 
-    coordinator.register("repo-a")
-    coordinator.register("repo-a")
-    coordinator.register("repo-a")
+    coordinator.register("repo-a", "repo-a")
+    coordinator.register("repo-a", "repo-a")
+    coordinator.register("repo-a", "repo-a")
 
     assert _wait_until(lambda: coordinator.repo_ready("repo-a"))
     assert walk_calls == ["repo-a"]
@@ -153,11 +158,11 @@ def test_register_is_idempotent_and_never_double_walks_a_repo_already_in_progres
 def test_register_is_a_no_op_once_the_repo_is_already_ready(tmp_path):
     walk_calls = []
     coordinator, write_queue, _ = _make_coordinator(tmp_path, files_by_repo={"repo-a": []})
-    coordinator.register("repo-a")
+    coordinator.register("repo-a", "repo-a")
     assert _wait_until(lambda: coordinator.repo_ready("repo-a"))
 
-    coordinator._walk_repo = lambda repo_key: walk_calls.append(repo_key) or []
-    coordinator.register("repo-a")
+    coordinator._walk_repo = lambda repo_root: walk_calls.append(repo_root) or []
+    coordinator.register("repo-a", "repo-a")
 
     assert walk_calls == []
     write_queue.close()
@@ -167,15 +172,17 @@ def test_concurrent_registers_from_multiple_threads_only_walk_once(tmp_path):
     walk_calls = []
     lock = threading.Lock()
 
-    def walk_repo(repo_key):
+    def walk_repo(repo_root):
         with lock:
-            walk_calls.append(repo_key)
+            walk_calls.append(repo_root)
         return [(f"pkg/mod{i}.py", f"def f{i}():\n    pass\n") for i in range(5)]
 
     coordinator, write_queue, _ = _make_coordinator(tmp_path, files_by_repo={})
     coordinator._walk_repo = walk_repo
 
-    threads = [threading.Thread(target=coordinator.register, args=("repo-a",)) for _ in range(10)]
+    threads = [
+        threading.Thread(target=coordinator.register, args=("repo-a", "repo-a")) for _ in range(10)
+    ]
     for t in threads:
         t.start()
     for t in threads:
@@ -194,21 +201,21 @@ def test_register_still_becomes_ready_when_every_files_write_queue_submission_fa
     # finally block, so a repo whose writer never even starts stayed
     # wedged in INDEX_NOT_READY forever.
     class AlwaysFailingWriteQueue:
-        def submit(self, repo_key, fn):
+        def submit(self, repo_id, fn):
             future = Future()
             future.set_exception(RuntimeError("writer startup failed"))
             return future
 
     coordinator = BootstrapCoordinator(
         write_queue=AlwaysFailingWriteQueue(),
-        db_path_for=lambda repo_key: str(tmp_path / f"{repo_key}.sqlite"),
-        walk_repo=lambda repo_key: [
+        db_path_for=lambda repo_id: str(tmp_path / f"{repo_id}.sqlite"),
+        walk_repo=lambda repo_root: [
             ("pkg/mod.py", "def foo():\n    pass\n"),
             ("pkg/other.py", "def bar():\n    pass\n"),
         ],
     )
 
-    coordinator.register("repo-a")
+    coordinator.register("repo-a", "repo-a")
 
     assert _wait_until(lambda: coordinator.repo_ready("repo-a")), "repo stayed wedged in INDEX_NOT_READY"
 
@@ -220,8 +227,8 @@ def test_different_repos_bootstrap_independently(tmp_path):
     }
     coordinator, write_queue, db_path_for = _make_coordinator(tmp_path, files_by_repo=files)
 
-    coordinator.register("repo-a")
-    coordinator.register("repo-b")
+    coordinator.register("repo-a", "repo-a")
+    coordinator.register("repo-b", "repo-b")
 
     assert _wait_until(lambda: coordinator.repo_ready("repo-a") and coordinator.repo_ready("repo-b"))
 
@@ -229,4 +236,28 @@ def test_different_repos_bootstrap_independently(tmp_path):
     store_b = SymbolStore(db_path_for("repo-b"))
     assert {s.qualname for s in store_a.search(qualname_substring="")} == {"", "foo"}
     assert {s.qualname for s in store_b.search(qualname_substring="")} == {"", "baz"}
+    write_queue.close()
+
+
+def test_register_keys_readiness_on_repo_id_but_walks_the_given_repo_root(tmp_path):
+    # decision 10's fix: two different repo_ids sharing the same repo_root
+    # never comes up in practice (repo_id.py's resolve_repo_id and
+    # resolve_repo_root are both derived from the same underlying repo),
+    # but the reverse -- one repo_id, walked via its own distinct
+    # repo_root -- is exactly the worktree scenario the fix must support:
+    # register()'s first argument (repo_id) drives readiness bookkeeping,
+    # its second (repo_root) is what actually gets passed to walk_repo.
+    seen_roots = []
+
+    def walk_repo(repo_root):
+        seen_roots.append(repo_root)
+        return [("pkg/mod.py", "def foo():\n    pass\n")]
+
+    coordinator, write_queue, _ = _make_coordinator(tmp_path, files_by_repo={})
+    coordinator._walk_repo = walk_repo
+
+    coordinator.register("shared-repo-id", "/worktrees/a")
+
+    assert _wait_until(lambda: coordinator.repo_ready("shared-repo-id"))
+    assert seen_roots == ["/worktrees/a"]
     write_queue.close()

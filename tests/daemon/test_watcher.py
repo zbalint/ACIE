@@ -236,8 +236,8 @@ def test_repo_watcher_end_to_end_indexes_a_newly_created_file(tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     db_path = tmp_path / "index.sqlite"
-    write_queue = WriteQueue(db_path_for=lambda repo_key: str(db_path))
-    watcher = RepoWatcher(str(repo_root), "repo-key", write_queue, debounce_seconds=_SHORT_DEBOUNCE)
+    write_queue = WriteQueue(db_path_for=lambda repo_id: str(db_path))
+    watcher = RepoWatcher(str(repo_root), "repo-id", write_queue, debounce_seconds=_SHORT_DEBOUNCE)
     try:
         _write(str(repo_root), "mod.py", "def foo():\n    pass\n")
         deadline = time.monotonic() + 2
@@ -255,16 +255,39 @@ def test_repo_watcher_end_to_end_indexes_a_newly_created_file(tmp_path):
         write_queue.close(timeout=2)
 
 
-def test_watcher_registry_creates_exactly_one_watcher_per_repo_key(tmp_path):
+def test_watcher_registry_creates_exactly_one_watcher_per_repo_root(tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    write_queue = WriteQueue(db_path_for=lambda repo_key: ":memory:")
+    write_queue = WriteQueue(db_path_for=lambda repo_id: ":memory:")
     registry = WatcherRegistry(write_queue)
     try:
-        registry.register("repo-key", str(repo_root))
-        first_watcher = registry._watchers["repo-key"]
-        registry.register("repo-key", str(repo_root))  # idempotent second call
+        registry.register("repo-id", str(repo_root))
+        first_watcher = registry._watchers[str(repo_root)]
+        registry.register("repo-id", str(repo_root))  # idempotent second call
 
-        assert registry._watchers["repo-key"] is first_watcher
+        assert registry._watchers[str(repo_root)] is first_watcher
+    finally:
+        registry.close(timeout=2)
+
+
+def test_watcher_registry_keys_on_repo_root_not_repo_id(tmp_path):
+    # decision 10's fix (SALTMDB f4bdfc9d, grilled 2026-09-02): a second
+    # repo_path spelling of the identical worktree directory (e.g. a
+    # symlink vs its realpath'd twin) resolves to the same repo_root even
+    # when it resolves to a *different* repo_id would be a bug elsewhere
+    # -- but this registry specifically must dedup on repo_root, since
+    # that's the actual directory an Observer watches, not on whatever
+    # repo_id string happens to be passed alongside it.
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    write_queue = WriteQueue(db_path_for=lambda repo_id: ":memory:")
+    registry = WatcherRegistry(write_queue)
+    try:
+        registry.register("repo-id-one", str(repo_root))
+        first_watcher = registry._watchers[str(repo_root)]
+        registry.register("repo-id-two", str(repo_root))  # different repo_id, same directory
+
+        assert len(registry._watchers) == 1
+        assert registry._watchers[str(repo_root)] is first_watcher
     finally:
         registry.close(timeout=2)

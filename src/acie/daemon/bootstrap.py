@@ -27,11 +27,13 @@ from acie.storage.symbol_store import SymbolStore
 class BootstrapCoordinator:
     """Tracks per-repo readiness and drives a repo's first walk-and-index pass.
 
-    `db_path_for` and `walk_repo` are injected exactly like `WriteQueue`'s
-    own `db_path_for` -- production wiring (resolving `repo_path` to an
-    actual repo root and reading real files off disk) belongs to the
-    daemon-server slice that constructs the real callables; tests here
-    supply fakes so no real git repo or filesystem walk is needed.
+    `db_path_for` (repo_id -> index.sqlite path) and `walk_repo` (repo_root
+    -> discovered files) are injected exactly like `WriteQueue`'s own
+    `db_path_for` -- production wiring (resolving a raw `repo_path` to the
+    canonical `repo_id`/`repo_root` pair register() takes, and reading real
+    files off disk) belongs to the daemon-server slice that constructs the
+    real callables; tests here supply fakes so no real git repo or
+    filesystem walk is needed.
     """
 
     def __init__(
@@ -47,31 +49,39 @@ class BootstrapCoordinator:
         self._ready: set[str] = set()
         self._in_progress: set[str] = set()
 
-    def repo_ready(self, repo_key: str) -> bool:
+    def repo_ready(self, repo_id: str) -> bool:
         """The exact `repo_ready` callable dispatch.dispatch_request requires.
 
-        The disk-existence check only ever applies to a repo_key this
+        The disk-existence check only ever applies to a repo_id this
         coordinator has never touched (no prior register() call this
         process lifetime): opening the write queue's per-repo connection
-        creates repo_key's sqlite file on disk immediately, well before
+        creates repo_id's sqlite file on disk immediately, well before
         that connection's first write is committed, so while a bootstrap
-        for repo_key is in flight this must trust `_in_progress`, not the
+        for repo_id is in flight this must trust `_in_progress`, not the
         file's mere existence, or a concurrent caller could observe a
         just-created, still-empty (or partially written) index as ready.
         """
         with self._lock:
-            if repo_key in self._ready:
+            if repo_id in self._ready:
                 return True
-            if repo_key in self._in_progress:
+            if repo_id in self._in_progress:
                 return False
-        if os.path.exists(self._db_path_for(repo_key)):
+        if os.path.exists(self._db_path_for(repo_id)):
             with self._lock:
-                self._ready.add(repo_key)
+                self._ready.add(repo_id)
             return True
         return False
 
-    def register(self, repo_key: str) -> None:
-        """Idempotent: starts repo_key's bootstrap walk if it hasn't already.
+    def register(self, repo_id: str, repo_root: str) -> None:
+        """Idempotent: starts repo_id's bootstrap walk if it hasn't already.
+
+        Two params, not one: readiness/write-queue bookkeeping is keyed on
+        `repo_id` (the canonical, worktree-collapsing identity -- decision
+        10, SALTMDB f4bdfc9d/repo_path-vs-resolve_repo_id keying fix), but
+        `walk_repo` needs an actual on-disk directory to walk, which a
+        repo_id hash cannot be reversed back into -- so the caller (already
+        holding both, having resolved them together) passes `repo_root`
+        through explicitly rather than this class hiding a second lookup.
 
         Returns immediately -- per DAEMON.md, bootstrap indexing "kicks off
         a full walk-and-index pass in the background ... rather than
@@ -80,24 +90,24 @@ class BootstrapCoordinator:
         each discovered file becomes one write-queue job, matching
         `index_file`'s existing one-file-per-write-queue-item granularity.
         """
-        if self.repo_ready(repo_key):
+        if self.repo_ready(repo_id):
             return
         with self._lock:
-            if repo_key in self._in_progress:
+            if repo_id in self._in_progress:
                 return
-            self._in_progress.add(repo_key)
-        threading.Thread(target=self._run_bootstrap, args=(repo_key,), daemon=True).start()
+            self._in_progress.add(repo_id)
+        threading.Thread(target=self._run_bootstrap, args=(repo_id, repo_root), daemon=True).start()
 
-    def _run_bootstrap(self, repo_key: str) -> None:
+    def _run_bootstrap(self, repo_id: str, repo_root: str) -> None:
         try:
-            files = list(self._walk_repo(repo_key))
+            files = list(self._walk_repo(repo_root))
         except BaseException:
             with self._lock:
-                self._in_progress.discard(repo_key)
+                self._in_progress.discard(repo_id)
             raise
 
         if not files:
-            self._mark_ready(repo_key)
+            self._mark_ready(repo_id)
             return
 
         remaining = [len(files)]
@@ -124,7 +134,7 @@ class BootstrapCoordinator:
                 remaining[0] -= 1
                 done = remaining[0] == 0
             if done:
-                self._mark_ready(repo_key)
+                self._mark_ready(repo_id)
 
         def make_job(path: str, source_text: str):
             def job(conn):
@@ -138,9 +148,9 @@ class BootstrapCoordinator:
             return job
 
         for path, source_text in files:
-            self._write_queue.submit(repo_key, make_job(path, source_text)).add_done_callback(on_job_done)
+            self._write_queue.submit(repo_id, make_job(path, source_text)).add_done_callback(on_job_done)
 
-    def _mark_ready(self, repo_key: str) -> None:
+    def _mark_ready(self, repo_id: str) -> None:
         with self._lock:
-            self._in_progress.discard(repo_key)
-            self._ready.add(repo_key)
+            self._in_progress.discard(repo_id)
+            self._ready.add(repo_id)

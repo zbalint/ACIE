@@ -10,12 +10,18 @@ f4bdfc9d) for the full set of locked decisions this module implements:
   and lives for the daemon's whole process life, same as WriteQueue's
   writer threads -- no idle/teardown built here either.
 - decision 6: no cross-repo routing table -- one watcher instance per
-  repo, its closures already know their own repo_key by construction.
+  repo, its closures already know their own repo_id by construction.
 - decision 7: no cross-tier dedup against tier 2/3 -- a duplicate
   single-file reindex is cheap/idempotent, so this isn't built.
 - decision 13: delete/rename reuse index_file(path, "") as-is (already
   diff-tombstone-capable, see indexer.py) -- a rename is just two touched
   paths (old + new), handled by the exact same per-path job.
+
+See also decision 10's follow-up fix (SALTMDB f4bdfc9d, grilled to a
+locked plan 2026-09-02): WatcherRegistry keys on repo_root (RepoWatcher's
+own write-queue submissions use the canonical repo_id instead) so two
+worktrees of one repo get two Observers sharing one write-queue worker,
+and two spellings of one worktree never get a duplicate Observer.
 """
 
 import hashlib
@@ -210,16 +216,16 @@ class _DebouncedEventHandler(FileSystemEventHandler):
 class RepoWatcher:
     """One OS-level watch on one repo's root, submitting a write-queue job
     per touched path once its debounce window closes. decision 6: this
-    instance's closures already know their own repo_key, so no separate
+    instance's closures already know their own repo_id, so no separate
     path -> repo routing table is needed anywhere.
     """
 
     def __init__(
-        self, repo_root: str, repo_key: str, write_queue: WriteQueue,
+        self, repo_root: str, repo_id: str, write_queue: WriteQueue,
         *, debounce_seconds: float = _DEBOUNCE_SECONDS,
     ) -> None:
         self._repo_root = repo_root
-        self._repo_key = repo_key
+        self._repo_id = repo_id
         self._write_queue = write_queue
         self._handler = _DebouncedEventHandler(
             repo_root, self._on_paths_changed, debounce_seconds=debounce_seconds
@@ -231,7 +237,7 @@ class RepoWatcher:
 
     def _on_paths_changed(self, rel_paths: set[str]) -> None:
         for rel_path in rel_paths:
-            self._write_queue.submit(self._repo_key, _make_watch_job(self._repo_root, rel_path))
+            self._write_queue.submit(self._repo_id, _make_watch_job(self._repo_root, rel_path))
 
     def stop(self, timeout: float | None = None) -> None:
         self._observer.stop()
@@ -239,9 +245,20 @@ class RepoWatcher:
 
 
 class WatcherRegistry:
-    """Lazily creates and owns one RepoWatcher per repo_key -- same shape
+    """Lazily creates and owns one RepoWatcher per repo_root -- same shape
     as WriteQueue/BootstrapCoordinator (decision 5: no idle/teardown, a
     watcher lives for the daemon's whole process life once created).
+
+    Keyed by repo_root, not repo_id (decision 10, SALTMDB f4bdfc9d/
+    repo_path-vs-resolve_repo_id keying fix): repo_root is the actual
+    directory an Observer watches, and two genuinely different worktree
+    directories legitimately need two separate Observers even though they
+    share one repo_id -- but repo_root is already realpath'd/canonical
+    (repo_id.py's resolve_repo_root), so two different repo_path spellings
+    of the *same* worktree (a symlink vs its realpath'd twin) still
+    correctly collapse to one Observer here. Each RepoWatcher's own
+    write-queue submissions use the given repo_id, not its registry key, so
+    every worktree's live edits land in the one shared write-queue worker.
     """
 
     def __init__(self, write_queue: WriteQueue) -> None:
@@ -249,11 +266,11 @@ class WatcherRegistry:
         self._lock = threading.Lock()
         self._watchers: dict[str, RepoWatcher] = {}
 
-    def register(self, repo_key: str, repo_root: str) -> None:
+    def register(self, repo_id: str, repo_root: str) -> None:
         with self._lock:
-            if repo_key in self._watchers:
+            if repo_root in self._watchers:
                 return
-            self._watchers[repo_key] = RepoWatcher(repo_root, repo_key, self._write_queue)
+            self._watchers[repo_root] = RepoWatcher(repo_root, repo_id, self._write_queue)
 
     def close(self, timeout: float | None = None) -> None:
         with self._lock:

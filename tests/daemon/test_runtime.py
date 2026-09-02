@@ -1,3 +1,4 @@
+import os
 import subprocess
 import time
 
@@ -144,5 +145,98 @@ def test_runtime_routes_notify_hook_method_to_the_git_agent_handler(tmp_path):
                 break
             time.sleep(0.02)
         assert found, "git-hook-triggered reindex never surfaced the renamed function"
+    finally:
+        server.shutdown()
+
+
+def test_runtime_dedupes_write_queue_and_bootstrap_state_across_repo_path_spellings(tmp_path):
+    # decision 10's fix (SALTMDB f4bdfc9d, grilled 2026-09-02): a symlink
+    # and its realpath'd twin are two different repo_path strings for the
+    # exact same underlying repo -- the currently-reachable trigger found
+    # by comparing cli.py's notify-hook (os.getcwd(), not realpath'd)
+    # against mcp_server.py's (os.path.realpath(os.getcwd())). Before the
+    # fix, WriteQueue/BootstrapCoordinator/WatcherRegistry keyed on the
+    # raw string each treated these as two unrelated repos, sharing one
+    # on-disk index.sqlite but never each other's in-memory state.
+    real_repo = tmp_path / "real_repo"
+    real_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(real_repo)], check=True)
+    (real_repo / "module.py").write_text("def target():\n    pass\n", encoding="utf-8")
+    real_repo_path = os.path.realpath(str(real_repo))
+    symlinked_repo = tmp_path / "symlinked_repo"
+    symlinked_repo.symlink_to(real_repo_path, target_is_directory=True)
+
+    state_dir = tmp_path / "state"
+    server = create_daemon(state_dir=str(state_dir), port=0)
+    server.start()
+    try:
+        # Bootstrap via the symlinked spelling and wait for it to finish.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            response = send_request(
+                server.port, build_request("find_symbol", str(symlinked_repo), {"name": "target"})
+            )
+            if response["ok"]:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("repo did not finish bootstrap indexing via the symlinked path")
+
+        # The realpath'd spelling of the identical repo must already be
+        # ready -- it shares the symlinked spelling's repo_id-keyed
+        # BootstrapCoordinator state, not a fresh one of its own.
+        response = send_request(server.port, build_request("find_symbol", real_repo_path, {"name": "target"}))
+        assert response["ok"] is True
+        assert [item["qualname"] for item in response["result"]["results"]] == ["target"]
+
+        # Only one repos/<repo-id>/ directory was ever created -- confirms
+        # the write-queue/bootstrap state was genuinely shared, not just
+        # coincidentally both-ready from two independent walks.
+        repo_dirs = list((state_dir / "repos").iterdir())
+        assert len(repo_dirs) == 1
+    finally:
+        server.shutdown()
+
+
+def test_runtime_worktree_smoke_shared_bootstrap_state_does_not_crash_or_deadlock(tmp_path):
+    # decision 10's fix: two live worktrees of one repo now share one
+    # repo_id-keyed write queue and bootstrap-readiness flag. Full
+    # multi-worktree walk-merging semantics are explicitly out of v0 scope
+    # (ARCHITECTURE.md "Not Yet Specified") -- this only smoke-tests that
+    # the shared-state path doesn't crash or deadlock and matches the
+    # agreed first-registrant-wins behavior, not that both worktrees'
+    # possibly-diverged content ends up indexed.
+    main_repo = tmp_path / "main_repo"
+    main_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(main_repo)], check=True)
+    subprocess.run(["git", "-C", str(main_repo), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(main_repo), "config", "user.name", "T"], check=True)
+    (main_repo / "module.py").write_text("def target():\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(main_repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(main_repo), "commit", "-q", "-m", "first"], check=True)
+
+    worktree = tmp_path / "worktree"
+    subprocess.run(
+        ["git", "-C", str(main_repo), "worktree", "add", "-b", "other-branch", str(worktree)], check=True
+    )
+
+    server = create_daemon(state_dir=str(tmp_path / "state"), port=0)
+    server.start()
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            response = send_request(server.port, build_request("find_symbol", str(main_repo), {"name": "target"}))
+            if response["ok"]:
+                break
+            assert response["error"]["code"] == "INDEX_NOT_READY"
+            time.sleep(0.01)
+        else:
+            raise AssertionError("main worktree did not finish bootstrap indexing")
+
+        # Registering the second worktree (shared repo_id, distinct
+        # repo_root) must not crash or deadlock, and per the agreed
+        # first-registrant-wins behavior it reads as ready immediately too.
+        response = send_request(server.port, build_request("find_symbol", str(worktree), {"name": "target"}))
+        assert response["ok"] is True
     finally:
         server.shutdown()
