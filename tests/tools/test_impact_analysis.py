@@ -89,12 +89,24 @@ def test_impact_analysis_traverses_both_calls_and_imports_predicates():
 
 
 def test_impact_analysis_excludes_references_inherits_defines_predicates():
+    # `overrides` joined the followed predicate set in slice A4 (wayfinder
+    # ticket 732f8b2d's resolution: {"calls", "imports", "overrides"}) --
+    # `inherits` deliberately did NOT, same reasoning graph.py already
+    # applies to it (already reachable via find_references/get_definition).
+    # This test now exercises all three still-excluded predicates, not just
+    # `references`, so the overrides/inherits boundary stays covered.
     symbol_store, relation_store, index_meta_store = _stores()
     root = _symbol("pkg/mod.py:root#function", "pkg/mod.py", "root", "function", line=1)
     referencer = _symbol("pkg/mod.py:referencer#function", "pkg/mod.py", "referencer", "function", line=5)
+    inheriting_class = _symbol("pkg/mod.py:Sub#class", "pkg/mod.py", "Sub", "class", line=9)
+    defining_module = _symbol("pkg/mod.py:#module", "pkg/mod.py", "", "module", line=1)
     symbol_store.upsert(root)
     symbol_store.upsert(referencer)
+    symbol_store.upsert(inheriting_class)
+    symbol_store.upsert(defining_module)
     relation_store.upsert(_relation(referencer.id, root.id, "references", "pkg/mod.py", 6, 4))
+    relation_store.upsert(_relation(inheriting_class.id, root.id, "inherits", "pkg/mod.py", 9, 6))
+    relation_store.upsert(_relation(defining_module.id, root.id, "defines", "pkg/mod.py", 1, 0))
 
     envelope = impact_analysis(
         symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
@@ -102,6 +114,121 @@ def test_impact_analysis_excludes_references_inherits_defines_predicates():
     )
 
     assert envelope["affected_symbols"] == []
+
+
+def test_impact_analysis_traverses_overrides_predicate_finding_subclass_override_as_affected():
+    symbol_store, relation_store, index_meta_store = _stores()
+    base_method = _symbol("pkg/base.py:Base.foo#method", "pkg/base.py", "Base.foo", "method", line=2)
+    override_method = _symbol("pkg/sub.py:Sub.foo#method", "pkg/sub.py", "Sub.foo", "method", line=3)
+    symbol_store.upsert(base_method)
+    symbol_store.upsert(override_method)
+    relation_store.upsert(_relation(override_method.id, base_method.id, "overrides", "pkg/sub.py", 3, 4))
+
+    envelope = impact_analysis(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        root=base_method.id,
+    )
+
+    assert {s["id"] for s in envelope["affected_symbols"]} == {override_method.id}
+
+
+def test_impact_analysis_multi_level_override_chain_transitively_discovered_via_bfs():
+    # `overrides` points at the immediate base only (per extract_relations.py's
+    # own docstring: "multi-level chains fall out for free via BFS hopping
+    # through the edges") -- no special-cased chain-walking needed, the
+    # existing generic BFS already handles it once overrides is followed.
+    symbol_store, relation_store, index_meta_store = _stores()
+    grand = _symbol("pkg/a.py:GrandBase.foo#method", "pkg/a.py", "GrandBase.foo", "method", line=1)
+    base = _symbol("pkg/b.py:Base.foo#method", "pkg/b.py", "Base.foo", "method", line=1)
+    sub = _symbol("pkg/c.py:Sub.foo#method", "pkg/c.py", "Sub.foo", "method", line=1)
+    symbol_store.upsert(grand)
+    symbol_store.upsert(base)
+    symbol_store.upsert(sub)
+    relation_store.upsert(_relation(base.id, grand.id, "overrides", "pkg/b.py", 1, 4))
+    relation_store.upsert(_relation(sub.id, base.id, "overrides", "pkg/c.py", 1, 4))
+
+    envelope = impact_analysis(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        root=grand.id, depth_clamp=5,
+    )
+
+    assert {s["id"] for s in envelope["affected_symbols"]} == {base.id, sub.id}
+
+
+def test_impact_analysis_affected_symbols_carry_discovery_predicate_field():
+    # New per-node field (wayfinder resolution 732f8b2d): impact_analysis
+    # has no `edges` list at all, so without this field there is no way to
+    # tell from `affected_symbols` alone whether a node was reached via
+    # calls/imports/overrides. Unconditional (not full-gated) -- unlike
+    # confidence/provenance (the SYMBOL's own metadata), this is traversal
+    # metadata, structurally more like `impact_summary`'s always-shown
+    # confidence-tier breakdown than like render_symbol's full-only fields.
+    symbol_store, relation_store, index_meta_store = _stores()
+    caller = _symbol("pkg/mod.py:caller#function", "pkg/mod.py", "caller", "function", line=1)
+    callee = _symbol("pkg/mod.py:callee#function", "pkg/mod.py", "callee", "function", line=5)
+    symbol_store.upsert(caller)
+    symbol_store.upsert(callee)
+    relation_store.upsert(_relation(caller.id, callee.id, "calls", "pkg/mod.py", 2, 4))
+
+    envelope = impact_analysis(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        root=callee.id,
+    )
+
+    assert envelope["affected_symbols"][0]["discovery_predicate"] == "calls"
+
+
+def test_impact_analysis_discovery_predicate_distinguishes_overrides_from_calls():
+    symbol_store, relation_store, index_meta_store = _stores()
+    base_method = _symbol("pkg/base.py:Base.foo#method", "pkg/base.py", "Base.foo", "method", line=2)
+    override_method = _symbol("pkg/sub.py:Sub.foo#method", "pkg/sub.py", "Sub.foo", "method", line=3)
+    symbol_store.upsert(base_method)
+    symbol_store.upsert(override_method)
+    relation_store.upsert(_relation(override_method.id, base_method.id, "overrides", "pkg/sub.py", 3, 4))
+
+    envelope = impact_analysis(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        root=base_method.id, full=True,
+    )
+
+    assert envelope["affected_symbols"][0]["discovery_predicate"] == "overrides"
+
+
+def test_impact_analysis_same_subclass_overriding_two_different_bases_are_independent_edges_not_conflated():
+    # Closes the open question in memory b8fed631 (A3's self-critique):
+    # A3 deliberately gives independently-EXTRACTED confidence to a
+    # same-file-base override and a cross-file-base override on the same
+    # subclass method, rather than one true joint-MRO-ambiguous edge.
+    # Verified here that this can never cause impact_analysis to double-
+    # count or mis-rank a single root's blast radius: `overrides` points at
+    # the immediate BASE method, so the two edges have two DIFFERENT
+    # targets. Querying either base is a fully independent traversal that
+    # only ever sees its own edge -- there is no query shape where both
+    # edges collide into one impact_summary tally. Not a correctness bug;
+    # no fix needed.
+    symbol_store, relation_store, index_meta_store = _stores()
+    same_file_base = _symbol("pkg/mod.py:SameFileBase.bar#method", "pkg/mod.py", "SameFileBase.bar", "method", line=2)
+    cross_file_base = _symbol("pkg/other.py:CrossFileBase.bar#method", "pkg/other.py", "CrossFileBase.bar", "method", line=2)
+    overriding_method = _symbol("pkg/mod.py:Foo.bar#method", "pkg/mod.py", "Foo.bar", "method", line=9)
+    symbol_store.upsert(same_file_base)
+    symbol_store.upsert(cross_file_base)
+    symbol_store.upsert(overriding_method)
+    relation_store.upsert(_relation(overriding_method.id, same_file_base.id, "overrides", "pkg/mod.py", 9, 4))
+    relation_store.upsert(_relation(overriding_method.id, cross_file_base.id, "overrides", "pkg/mod.py", 9, 4))
+
+    same_file_envelope = impact_analysis(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        root=same_file_base.id,
+    )
+    cross_file_envelope = impact_analysis(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        root=cross_file_base.id,
+    )
+
+    assert {s["id"] for s in same_file_envelope["affected_symbols"]} == {overriding_method.id}
+    assert same_file_envelope["impact_summary"] == {"total": 1, "EXTRACTED": 1, "INFERRED": 0, "AMBIGUOUS": 0}
+    assert {s["id"] for s in cross_file_envelope["affected_symbols"]} == {overriding_method.id}
+    assert cross_file_envelope["impact_summary"] == {"total": 1, "EXTRACTED": 1, "INFERRED": 0, "AMBIGUOUS": 0}
 
 
 def test_impact_analysis_multi_hop_transitive_when_depth_clamp_allows():
@@ -246,7 +373,7 @@ def test_impact_analysis_renders_orphaned_relation_source_as_unresolved_leaf():
     )
 
     assert envelope["affected_symbols"] == [
-        {"id": "pkg/mod.py:ghost#function", "resolved": False}
+        {"id": "pkg/mod.py:ghost#function", "resolved": False, "discovery_predicate": "calls"}
     ]
 
 

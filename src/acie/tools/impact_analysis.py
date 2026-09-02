@@ -19,10 +19,16 @@ Seam decisions confirmed with the user before writing tests
    guessing the right shared abstraction now would risk over-generalizing
    graph.py based on one caller's needs. If the two traversals turn out
    substantially identical after this lands, extract then -- not before.
-2. **Predicate set: {"calls", "imports"} only** -- mirrors graph's two
-   graph_type predicate mappings combined into one traversal.
-   inherits/references/defines stay excluded, same reasoning as graph
-   (already reachable via find_references/get_definition).
+2. **Predicate set: {"calls", "imports", "overrides"}** -- mirrors graph's
+   two graph_type predicate mappings combined into one traversal, plus
+   `overrides` (slice A4, wayfinder ticket 732f8b2d's resolution: a base
+   method's blast radius includes every subclass that overrides it;
+   `overrides` points at the immediate base only, so multi-level override
+   chains fall out for free via the existing generic BFS, no chain-walking
+   code needed). `inherits`/references/defines stay excluded, same
+   reasoning as graph (already reachable via find_references/
+   get_definition; `inherits` deliberately did NOT join this set even
+   though `overrides` did -- the ticket resolution names `overrides` only).
 3. **Direction is fixed upstream, not a parameter.** "Impact of changing
    root" means finding what depends on/calls root -- i.e. what would
    break -- which is inbound edges (root is the relation's target, the
@@ -57,6 +63,16 @@ fork, so decided the same way graph's local defaults/decisions were):**
   check. This makes impact_analysis's loop body simpler than graph's, not
   a downgrade -- graph's edge-level detail simply isn't part of this
   tool's contract.
+- **`discovery_predicate` (slice A4) is a per-node field on every affected
+  symbol, unconditional -- not full-gated like confidence/provenance.**
+  Since there's no `edges` list at all, this is the only way to tell
+  *which* predicate (calls/imports/overrides) connected a node once three
+  predicates are followed instead of two. It's traversal metadata, not the
+  symbol's own data (unlike confidence/provenance, which come from
+  render_symbol and stay full-gated) -- structurally closer to
+  `impact_summary`'s always-shown confidence-tier breakdown. Set once, at
+  the same first-discovery point discovery_confidence already is, so it
+  shares that dict's single-expansion-per-node invariant for free.
 - **`_DEFAULT_NODE_CAP = 100`, `_DEFAULT_DEPTH_CLAMP = 5`** -- same local
   v0 default values as graph.py, not specified in ARCHITECTURE.md, same
   "flagged, not asked about" status as every prior numeric default in this
@@ -74,7 +90,7 @@ from acie.tools.render import render_symbol
 _DEFAULT_NODE_CAP = 100
 _DEFAULT_DEPTH_CLAMP = 5
 
-_PREDICATES = {"calls", "imports"}
+_PREDICATES = {"calls", "imports", "overrides"}
 
 
 def impact_analysis(
@@ -120,7 +136,9 @@ def impact_analysis(
                     continue
                 if is_new_node:
                     neighbor_symbol = symbol_store.get(neighbor_id)
-                    nodes[neighbor_id] = _render_node(neighbor_id, neighbor_symbol, full=full)
+                    rendered = _render_node(neighbor_id, neighbor_symbol, full=full)
+                    rendered["discovery_predicate"] = relation.predicate
+                    nodes[neighbor_id] = rendered
                     discovery_confidence[neighbor_id] = relation.confidence
                     next_frontier.add(neighbor_id)
         frontier = next_frontier
