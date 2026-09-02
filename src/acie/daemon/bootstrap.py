@@ -48,6 +48,7 @@ class BootstrapCoordinator:
         self._lock = threading.Lock()
         self._ready: set[str] = set()
         self._in_progress: set[str] = set()
+        self._migration_checked: set[str] = set()
 
     def repo_ready(self, repo_id: str) -> bool:
         """The exact `repo_ready` callable dispatch.dispatch_request requires.
@@ -89,8 +90,18 @@ class BootstrapCoordinator:
         the write-queue's writer thread, which only ever does DB work), and
         each discovered file becomes one write-queue job, matching
         `index_file`'s existing one-file-per-write-queue-item granularity.
+
+        For a repo that's *already* ready (an existing index.sqlite this
+        coordinator never walked itself this process lifetime -- most
+        commonly an installation upgraded to a version with cross-file call
+        resolution), this instead schedules the one-time migration catch-up
+        pass (see `_maybe_schedule_cross_file_migration`) rather than
+        returning as a pure no-op -- codex review finding: without this, an
+        already-indexed repo would never gain cross-file call resolution
+        except by chance, one edited file at a time.
         """
         if self.repo_ready(repo_id):
+            self._maybe_schedule_cross_file_migration(repo_id, repo_root)
             return
         with self._lock:
             if repo_id in self._in_progress:
@@ -107,9 +118,90 @@ class BootstrapCoordinator:
             raise
 
         if not files:
+            # A genuinely empty repo never gets a write_queue submission at
+            # all (see repo_ready()'s own docstring: opening the per-repo
+            # connection creates index.sqlite on disk immediately) -- so
+            # there is no index.sqlite to persist the migration flag into,
+            # and nothing to migrate anyway. Skip it; a future daemon
+            # restart will just cheaply re-walk-and-immediately-ready again.
             self._mark_ready(repo_id)
             return
 
+        def on_bootstrap_done() -> None:
+            self._mark_ready(repo_id)
+            # A from-scratch bootstrap already gets the full two-pass
+            # treatment below -- mark the migration flag done too, so a
+            # later daemon restart's register() call never redundantly
+            # re-walks this repo a third time via _maybe_schedule_cross_file_migration.
+            self._mark_cross_file_migration_done(repo_id)
+
+        # Second pass: os.walk's file-discovery order (this class's own
+        # `_walk_repo` contract) is arbitrary, not dependency-ordered, so a
+        # file indexed before something it cross-file-calls into leaves that
+        # call unresolved (see extract_relations.py's DeferredImportCall /
+        # indexer.py's _resolve_deferred_calls -- no retarget-in-place
+        # primitive exists to fix it after the fact). Re-running every
+        # file's index_file once more, now that the full repo's SymbolStore
+        # is populated from the first pass, resolves whatever the first
+        # pass's arbitrary order missed -- a bounded, one-time cost at
+        # registration, not a steady-state one. Only the initial
+        # registration walk gets this; tier 1-3 incremental reindexing
+        # (watcher/git-hooks/agent-hooks) doesn't re-run this second pass.
+        self._run_indexing_pass(
+            repo_id, files, on_pass_done=lambda: self._run_indexing_pass(repo_id, files, on_pass_done=on_bootstrap_done)
+        )
+
+    def _maybe_schedule_cross_file_migration(self, repo_id: str, repo_root: str) -> None:
+        """One-time catch-up for a repo that was already `repo_ready()`
+        before this call -- either indexed under pre-cross-file-resolution
+        code, or (harmlessly redundant but still correct) one this
+        coordinator already fully bootstrapped itself this process
+        lifetime. `_migration_checked` only dedupes *within* this process;
+        the actual "already done" answer is `IndexMetaStore.
+        cross_file_pass_done()`, persisted to the repo's own index.sqlite so
+        it survives a daemon restart -- checked from a write-queue job (not
+        a fresh ad hoc connection) to stay on the one connection/thread each
+        repo's writer already owns, same discipline as every other write in
+        this codebase.
+        """
+        with self._lock:
+            if repo_id in self._migration_checked:
+                return
+            self._migration_checked.add(repo_id)
+        threading.Thread(
+            target=self._run_cross_file_migration_if_needed, args=(repo_id, repo_root), daemon=True
+        ).start()
+
+    def _run_cross_file_migration_if_needed(self, repo_id: str, repo_root: str) -> None:
+        def check_job(conn) -> bool:
+            return IndexMetaStore(conn=conn).cross_file_pass_done()
+
+        already_done = self._write_queue.submit(repo_id, check_job).result()
+        if already_done:
+            return
+
+        try:
+            files = list(self._walk_repo(repo_root))
+        except BaseException:
+            # Best-effort catch-up: repo_ready() was already true before
+            # this ran, so a failed walk here must not affect it -- unlike
+            # _run_bootstrap, there is no INDEX_NOT_READY state to fall
+            # back into. A later register() call will simply retry (this
+            # process's own _migration_checked guard only blocks a *second*
+            # concurrent attempt, not a future one, since this method
+            # returns without ever marking the flag done on failure).
+            with self._lock:
+                self._migration_checked.discard(repo_id)
+            return
+
+        if not files:
+            self._mark_cross_file_migration_done(repo_id)
+            return
+        self._run_indexing_pass(repo_id, files, on_pass_done=lambda: self._mark_cross_file_migration_done(repo_id))
+
+    def _run_indexing_pass(
+        self, repo_id: str, files: list[tuple[str, str]], *, on_pass_done: Callable[[], None]
+    ) -> None:
         remaining = [len(files)]
         remaining_lock = threading.Lock()
 
@@ -134,23 +226,30 @@ class BootstrapCoordinator:
                 remaining[0] -= 1
                 done = remaining[0] == 0
             if done:
-                self._mark_ready(repo_id)
-
-        def make_job(path: str, source_text: str):
-            def job(conn):
-                index_file(
-                    path=path, source_text=source_text,
-                    observed_at=datetime.now(timezone.utc).isoformat(),
-                    symbol_store=SymbolStore(conn=conn),
-                    relation_store=RelationStore(conn=conn),
-                    index_meta_store=IndexMetaStore(conn=conn),
-                )
-            return job
+                on_pass_done()
 
         for path, source_text in files:
-            self._write_queue.submit(repo_id, make_job(path, source_text)).add_done_callback(on_job_done)
+            self._write_queue.submit(repo_id, _make_index_job(path, source_text)).add_done_callback(on_job_done)
 
     def _mark_ready(self, repo_id: str) -> None:
         with self._lock:
             self._in_progress.discard(repo_id)
             self._ready.add(repo_id)
+
+    def _mark_cross_file_migration_done(self, repo_id: str) -> None:
+        def mark_job(conn) -> None:
+            IndexMetaStore(conn=conn).mark_cross_file_pass_done()
+
+        self._write_queue.submit(repo_id, mark_job)
+
+
+def _make_index_job(path: str, source_text: str):
+    def job(conn):
+        index_file(
+            path=path, source_text=source_text,
+            observed_at=datetime.now(timezone.utc).isoformat(),
+            symbol_store=SymbolStore(conn=conn),
+            relation_store=RelationStore(conn=conn),
+            index_meta_store=IndexMetaStore(conn=conn),
+        )
+    return job

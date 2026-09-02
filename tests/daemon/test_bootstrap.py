@@ -6,6 +6,9 @@ from concurrent.futures import Future
 
 from acie.daemon.bootstrap import BootstrapCoordinator
 from acie.daemon.write_queue import WriteQueue
+from acie.indexer import index_file
+from acie.storage.index_meta_store import IndexMetaStore
+from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
 
 _OBSERVED_AT = "2026-09-01T00:00:00Z"
@@ -237,6 +240,142 @@ def test_different_repos_bootstrap_independently(tmp_path):
     assert {s.qualname for s in store_a.search(qualname_substring="")} == {"", "foo"}
     assert {s.qualname for s in store_b.search(qualname_substring="")} == {"", "baz"}
     write_queue.close()
+
+
+def test_register_resolves_a_cross_file_imported_call_regardless_of_walk_order(tmp_path):
+    """The bootstrap-plan's central claim: register()'s second pass closes
+    the ordering gap indexer.py's own tests pin as a known limitation of a
+    single index_file call -- the caller (pkg/mod.py) is walked *before*
+    its callee (pkg/other.py) here, and the cross-file `calls` edge must
+    still exist once repo_ready() flips true, with no second register()
+    call from the test.
+    """
+    files = {
+        "repo-a": [
+            ("pkg/mod.py", "from pkg.other import helper\n\n\nhelper()\n"),
+            ("pkg/other.py", "def helper():\n    pass\n"),
+        ]
+    }
+    coordinator, write_queue, db_path_for = _make_coordinator(tmp_path, files_by_repo=files)
+
+    coordinator.register("repo-a", "repo-a")
+
+    assert _wait_until(lambda: coordinator.repo_ready("repo-a")), "repo never became ready"
+
+    relation_store = RelationStore(db_path_for("repo-a"))
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 1
+    assert calls[0].target == "pkg/other.py:helper#function"
+    write_queue.close()
+
+
+def _index_files_once_directly(db_path, files):
+    """Simulates a pre-upgrade install: each file indexed exactly once,
+    via a single index_file call per file (no bootstrap two-pass), matching
+    the shape of an already-existing index.sqlite from before cross-file
+    call resolution existed.
+    """
+    conn = sqlite3.connect(db_path)
+    for path, source_text in files:
+        index_file(
+            path=path, source_text=source_text, observed_at=_OBSERVED_AT,
+            symbol_store=SymbolStore(conn=conn), relation_store=RelationStore(conn=conn),
+            index_meta_store=IndexMetaStore(conn=conn),
+        )
+    conn.close()
+
+
+def test_register_retroactively_resolves_cross_file_calls_for_an_already_indexed_repo(tmp_path):
+    """Codex review finding (P1): repo_ready() trusts a pre-existing
+    index.sqlite immediately (this class's own docstring), so register()'s
+    normal walk-then-two-pass path is never reached for an already-indexed
+    repo -- an upgraded installation would otherwise never gain cross-file
+    call resolution unless individual files happened to be edited later. A
+    dedicated, flag-gated catch-up pass (IndexMetaStore.cross_file_pass_done,
+    same lazy-migration idiom as _migrate_add_head_sha_column_if_missing)
+    must retroactively resolve it the first time such a repo is registered
+    again.
+    """
+    files = {
+        "repo-a": [
+            ("pkg/mod.py", "from pkg.other import helper\n\n\nhelper()\n"),
+            ("pkg/other.py", "def helper():\n    pass\n"),
+        ]
+    }
+    coordinator, write_queue, db_path_for = _make_coordinator(tmp_path, files_by_repo=files)
+    _index_files_once_directly(db_path_for("repo-a"), files["repo-a"])
+    assert RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"calls"}) == []
+    coordinator._walk_repo = lambda repo_root: files.get(repo_root, [])
+
+    coordinator.register("repo-a", "repo-a")
+
+    assert _wait_until(
+        lambda: RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"calls"}) != []
+    ), "cross-file call was never retroactively resolved"
+    calls = RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 1
+    assert calls[0].target == "pkg/other.py:helper#function"
+    write_queue.close()
+
+
+def test_register_does_not_repeat_the_cross_file_migration_once_done(tmp_path):
+    files = {
+        "repo-a": [
+            ("pkg/mod.py", "from pkg.other import helper\n\n\nhelper()\n"),
+            ("pkg/other.py", "def helper():\n    pass\n"),
+        ]
+    }
+    coordinator, write_queue, db_path_for = _make_coordinator(tmp_path, files_by_repo=files)
+    _index_files_once_directly(db_path_for("repo-a"), files["repo-a"])
+    walk_calls = []
+    coordinator._walk_repo = lambda repo_root: walk_calls.append(repo_root) or files.get(repo_root, [])
+
+    coordinator.register("repo-a", "repo-a")
+    assert _wait_until(
+        lambda: RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"calls"}) != []
+    )
+    assert walk_calls == ["repo-a"]
+
+    coordinator.register("repo-a", "repo-a")
+    coordinator.register("repo-a", "repo-a")
+
+    assert walk_calls == ["repo-a"], "migration re-walked the repo after already completing once"
+    write_queue.close()
+
+
+def test_cross_file_migration_flag_persists_across_a_simulated_daemon_restart(tmp_path):
+    """The in-memory _in_progress/_ready guards alone don't prove the flag
+    is actually persisted to disk -- a brand-new BootstrapCoordinator
+    instance (simulating a daemon restart) sharing the same on-disk
+    index.sqlite must also skip a redundant re-walk, since only the
+    persisted flag (not any in-process state) survives a restart.
+    """
+    files = {
+        "repo-a": [
+            ("pkg/mod.py", "from pkg.other import helper\n\n\nhelper()\n"),
+            ("pkg/other.py", "def helper():\n    pass\n"),
+        ]
+    }
+    db_paths: dict[str, str] = {}
+    coordinator1, write_queue1, db_path_for = _make_coordinator(tmp_path, files_by_repo=files, db_paths=db_paths)
+    _index_files_once_directly(db_path_for("repo-a"), files["repo-a"])
+    coordinator1._walk_repo = lambda repo_root: files.get(repo_root, [])
+    coordinator1.register("repo-a", "repo-a")
+    assert _wait_until(
+        lambda: RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"calls"}) != []
+    )
+    write_queue1.close()
+
+    walk_calls = []
+    coordinator2, write_queue2, _ = _make_coordinator(tmp_path, files_by_repo=files, db_paths=db_paths)
+    coordinator2._walk_repo = lambda repo_root: walk_calls.append(repo_root) or files.get(repo_root, [])
+
+    coordinator2.register("repo-a", "repo-a")
+    assert coordinator2.repo_ready("repo-a") is True
+    time.sleep(0.1)  # give an incorrect redundant walk a chance to happen
+
+    assert walk_calls == [], "migration re-walked after a simulated daemon restart despite the persisted flag"
+    write_queue2.close()
 
 
 def test_register_keys_readiness_on_repo_id_but_walks_the_given_repo_root(tmp_path):

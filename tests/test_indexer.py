@@ -1,6 +1,7 @@
 import subprocess
 
 from acie.indexer import index_file
+from acie.ir.symbol import Confidence
 from acie.repo_id import resolve_index_db_path
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
@@ -222,6 +223,199 @@ def test_index_file_does_not_bump_generation_when_skipped_for_malformed_source()
 
     assert result.skipped is True
     assert index_meta_store.current_generation() == 0
+
+
+def test_cross_file_imported_call_resolves_once_the_callee_file_is_indexed():
+    """Closes the generation-102 evaluation's cross-module-call gap
+    (SALTMDB 98c4e550): a bare call to a name imported from another module
+    resolves to a real `calls` edge once that module's file is in the same
+    SymbolStore -- callee indexed first, matching bootstrap's own walk-then-
+    resolve order within one file's index_file call for the already-indexed
+    case (the arbitrary-order/not-yet-indexed case is covered separately
+    below).
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/other.py", source_text="def helper():\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import helper\n\n\nhelper()\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 1
+    assert calls[0].source == "pkg/mod.py:#module"
+    assert calls[0].target == "pkg/other.py:helper#function"
+    assert calls[0].confidence == Confidence.EXTRACTED
+
+
+def test_cross_file_imported_call_stays_unresolved_when_the_callee_is_indexed_first_the_other_way_around():
+    """Pins the known, accepted ordering limitation the plan calls out:
+    indexing the *caller* before the callee leaves the call unresolved --
+    there is no retarget-in-place primitive, so nothing retroactively fixes
+    an already-written miss. Re-indexing the caller after the callee exists
+    (e.g. bootstrap's second pass, or the watcher touching the caller again)
+    is what closes it, proven here by literally reindexing the caller.
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import helper\n\n\nhelper()\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"}) == []
+
+    index_file(
+        path="pkg/other.py", source_text="def helper():\n    pass\n",
+        observed_at="2026-08-31T00:01:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"}) == []
+
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import helper\n\n\nhelper()\n",
+        observed_at="2026-08-31T00:02:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 1
+    assert calls[0].target == "pkg/other.py:helper#function"
+
+
+def test_cross_file_call_matching_two_same_suffix_module_paths_is_ambiguous():
+    """Two files whose dotted-path suffix both match the imported module
+    path (e.g. two vendored `pkg/other.py` copies under different roots) --
+    genuinely ambiguous, since ACIE has no PYTHONPATH/source-root config to
+    disambiguate them, so both surface as AMBIGUOUS candidates rather than
+    guessing one.
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="vendor_a/pkg/other.py", source_text="def helper():\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="vendor_b/pkg/other.py", source_text="def helper():\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import helper\n\n\nhelper()\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 2
+    targets = {r.target for r in calls}
+    assert targets == {"vendor_a/pkg/other.py:helper#function", "vendor_b/pkg/other.py:helper#function"}
+    assert all(r.confidence == Confidence.AMBIGUOUS for r in calls)
+
+
+def test_removing_a_callee_symbol_tombstones_a_cross_file_call_edge_into_it():
+    """Codex review finding (P1): index_file's diffing only ever removed
+    relations sited in the file being reindexed -- correct pre-Slice-C,
+    since every relation's target used to live in that same file. Slice C
+    makes a `calls` edge's site (caller's file) and target (callee's file)
+    genuinely different files, so removing/renaming the callee must also
+    invalidate the caller-sited edge into it, even though the caller's own
+    file was never touched by this reindex.
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    index_file(
+        path="pkg/other.py", source_text="def helper():\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import helper\n\n\nhelper()\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert len(relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})) == 1
+
+    # Rename helper -> renamed in the callee's own file. Per ACIE's
+    # deterministic-recompute identity model, this is "delete the old
+    # symbol id" -- pkg/mod.py itself is never reindexed here.
+    result = index_file(
+        path="pkg/other.py", source_text="def renamed():\n    pass\n",
+        observed_at="2026-08-31T00:01:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    assert symbol_store.get("pkg/other.py:helper#function") is None
+    stale_calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert stale_calls == []
+    assert result.relations_tombstoned >= 1
+
+
+def test_removing_a_callee_symbol_does_not_disturb_an_unrelated_ambiguous_sibling_edge():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    index_file(
+        path="vendor_a/pkg/other.py", source_text="def helper():\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="vendor_b/pkg/other.py", source_text="def helper():\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import helper\n\n\nhelper()\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert len(relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})) == 2
+
+    index_file(
+        path="vendor_a/pkg/other.py", source_text="",
+        observed_at="2026-08-31T00:01:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    remaining = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(remaining) == 1
+    assert remaining[0].target == "vendor_b/pkg/other.py:helper#function"
 
 
 def test_index_file_persists_to_a_real_on_disk_index_for_a_resolved_repo(tmp_path):

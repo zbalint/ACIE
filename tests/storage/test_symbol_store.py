@@ -152,6 +152,35 @@ def test_search_path_glob_filter_scopes_to_matching_files():
     assert store.search(qualname_substring="foo", path_glob="pkg/*") == [in_pkg]
 
 
+def test_find_by_qualname_and_kind_matches_exactly_across_files():
+    store = SymbolStore(":memory:")
+    in_pkg = make_symbol(id="pkg/mod.py:helper#function", path="pkg/mod.py", qualname="helper", kind="function")
+    elsewhere = make_symbol(
+        id="other/mod.py:helper#function", path="other/mod.py", qualname="helper", kind="function"
+    )
+    store.upsert(in_pkg)
+    store.upsert(elsewhere)
+
+    assert set(store.find_by_qualname_and_kind(qualname="helper", kind="function")) == {in_pkg, elsewhere}
+
+
+def test_find_by_qualname_and_kind_is_exact_not_a_substring_match():
+    store = SymbolStore(":memory:")
+    store.upsert(make_symbol(id="pkg/mod.py:helper_extra#function", path="pkg/mod.py", qualname="helper_extra", kind="function"))
+
+    assert store.find_by_qualname_and_kind(qualname="helper", kind="function") == []
+
+
+def test_find_by_qualname_and_kind_filters_by_kind():
+    store = SymbolStore(":memory:")
+    function_sym = make_symbol(id="pkg/mod.py:foo#function", path="pkg/mod.py", qualname="foo", kind="function")
+    class_sym = make_symbol(id="pkg/mod.py:foo#class", path="pkg/mod.py", qualname="foo", kind="class")
+    store.upsert(function_sym)
+    store.upsert(class_sym)
+
+    assert store.find_by_qualname_and_kind(qualname="foo", kind="function") == [function_sym]
+
+
 def test_at_start_returns_the_symbol_whose_start_position_matches_exactly():
     store = SymbolStore(":memory:")
     symbol = make_symbol()

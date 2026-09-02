@@ -4,7 +4,8 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS index_meta (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     generation INTEGER NOT NULL,
-    head_sha TEXT
+    head_sha TEXT,
+    cross_file_pass_done INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -27,6 +28,17 @@ class IndexMetaStore:
     against this stored value itself. NULL means "never recorded" -- a
     fresh repo with nothing to diff against yet, since bootstrap already
     indexes everything from scratch.
+
+    `cross_file_pass_done` is a narrow, single-purpose migration flag, not
+    a general schema/IR version (ARCHITECTURE.md's "Not Yet Specified"
+    still defers that as unbuilt): it exists solely so BootstrapCoordinator
+    can tell whether a repo's already-existing index.sqlite (trusted ready
+    immediately, per its own docstring) has ever had the cross-file-call
+    resolution catch-up pass run against it, since repo_ready()'s
+    file-existence check would otherwise skip that pass forever on an
+    upgraded installation (codex review finding). Defaults to 0/false so
+    every pre-existing index.sqlite from before this flag existed correctly
+    reports "not yet done" via the same lazy-migration idiom as head_sha.
     """
 
     def __init__(self, db_path: str = ":memory:", *, conn: sqlite3.Connection | None = None) -> None:
@@ -34,8 +46,9 @@ class IndexMetaStore:
         self._conn = conn if conn is not None else sqlite3.connect(db_path)
         self._conn.executescript(_SCHEMA)
         self._migrate_add_head_sha_column_if_missing()
+        self._migrate_add_cross_file_pass_done_column_if_missing()
         self._conn.execute(
-            "INSERT OR IGNORE INTO index_meta (id, generation, head_sha) VALUES (0, 0, NULL)"
+            "INSERT OR IGNORE INTO index_meta (id, generation, head_sha, cross_file_pass_done) VALUES (0, 0, NULL, 0)"
         )
         self._conn.commit()
 
@@ -49,6 +62,14 @@ class IndexMetaStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(index_meta)")}
         if "head_sha" not in columns:
             self._conn.execute("ALTER TABLE index_meta ADD COLUMN head_sha TEXT")
+            self._conn.commit()
+
+    def _migrate_add_cross_file_pass_done_column_if_missing(self) -> None:
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(index_meta)")}
+        if "cross_file_pass_done" not in columns:
+            self._conn.execute(
+                "ALTER TABLE index_meta ADD COLUMN cross_file_pass_done INTEGER NOT NULL DEFAULT 0"
+            )
             self._conn.commit()
 
     def current_generation(self) -> int:
@@ -68,4 +89,14 @@ class IndexMetaStore:
 
     def set_last_indexed_head_sha(self, sha: str) -> None:
         self._conn.execute("UPDATE index_meta SET head_sha = ? WHERE id = 0", (sha,))
+        self._conn.commit()
+
+    def cross_file_pass_done(self) -> bool:
+        row = self._conn.execute(
+            "SELECT cross_file_pass_done FROM index_meta WHERE id = 0"
+        ).fetchone()
+        return bool(row[0])
+
+    def mark_cross_file_pass_done(self) -> None:
+        self._conn.execute("UPDATE index_meta SET cross_file_pass_done = 1 WHERE id = 0")
         self._conn.commit()

@@ -92,6 +92,55 @@ def test_setting_head_sha_does_not_disturb_the_generation_counter():
     assert store.current_generation() == 1
 
 
+def test_cross_file_pass_done_is_false_for_a_fresh_store():
+    store = IndexMetaStore(":memory:")
+
+    assert store.cross_file_pass_done() is False
+
+
+def test_mark_cross_file_pass_done_flips_it_true_and_persists():
+    store = IndexMetaStore(":memory:")
+
+    store.mark_cross_file_pass_done()
+
+    assert store.cross_file_pass_done() is True
+
+
+def test_cross_file_pass_done_persists_across_store_instances_on_the_same_db_path(tmp_path):
+    db_path = str(tmp_path / "index.sqlite")
+    IndexMetaStore(db_path).mark_cross_file_pass_done()
+
+    assert IndexMetaStore(db_path).cross_file_pass_done() is True
+
+
+def test_opening_a_pre_existing_index_meta_table_without_cross_file_pass_done_migrates_it_in_place():
+    # Same lazy-migration idiom as the head_sha regression above -- a
+    # pre-existing index.sqlite from before this column existed (i.e. an
+    # ACIE install predating cross-file call resolution) must not hard-fail
+    # on next open, and must correctly report "not yet done" rather than
+    # raising or silently defaulting to done.
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS index_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 0),
+            generation INTEGER NOT NULL,
+            head_sha TEXT
+        );
+        """
+    )
+    conn.execute("INSERT INTO index_meta (id, generation, head_sha) VALUES (0, 5, 'abc123')")
+    conn.commit()
+
+    store = IndexMetaStore(conn=conn)  # must not raise OperationalError
+
+    assert store.cross_file_pass_done() is False
+    assert store.current_generation() == 5
+    assert store.get_last_indexed_head_sha() == "abc123"
+
+
 def test_opening_a_pre_existing_index_meta_table_without_head_sha_migrates_it_in_place():
     # Regression (codex review, 2026-09-02): CREATE TABLE IF NOT EXISTS is a
     # no-op against a real pre-existing index.sqlite from before head_sha

@@ -176,6 +176,24 @@ class SymbolStore:
         ).fetchall()
         return [_row_to_symbol(row) for row in rows]
 
+    def find_by_qualname_and_kind(self, qualname: str, kind: str) -> list[Symbol]:
+        """Repo-wide exact-match lookup (every live symbol at this qualname
+        and kind, regardless of which file defines it) -- used to resolve a
+        cross-file DeferredImportCall (see extract_relations.py/indexer.py)
+        against the whole repo's symbol index. Deliberately narrower than
+        `search()`'s substring match: a resolved cross-file target must be
+        exact, not fuzzy.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, path, qualname, kind, start_line, start_col, end_line, end_col,
+                   confidence, provenance_provider, provenance_version, observed_at
+            FROM symbols_live WHERE qualname = ? AND kind = ?
+            """,
+            (qualname, kind),
+        ).fetchall()
+        return [_row_to_symbol(row) for row in rows]
+
     def at_start(self, *, path: str, line: int, col: int) -> Symbol | None:
         """The live symbol whose own defining start position is exactly
         (path, line, col), or None. Used by get_definition's position
