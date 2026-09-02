@@ -177,6 +177,15 @@ def test_notify_hook_returns_0_when_no_daemon_is_running(monkeypatch, tmp_path):
     assert exit_code == 0
 
 
+
+def test_notify_hook_accepts_omp_agent(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+
+    exit_code = main(["notify-hook", "--agent", "omp"])
+
+    assert exit_code == 0
+
 def test_notify_hook_returns_0_even_when_the_daemon_answers_with_an_error(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr("sys.stdin", io.StringIO("{}"))

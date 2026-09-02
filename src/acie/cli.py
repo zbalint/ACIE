@@ -23,7 +23,7 @@ _RESPAWN_EVERY_ATTEMPTS = 5
 # Claude Code's PostToolUse hook blocks the agent's current turn until
 # this process exits.
 _NOTIFY_HOOK_TIMEOUT_SECONDS = 0.2
-_NOTIFY_HOOK_AGENTS = ("git", "claude-code", "codex")
+_NOTIFY_HOOK_AGENTS = ("git", "claude-code", "codex", "omp")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -128,6 +128,21 @@ def test_claude_code_agent_reindexes_the_file_named_in_tool_input(tmp_path):
     assert [s.qualname for s in SymbolStore(conn=conn).list_by_path("mod.py")] == ["", "foo"]
 
 
+
+def test_omp_agent_reindexes_the_file_named_in_tool_input(tmp_path):
+    repo = _git_repo(tmp_path)
+    (repo / "mod.py").write_text("def foo():\n    pass\n")
+    db_path = str(tmp_path / "index.sqlite")
+    payload = json.dumps({
+        "tool_name": "edit",
+        "tool_input": {"file_path": str(repo / "mod.py")},
+    })
+
+    _run(str(repo), "omp", payload, db_path=db_path)
+
+    conn = __import__("sqlite3").connect(db_path)
+    assert [s.qualname for s in SymbolStore(conn=conn).list_by_path("mod.py")] == ["", "foo"]
+
 def test_claude_code_agent_with_malformed_payload_is_a_no_op(tmp_path):
     repo = _git_repo(tmp_path)
     db_path = str(tmp_path / "index.sqlite")

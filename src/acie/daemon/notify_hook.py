@@ -56,6 +56,9 @@ def handle_notify_hook(
     elif agent == "codex":
         for rel_path in _parse_codex_payload(payload, repo_root):
             _submit_if_in_scope(repo_id, repo_root, write_queue, rel_path)
+    elif agent == "omp":
+        rel_path = _parse_claude_code_payload(payload, repo_root)
+        _submit_if_in_scope(repo_id, repo_root, write_queue, rel_path)
     # An unrecognized agent name is a silent no-op, not an error --
     # ARCHITECTURE.md's whole notify-hook contract is "never break or
     # delay the caller", so a future/unknown agent name must not raise.
