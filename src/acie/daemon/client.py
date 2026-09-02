@@ -44,6 +44,28 @@ def daemon_is_running(discovery_path: str, *, timeout: float = 0.2) -> bool:
     return response is not None and response.get("ok") is True
 
 
+def probe_daemon_status(discovery_path: str, *, timeout: float = 0.2) -> str:
+    """Return "running", "shutting_down", or "stopped" for the daemon discovery points at.
+
+    A daemon mid-graceful-drain (server.py::DaemonServer.shutdown()) still
+    holds its port/PID but answers `ping` with a DAEMON_SHUTTING_DOWN
+    error rather than ok -- distinguishing that from "stopped" (no daemon
+    reachable at all) is what `daemon_is_running`'s plain bool collapses,
+    per DAEMON.md "Shutdown / Stop Semantics".
+    """
+    response = request_daemon(
+        discovery_path, method="ping", repo_path="", params={}, timeout=timeout
+    )
+    if response is None:
+        return "stopped"
+    if response.get("ok") is True:
+        return "running"
+    error = response.get("error")
+    if isinstance(error, dict) and error.get("code") == "DAEMON_SHUTTING_DOWN":
+        return "shutting_down"
+    return "stopped"
+
+
 def _request(port: int, request: dict, *, timeout: float) -> dict:
     with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
         sock.settimeout(timeout)

@@ -1,8 +1,10 @@
 import io
 import json
 import threading
+import time
 
 import acie.cli
+import acie.daemon.runtime
 from acie.cli import main
 from acie.daemon.client import daemon_is_running
 from acie.daemon.discovery import write_discovery_file
@@ -18,7 +20,7 @@ def test_daemon_status_json_reports_stopped_when_no_discovery_file_exists(
     exit_code = main(["daemon", "status", "--json"])
 
     assert exit_code == 1
-    assert json.loads(capsys.readouterr().out) == {"running": False}
+    assert json.loads(capsys.readouterr().out) == {"running": False, "status": "stopped"}
 
 
 def test_daemon_status_json_reports_stopped_for_a_stale_discovery_file(
@@ -35,7 +37,7 @@ def test_daemon_status_json_reports_stopped_for_a_stale_discovery_file(
     exit_code = main(["daemon", "status", "--json"])
 
     assert exit_code == 1
-    assert json.loads(capsys.readouterr().out) == {"running": False}
+    assert json.loads(capsys.readouterr().out) == {"running": False, "status": "stopped"}
 
 
 def test_daemon_status_json_probes_a_live_daemon(monkeypatch, tmp_path, capsys):
@@ -52,7 +54,44 @@ def test_daemon_status_json_probes_a_live_daemon(monkeypatch, tmp_path, capsys):
         server.shutdown()
 
     assert exit_code == 0
-    assert json.loads(capsys.readouterr().out) == {"running": True}
+    assert json.loads(capsys.readouterr().out) == {"running": True, "status": "running"}
+
+
+def test_daemon_status_reports_shutting_down_for_a_daemon_mid_drain(monkeypatch, tmp_path, capsys):
+    # Regression: status collapsed "shutdown has begun, drain still in
+    # progress" and "process has fully exited" into the same "stopped"
+    # result the instant shutdown() set _shutting_down, because ping just
+    # got DAEMON_SHUTTING_DOWN back and daemon_is_running() treated any
+    # non-ok ping as "not running". A live daemon mid-drain still holds
+    # its port/PID for up to _SHUTDOWN_DRAIN_TIMEOUT_SECONDS -- status
+    # must say so instead of claiming it's already stopped.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    drain_started = threading.Event()
+    release_drain = threading.Event()
+
+    def slow_on_shutdown():
+        drain_started.set()
+        release_drain.wait(timeout=2)
+
+    server = DaemonServer(
+        lambda request: build_success_response(request["id"], {}),
+        port=0,
+        discovery_path=str(tmp_path / ".acie" / "daemon.json"),
+        on_shutdown=slow_on_shutdown,
+    )
+    server.start()
+    shutdown_thread = threading.Thread(target=server.shutdown)
+    shutdown_thread.start()
+    try:
+        assert drain_started.wait(timeout=2)
+
+        exit_code = main(["daemon", "status", "--json"])
+    finally:
+        release_drain.set()
+        shutdown_thread.join(timeout=2)
+
+    assert exit_code == 1
+    assert json.loads(capsys.readouterr().out) == {"running": False, "status": "shutting_down"}
 
 
 def test_spawn_daemon_reaps_its_subprocess_so_it_never_zombies(monkeypatch, tmp_path):
@@ -86,6 +125,44 @@ def test_daemon_start_spawns_a_daemon_and_stop_shuts_it_down(monkeypatch, tmp_pa
         assert not daemon_is_running(discovery_path)
     finally:
         main(["daemon", "stop"])
+
+
+def test_daemon_stop_uses_a_client_timeout_that_covers_the_servers_real_drain_budget(
+    monkeypatch, tmp_path
+):
+    # Regression: _daemon_stop() sent the `shutdown` RPC with
+    # request_daemon's 2.0s library-default client timeout, far shorter
+    # than the server's real drain budget (runtime.py's
+    # _SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 10.0) -- so `acie daemon stop`'s
+    # own exit code was close to meaningless whenever a real drain took
+    # longer than 2s (it read back as a client-side failure even though
+    # the server-side shutdown was proceeding correctly). Patch the
+    # runtime constant down so the test stays fast while still proving
+    # _daemon_stop() reads the live value rather than a hardcoded default.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(acie.daemon.runtime, "_SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 3.0)
+    release_drain = threading.Event()
+
+    def slow_on_shutdown():
+        release_drain.wait(timeout=3.0)
+
+    server = DaemonServer(
+        lambda request: build_success_response(request["id"], {}),
+        port=0,
+        discovery_path=str(tmp_path / ".acie" / "daemon.json"),
+        on_shutdown=slow_on_shutdown,
+    )
+    server.start()
+
+    def _release_after_delay():
+        time.sleep(2.2)  # longer than the old hardcoded 2.0s client timeout
+        release_drain.set()
+
+    threading.Thread(target=_release_after_delay).start()
+
+    exit_code = main(["daemon", "stop"])
+
+    assert exit_code == 0
 
 
 def test_notify_hook_returns_0_when_no_daemon_is_running(monkeypatch, tmp_path):

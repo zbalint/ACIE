@@ -149,6 +149,8 @@ Stdlib `argparse` — no new dependency. Entry-point wiring: `src/acie/cli.py` +
 | `acie daemon stop` | Triggers the graceful shutdown RPC described above. |
 | `acie daemon status` | Plain-text by default; `--json` for machine-readable output. |
 | `acie daemon restart` | **Does not exist** — use `stop`, then let the next `acie serve-mcp` auto-spawn a fresh daemon. |
+
+**Resolved during implementation** (2026-09-02, fixing SALTMDB `4083924d-ed96-4356-8002-c3ce224daeb5`'s two observability gaps): `acie daemon status` reports one of three states, not two — `running`, `shutting_down` (the daemon is mid-drain: still holding its port/PID, but answering everything except `shutdown` with `DAEMON_SHUTTING_DOWN`), or `stopped` (unreachable). `--json` emits `{"running": bool, "status": "..."}`, `running` being `true` only for the `running` state. `acie daemon stop`'s own `shutdown` RPC uses a client-side timeout of `_SHUTDOWN_DRAIN_TIMEOUT_SECONDS + 1.0` (currently 11s) rather than the transport's 2.0s default, since the RPC only responds once the server's whole drain has completed — a shorter client timeout made `stop`'s exit code meaningless for any drain slower than 2s.
 | `acie notify-hook --agent <name>` | Reads stdin, sends it as the `notify_hook` RPC's `payload` param over the already-locked transport/envelope, always exits 0 (see "Incremental Indexing Wiring" above and `ARCHITECTURE.md`'s "Agent Hook Integration"). |
 
 ## Deployment: Dev Repo vs. Dogfeeding Install

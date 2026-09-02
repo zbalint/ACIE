@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Sequence
 
-from acie.daemon.client import daemon_is_running, request_daemon
+from acie.daemon.client import daemon_is_running, probe_daemon_status, request_daemon
 from acie.daemon.server import main as run_daemon_foreground
 from acie.mcp_server import run_stdio_server
 
@@ -59,12 +59,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _daemon_status(*, as_json: bool) -> int:
     discovery_path = _discovery_path()
-    running = daemon_is_running(discovery_path)
+    status = probe_daemon_status(discovery_path)
     if as_json:
-        print(json.dumps({"running": running}))
+        print(json.dumps({"running": status == "running", "status": status}))
     else:
-        print("running" if running else "stopped")
-    return 0 if running else 1
+        print(status)
+    return 0 if status == "running" else 1
 
 
 def _serve_mcp(*, log_level: str) -> int:
@@ -99,8 +99,20 @@ def _notify_hook(*, agent: str) -> int:
 
 
 def _daemon_stop() -> int:
+    # Lazy import, matching server.py::main()'s own pattern -- keeps
+    # runtime.py's heavier daemon-assembly import graph off every other
+    # CLI command's startup path. The `shutdown` RPC only responds once
+    # server.py::DaemonServer.shutdown() has fully returned, i.e. after
+    # its whole drain, so the client socket timeout must exceed the
+    # server's real drain budget (runtime.py's
+    # _SHUTDOWN_DRAIN_TIMEOUT_SECONDS) or `stop`'s own exit code is
+    # meaningless for any shutdown slower than request_daemon's 2.0s
+    # library default -- see SALTMDB 4083924d-ed96-4356-8002-c3ce224daeb5.
+    from acie.daemon.runtime import _SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+
     response = request_daemon(
-        _discovery_path(), method="shutdown", repo_path="", params={}
+        _discovery_path(), method="shutdown", repo_path="", params={},
+        timeout=_SHUTDOWN_DRAIN_TIMEOUT_SECONDS + 1.0,
     )
     return 0 if response is not None and response.get("ok") is True else 1
 
