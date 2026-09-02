@@ -10,12 +10,13 @@ CREATE TABLE IF NOT EXISTS index_meta (
 """
 
 # 1 = cross-file `calls` resolution only (pre-slice-A2 catch-up pass).
-# 2 = + cross-file `inherits` resolution (slice A2). Bump this whenever a
-# future slice (e.g. A3's cross-file `overrides`) adds another predicate
-# the catch-up pass must retroactively resolve for an already-migrated
-# repo -- see cross_file_pass_done()'s docstring for why a plain boolean
-# can't represent "which version of the pass" already ran.
-CURRENT_CROSS_FILE_PASS_VERSION = 2
+# 2 = + cross-file `inherits` resolution (slice A2).
+# 3 = + cross-file `overrides` resolution (slice A3). Bump this whenever a
+# future slice adds another predicate the catch-up pass must retroactively
+# resolve for an already-migrated repo -- see cross_file_pass_done()'s
+# docstring for why a plain boolean can't represent "which version of the
+# pass" already ran.
+CURRENT_CROSS_FILE_PASS_VERSION = 3
 
 
 class IndexMetaStore:

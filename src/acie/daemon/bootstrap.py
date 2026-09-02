@@ -137,11 +137,11 @@ class BootstrapCoordinator:
 
         # Second pass: os.walk's file-discovery order (this class's own
         # `_walk_repo` contract) is arbitrary, not dependency-ordered, so a
-        # file indexed before something it cross-file-calls/inherits into
-        # leaves that edge unresolved (see extract_relations.py's
-        # DeferredImportCall/DeferredImportInherit -- indexer.py's
-        # _resolve_deferred -- no retarget-in-place primitive exists to fix
-        # it after the fact). Re-running every
+        # file indexed before something it cross-file-calls/inherits/overrides
+        # into leaves that edge unresolved (see extract_relations.py's
+        # DeferredImportCall/DeferredImportInherit/DeferredImportOverride --
+        # indexer.py's _resolve_deferred/_resolve_deferred_overrides -- no
+        # retarget-in-place primitive exists to fix it after the fact). Re-running every
         # file's index_file once more, now that the full repo's SymbolStore
         # is populated from the first pass, resolves whatever the first
         # pass's arbitrary order missed -- a bounded, one-time cost at

@@ -4,7 +4,7 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 
 from acie.adapters.python.extract_symbols import extract_symbols
-from acie.ir.relation import DeferredImportCall, DeferredImportInherit, Relation
+from acie.ir.relation import DeferredImportCall, DeferredImportInherit, DeferredImportOverride, Relation
 from acie.ir.symbol import Confidence, Provenance, Symbol
 
 _LANGUAGE = Language(tspython.language())
@@ -16,7 +16,7 @@ def extract_relations(path: str, source_text: str, observed_at: str) -> list[Rel
     for the sibling entry point that also surfaces cross-file-candidate
     calls/inherits this pure, single-file function cannot itself resolve.
     """
-    relations, _deferred_calls, _deferred_inherits = _extract(
+    relations, _deferred_calls, _deferred_inherits, _deferred_overrides = _extract(
         path=path, source_text=source_text, observed_at=observed_at
     )
     return relations
@@ -24,20 +24,21 @@ def extract_relations(path: str, source_text: str, observed_at: str) -> list[Rel
 
 def extract_relations_with_deferred_edges(
     path: str, source_text: str, observed_at: str
-) -> tuple[list[Relation], list[DeferredImportCall], list[DeferredImportInherit]]:
-    """Like extract_relations, but also returns bare-identifier calls and
-    `class Foo(Base):` base identifiers whose name resolves to no same-file
-    symbol yet *is* imported in this file -- candidates for cross-file
-    resolution against the repo-wide symbol index, which only indexer.py
-    (not this pure, single-file function) can do. See DeferredImportCall /
-    DeferredImportInherit.
+) -> tuple[list[Relation], list[DeferredImportCall], list[DeferredImportInherit], list[DeferredImportOverride]]:
+    """Like extract_relations, but also returns bare-identifier calls,
+    `class Foo(Base):` base identifiers, and method overrides of such a base
+    whose name resolves to no same-file symbol yet *is* imported in this
+    file -- candidates for cross-file resolution against the repo-wide
+    symbol index, which only indexer.py (not this pure, single-file
+    function) can do. See DeferredImportCall / DeferredImportInherit /
+    DeferredImportOverride.
     """
     return _extract(path=path, source_text=source_text, observed_at=observed_at)
 
 
 def _extract(
     path: str, source_text: str, observed_at: str
-) -> tuple[list[Relation], list[DeferredImportCall], list[DeferredImportInherit]]:
+) -> tuple[list[Relation], list[DeferredImportCall], list[DeferredImportInherit], list[DeferredImportOverride]]:
     symbols = extract_symbols(path=path, source_text=source_text, observed_at=observed_at)
     provenance = Provenance(
         provider="tree-sitter", version=_PROVENANCE_VERSION, observed_at=observed_at
@@ -72,21 +73,22 @@ def _extract(
         provenance=provenance,
     )
 
+    overrides_relations, deferred_overrides = _overrides_relations(
+        tree.root_node,
+        top_level_by_name=top_level_by_name,
+        methods_by_class=methods_by_class,
+        import_alias_map=import_alias_map,
+        path=path,
+        provenance=provenance,
+    )
+
     relations: list[Relation] = []
     relations.extend(_defines_relations(symbols, path=path, provenance=provenance))
     relations.extend(import_relations)
     relations.extend(inherits_relations)
-    relations.extend(
-        _overrides_relations(
-            tree.root_node,
-            top_level_by_name=top_level_by_name,
-            methods_by_class=methods_by_class,
-            path=path,
-            provenance=provenance,
-        )
-    )
+    relations.extend(overrides_relations)
     relations.extend(call_relations)
-    return relations, deferred_calls, deferred_inherits
+    return relations, deferred_calls, deferred_inherits, deferred_overrides
 
 
 def _call_and_reference_relations(
@@ -334,23 +336,42 @@ def _overrides_relations(
     *,
     top_level_by_name: dict[str, list[Symbol]],
     methods_by_class: dict[str, dict[str, list[Symbol]]],
+    import_alias_map: dict[str, str],
     path: str,
     provenance: Provenance,
-) -> list[Relation]:
+) -> tuple[list[Relation], list[DeferredImportOverride]]:
     """Top-level `class Foo(Base): def bar(...)` where an immediate base
-    (same scope as _inherits_relations resolves -- same-file only, this
-    slice's narrow first cut) already defines a method of the same name.
-    `overrides` points at the immediate overridden base method, not the
-    transitive root -- multi-level chains fall out for free via BFS hopping
-    through the edges (impact_analysis, a later slice).
+    already defines a method of the same name. `overrides` points at the
+    immediate overridden base method, not the transitive root -- multi-level
+    chains fall out for free via BFS hopping through the edges
+    (impact_analysis, a later slice).
+
+    A same-file base (same scope as _inherits_relations resolves)
+    resolves immediately, exactly as before slice A3. An immediate base
+    that resolves to no same-file class but *is* `from`-imported produces
+    a DeferredImportOverride instead (mirroring DeferredImportInherit's
+    same split for the `inherits` predicate): this pure, single-file
+    function cannot know whether that cross-file base defines a matching
+    method -- only indexer.py's repo-wide symbol index can. One deferred
+    candidate is emitted per (own method, import-deferred base) pair,
+    since either might be the one the base actually overrides.
 
     Ambiguity is computed per (subclass, method_name) pair over the *union*
-    of every immediate base's matching method candidates -- not per base
-    independently -- because Python's MRO would pick exactly one candidate
-    deterministically, but tree-sitter alone cannot compute MRO linearization
-    across multiple bases; more than one candidate anywhere in that union
-    means the override target is genuinely ambiguous without semantic
-    resolution (later upgraded to INFERRED by pyright enrichment).
+    of every immediate SAME-FILE base's matching method candidates -- not
+    per base independently -- because Python's MRO would pick exactly one
+    candidate deterministically, but tree-sitter alone cannot compute MRO
+    linearization across multiple bases; more than one candidate anywhere
+    in that union means the override target is genuinely ambiguous without
+    semantic resolution (later upgraded to INFERRED by pyright enrichment).
+    A cross-file base's candidates are NOT folded into this same union --
+    indexer.py's _resolve_deferred_overrides computes each deferred item's
+    own confidence independently once resolved. shortcut: a method
+    overriding both a same-file base and a cross-file base therefore gets
+    two independently-confident edges instead of one true joint-MRO-
+    ambiguous edge; true joint confidence would need cross-file candidates
+    available before this single-file function returns, which isn't this
+    slice's scope -- revisit if joint same-file+cross-file MRO ambiguity
+    ever needs modeling.
 
     Base qualnames are deduplicated via a set before the methods_by_class
     lookup: a redefined base class name (e.g. two `class Base:` definitions)
@@ -377,6 +398,7 @@ def _overrides_relations(
     }
 
     relations: list[Relation] = []
+    deferred: list[DeferredImportOverride] = []
     for child in root.named_children:
         if child.type != "class_definition":
             continue
@@ -394,11 +416,17 @@ def _overrides_relations(
             continue
 
         base_qualnames: set[str] = set()
+        deferred_bases: list[tuple[str, str]] = []  # (base_name, module_path)
         for base in superclasses.named_children:
             if base.type != "identifier":
                 continue
-            for candidate in class_candidates_by_name.get(base.text.decode("utf-8"), []):
-                base_qualnames.add(candidate.qualname)
+            base_name = base.text.decode("utf-8")
+            same_file_candidates = class_candidates_by_name.get(base_name, [])
+            if same_file_candidates:
+                for candidate in same_file_candidates:
+                    base_qualnames.add(candidate.qualname)
+            elif base_name in import_alias_map:
+                deferred_bases.append((base_name, import_alias_map[base_name]))
 
         for method_name, subclass_methods in own_methods.items():
             base_method_candidates = [
@@ -406,28 +434,41 @@ def _overrides_relations(
                 for base_qualname in sorted(base_qualnames)
                 for method in methods_by_class.get(base_qualname, {}).get(method_name, [])
             ]
-            if not base_method_candidates:
-                continue
-            confidence = (
-                Confidence.AMBIGUOUS
-                if len(base_method_candidates) > 1 or len(subclass_methods) > 1
-                else Confidence.EXTRACTED
-            )
-            for subclass_method in subclass_methods:
-                for base_method in base_method_candidates:
-                    relations.append(
-                        Relation(
+            if base_method_candidates:
+                confidence = (
+                    Confidence.AMBIGUOUS
+                    if len(base_method_candidates) > 1 or len(subclass_methods) > 1
+                    else Confidence.EXTRACTED
+                )
+                for subclass_method in subclass_methods:
+                    for base_method in base_method_candidates:
+                        relations.append(
+                            Relation(
+                                source=subclass_method.id,
+                                target=base_method.id,
+                                predicate="overrides",
+                                site_file=path,
+                                site_line=subclass_method.start_line,
+                                site_col=subclass_method.start_col,
+                                confidence=confidence,
+                                provenance=provenance,
+                            )
+                        )
+            for base_name, module_path in deferred_bases:
+                for subclass_method in subclass_methods:
+                    deferred.append(
+                        DeferredImportOverride(
                             source=subclass_method.id,
-                            target=base_method.id,
-                            predicate="overrides",
+                            module_path=module_path,
+                            base_name=base_name,
+                            method_name=method_name,
                             site_file=path,
                             site_line=subclass_method.start_line,
                             site_col=subclass_method.start_col,
-                            confidence=confidence,
                             provenance=provenance,
                         )
                     )
-    return relations
+    return relations, deferred
 
 
 def _import_relations(

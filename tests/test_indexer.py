@@ -557,6 +557,185 @@ def test_removing_a_base_class_symbol_tombstones_a_cross_file_inherits_edge_into
     assert result.relations_tombstoned >= 1
 
 
+def test_cross_file_overridden_base_method_resolves_once_the_base_file_is_indexed():
+    """Slice A3: mirrors test_cross_file_inherited_base_resolves_once_the_base_file_is_indexed
+    for the `overrides` predicate -- base indexed first, matching bootstrap's
+    own walk-then-resolve order within one file's index_file call.
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/other.py", source_text="class Base:\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    overrides = relation_store.list_by_site_file("pkg/mod.py", predicates={"overrides"})
+    assert len(overrides) == 1
+    assert overrides[0].source == "pkg/mod.py:Foo.bar#method"
+    assert overrides[0].target == "pkg/other.py:Base.bar#method"
+    assert overrides[0].confidence == Confidence.EXTRACTED
+
+
+def test_cross_file_overridden_base_method_stays_unresolved_when_the_base_is_indexed_first_the_other_way_around():
+    """Pins the same known ordering limitation as the calls/inherits-side
+    equivalents: indexing the subclass before the base file leaves
+    `overrides` unresolved until the subclass's file is reindexed (e.g.
+    bootstrap's second pass).
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert relation_store.list_by_site_file("pkg/mod.py", predicates={"overrides"}) == []
+
+    index_file(
+        path="pkg/other.py", source_text="class Base:\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:01:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert relation_store.list_by_site_file("pkg/mod.py", predicates={"overrides"}) == []
+
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:02:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    overrides = relation_store.list_by_site_file("pkg/mod.py", predicates={"overrides"})
+    assert len(overrides) == 1
+    assert overrides[0].target == "pkg/other.py:Base.bar#method"
+
+
+def test_cross_file_override_matching_two_same_suffix_module_paths_is_ambiguous():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="vendor_a/pkg/other.py", source_text="class Base:\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="vendor_b/pkg/other.py", source_text="class Base:\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    overrides = relation_store.list_by_site_file("pkg/mod.py", predicates={"overrides"})
+    assert len(overrides) == 2
+    targets = {r.target for r in overrides}
+    assert targets == {"vendor_a/pkg/other.py:Base.bar#method", "vendor_b/pkg/other.py:Base.bar#method"}
+    assert all(r.confidence == Confidence.AMBIGUOUS for r in overrides)
+
+
+def test_cross_file_override_does_not_leak_a_same_named_method_from_an_unrelated_module():
+    """Codex P1 review finding: _resolve_deferred_overrides's method lookup
+    (find_by_qualname_and_kind) is repo-wide on qualname TEXT alone -- a
+    same-named-but-unrelated class elsewhere in the repo (module_path
+    doesn't match the import at all, unlike the legitimate ambiguous-suffix
+    case above where both candidates genuinely match) must not leak its
+    own same-named method in just because the resolved base class happens
+    to share its bare qualname ("Base"). Only vendor_a/pkg/other.py's Base
+    is actually importable as `pkg.other.Base` here -- unrelated.py's
+    unconnected `Base` class must be invisible to this resolution.
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/other.py", source_text="class Base:\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="unrelated.py", source_text="class Base:\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    overrides = relation_store.list_by_site_file("pkg/mod.py", predicates={"overrides"})
+    assert len(overrides) == 1
+    assert overrides[0].target == "pkg/other.py:Base.bar#method"
+    assert overrides[0].confidence == Confidence.EXTRACTED
+
+
+def test_removing_a_cross_file_overridden_base_method_tombstones_the_overrides_edge_into_it():
+    """Mirrors test_removing_a_base_class_symbol_tombstones_a_cross_file_inherits_edge_into_it:
+    index_file's stale-cross-file-relation cleanup is predicate-agnostic
+    already, so it must cover a renamed/removed cross-file overridden base
+    method exactly like it does a renamed/removed base class or callee.
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    index_file(
+        path="pkg/other.py", source_text="class Base:\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    def bar(self):\n        pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert len(relation_store.list_by_site_file("pkg/mod.py", predicates={"overrides"})) == 1
+
+    result = index_file(
+        path="pkg/other.py", source_text="class Base:\n    def renamed(self):\n        pass\n",
+        observed_at="2026-08-31T00:01:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    assert symbol_store.get("pkg/other.py:Base.bar#method") is None
+    stale_overrides = relation_store.list_by_site_file("pkg/mod.py", predicates={"overrides"})
+    assert stale_overrides == []
+    assert result.relations_tombstoned >= 1
+
+
 def test_index_file_persists_to_a_real_on_disk_index_for_a_resolved_repo(tmp_path):
     """Closes slice 7 follow-up e3414030's roadmap-gap half: proves
     index_file + SymbolStore/RelationStore actually work end-to-end against

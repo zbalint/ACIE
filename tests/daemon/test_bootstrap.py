@@ -385,6 +385,45 @@ def test_register_retroactively_resolves_cross_file_inherits_for_a_repo_stuck_at
     write_queue.close()
 
 
+def test_register_retroactively_resolves_cross_file_overrides_for_a_repo_stuck_at_the_old_calls_and_inherits_migration_version(
+    tmp_path,
+):
+    """Slice A3: mirrors test_register_retroactively_resolves_cross_file_inherits_for_a_repo_stuck_at_the_old_calls_only_migration_version
+    one version up -- a repo that already completed the pre-A3 calls+inherits
+    catch-up pass (persisted at cross-file-pass version 2) must NOT be
+    skipped just because that old version already reads "done"; only a repo
+    at or above CURRENT_CROSS_FILE_PASS_VERSION (3, calls+inherits+overrides)
+    may be skipped.
+    """
+    files = {
+        "repo-a": [
+            ("pkg/mod.py", "from pkg.other import Base\n\n\nclass Foo(Base):\n    def bar(self):\n        pass\n"),
+            ("pkg/other.py", "class Base:\n    def bar(self):\n        pass\n"),
+        ]
+    }
+    coordinator, write_queue, db_path_for = _make_coordinator(tmp_path, files_by_repo=files)
+    _index_files_once_directly(db_path_for("repo-a"), files["repo-a"])
+    # Simulate an install that already fully completed the pre-A3
+    # calls+inherits migration (persisted version 2) -- not a fresh/never-
+    # migrated repo (version 0/1), which the older tests above already cover.
+    conn = sqlite3.connect(db_path_for("repo-a"))
+    conn.execute("UPDATE index_meta SET cross_file_pass_version = 2 WHERE id = 0")
+    conn.commit()
+    conn.close()
+    assert RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"overrides"}) == []
+    coordinator._walk_repo = lambda repo_root: files.get(repo_root, [])
+
+    coordinator.register("repo-a", "repo-a")
+
+    assert _wait_until(
+        lambda: RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"overrides"}) != []
+    ), "cross-file overrides was never retroactively resolved for a repo stuck at the old calls+inherits version"
+    overrides = RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"overrides"})
+    assert len(overrides) == 1
+    assert overrides[0].target == "pkg/other.py:Base.bar#method"
+    write_queue.close()
+
+
 def test_cross_file_migration_flag_persists_across_a_simulated_daemon_restart(tmp_path):
     """The in-memory _in_progress/_ready guards alone don't prove the flag
     is actually persisted to disk -- a brand-new BootstrapCoordinator

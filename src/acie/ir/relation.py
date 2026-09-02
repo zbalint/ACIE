@@ -56,3 +56,29 @@ class DeferredImportInherit:
     site_line: int
     site_col: int
     provenance: Provenance
+
+
+@dataclass(frozen=True)
+class DeferredImportOverride:
+    """A `class Foo(Base): def bar(...)` where `Base` is not a same-file
+    class but *is* imported (`from module_path import name`) -- mirrors
+    DeferredImportCall/DeferredImportInherit's split for the `overrides`
+    predicate (slice A3). Unlike those two, resolving this needs a
+    two-step lookup, not one: extract_relations (single-file, pure) knows
+    the overriding method and the imported base's bare name/module, but
+    cannot itself know whether that base actually defines a same-named
+    method -- only indexer.py's repo-wide symbol index can answer that, by
+    first resolving base_name/module_path to a class symbol and then
+    looking up method_name within it. A base that resolves to no repo
+    symbol, or that resolves but defines no matching method, produces no
+    edge at all, same as DeferredImportCall/DeferredImportInherit.
+    """
+
+    source: str
+    module_path: str
+    base_name: str
+    method_name: str
+    site_file: str
+    site_line: int
+    site_col: int
+    provenance: Provenance

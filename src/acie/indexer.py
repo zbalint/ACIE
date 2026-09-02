@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from acie.adapters.python.extract_relations import extract_relations_with_deferred_edges
 from acie.adapters.python.extract_symbols import extract_symbols, has_syntax_error
-from acie.ir.relation import DeferredImportCall, DeferredImportInherit, Relation
+from acie.ir.relation import DeferredImportCall, DeferredImportInherit, DeferredImportOverride, Relation
 from acie.ir.symbol import Confidence
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
@@ -36,7 +36,7 @@ def index_file(
         )
 
     new_symbols = extract_symbols(path=path, source_text=source_text, observed_at=observed_at)
-    new_relations, deferred_calls, deferred_inherits = extract_relations_with_deferred_edges(
+    new_relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
         path=path, source_text=source_text, observed_at=observed_at
     )
     new_relations = new_relations + _resolve_deferred(
@@ -45,6 +45,7 @@ def index_file(
     new_relations = new_relations + _resolve_deferred(
         deferred_inherits, symbol_store, kind="class", predicate="inherits"
     )
+    new_relations = new_relations + _resolve_deferred_overrides(deferred_overrides, symbol_store)
 
     prior_symbol_ids = {s.id for s in symbol_store.list_by_path(path)}
     prior_relation_keys = {_relation_key(r) for r in relation_store.list_by_site_file(path)}
@@ -152,6 +153,73 @@ def _resolve_deferred(
                     source=item.source,
                     target=candidate.id,
                     predicate=predicate,
+                    site_file=item.site_file,
+                    site_line=item.site_line,
+                    site_col=item.site_col,
+                    confidence=confidence,
+                    provenance=item.provenance,
+                )
+            )
+    return relations
+
+
+def _resolve_deferred_overrides(
+    deferred_items: list[DeferredImportOverride],
+    symbol_store: SymbolStore,
+) -> list[Relation]:
+    """Resolves each DeferredImportOverride (slice A3) against the repo-wide
+    symbol index. Unlike _resolve_deferred's single qualname+kind lookup, a
+    base class name alone isn't the actual override target -- the target is
+    one of THAT class's own methods, at qualname f"{base.qualname}.
+    {method_name}" (methods_by_class's own keying convention, same one
+    _overrides_relations' same-file resolution already relies on). A base
+    name that resolves to no repo symbol, or resolves but defines no
+    matching method, produces no edge -- same silent-miss behavior as every
+    other deferred kind.
+
+    find_by_qualname_and_kind(f"{base.qualname}.{method_name}", ...) is
+    repo-wide on qualname TEXT alone -- a class qualname like "Base" isn't
+    unique across files, so this must be filtered to `method.path ==
+    base.path` (codex review finding, 2026-09-02): without it, an entirely
+    unrelated same-named class elsewhere in the repo (whose own class
+    symbol already correctly failed the base_candidates module-path filter
+    above) would still leak its own same-named method in here, since the
+    method-level query alone has no idea which file its qualname match
+    came from.
+
+    Confidence is computed independently per deferred item, from its own
+    resolved method-candidate count only -- see _overrides_relations'
+    docstring for why this is NOT unioned with any same-file override
+    confidence for the same subclass method (documented shortcut).
+    """
+    relations: list[Relation] = []
+    for item in deferred_items:
+        base_candidates = [
+            symbol
+            for symbol in symbol_store.find_by_qualname_and_kind(qualname=item.base_name, kind="class")
+            if _module_path_matches(symbol.path, item.module_path)
+        ]
+        method_candidates = [
+            method
+            for base in base_candidates
+            for method in symbol_store.find_by_qualname_and_kind(
+                qualname=f"{base.qualname}.{item.method_name}", kind="method"
+            )
+            if method.path == base.path
+        ]
+        if not method_candidates:
+            continue
+        # shortcut: computed from this deferred item's own cross-file
+        # candidates only, never unioned with a same-file override
+        # confidence already computed for the same subclass method in
+        # _overrides_relations -- see that function's docstring.
+        confidence = Confidence.EXTRACTED if len(method_candidates) == 1 else Confidence.AMBIGUOUS
+        for method in method_candidates:
+            relations.append(
+                Relation(
+                    source=item.source,
+                    target=method.id,
+                    predicate="overrides",
                     site_file=item.site_file,
                     site_line=item.site_line,
                     site_col=item.site_col,
