@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 
-from acie.adapters.python.extract_relations import extract_relations_with_deferred_calls
+from acie.adapters.python.extract_relations import extract_relations_with_deferred_edges
 from acie.adapters.python.extract_symbols import extract_symbols, has_syntax_error
-from acie.ir.relation import DeferredImportCall, Relation
+from acie.ir.relation import DeferredImportCall, DeferredImportInherit, Relation
 from acie.ir.symbol import Confidence
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
@@ -36,10 +36,15 @@ def index_file(
         )
 
     new_symbols = extract_symbols(path=path, source_text=source_text, observed_at=observed_at)
-    new_relations, deferred_calls = extract_relations_with_deferred_calls(
+    new_relations, deferred_calls, deferred_inherits = extract_relations_with_deferred_edges(
         path=path, source_text=source_text, observed_at=observed_at
     )
-    new_relations = new_relations + _resolve_deferred_calls(deferred_calls, symbol_store)
+    new_relations = new_relations + _resolve_deferred(
+        deferred_calls, symbol_store, kind="function", predicate="calls"
+    )
+    new_relations = new_relations + _resolve_deferred(
+        deferred_inherits, symbol_store, kind="class", predicate="inherits"
+    )
 
     prior_symbol_ids = {s.id for s in symbol_store.list_by_path(path)}
     prior_relation_keys = {_relation_key(r) for r in relation_store.list_by_site_file(path)}
@@ -93,12 +98,22 @@ def index_file(
     )
 
 
-def _resolve_deferred_calls(
-    deferred_calls: list[DeferredImportCall], symbol_store: SymbolStore
+def _resolve_deferred(
+    deferred_items: list[DeferredImportCall] | list[DeferredImportInherit],
+    symbol_store: SymbolStore,
+    *,
+    kind: str,
+    predicate: str,
 ) -> list[Relation]:
-    """Resolves each DeferredImportCall (a bare call to a `from`-imported
-    name extract_relations couldn't itself resolve, single-file-scoped as
-    it is) against the repo-wide symbol index.
+    """Resolves each DeferredImportCall/DeferredImportInherit (a bare call or
+    a base-class identifier that's `from`-imported but which extract_relations
+    couldn't itself resolve, single-file-scoped as it is) against the
+    repo-wide symbol index. Shared by both predicates (slice A2 generalized
+    this out of what was originally calls-only `_resolve_deferred_calls`,
+    since the two are identical apart from which symbol `kind` to look up
+    and which `predicate` to stamp the resulting Relation with) -- not
+    tested directly (both call sites are private), only via index_file's own
+    integration tests.
 
     No module-path-to-file-path mapping exists or can be assumed for an
     arbitrary target repo (no PYTHONPATH/package-root config, see the
@@ -112,7 +127,7 @@ def _resolve_deferred_calls(
     matching already used for redefinition collisions elsewhere in this
     codebase, just applied to paths instead of qualnames.
 
-    Zero matches leaves the call unresolved (identical to today's silent
+    Zero matches leaves the item unresolved (identical to today's silent
     miss on a genuinely undefined name) -- most commonly because the
     target file hasn't been indexed yet; bootstrap.py's second pass and the
     filesystem watcher's natural reindex-on-edit are what eventually close
@@ -122,11 +137,11 @@ def _resolve_deferred_calls(
     collision handling.
     """
     relations: list[Relation] = []
-    for call in deferred_calls:
+    for item in deferred_items:
         candidates = [
             symbol
-            for symbol in symbol_store.find_by_qualname_and_kind(qualname=call.name, kind="function")
-            if _module_path_matches(symbol.path, call.module_path)
+            for symbol in symbol_store.find_by_qualname_and_kind(qualname=item.name, kind=kind)
+            if _module_path_matches(symbol.path, item.module_path)
         ]
         if not candidates:
             continue
@@ -134,14 +149,14 @@ def _resolve_deferred_calls(
         for candidate in candidates:
             relations.append(
                 Relation(
-                    source=call.source,
+                    source=item.source,
                     target=candidate.id,
-                    predicate="calls",
-                    site_file=call.site_file,
-                    site_line=call.site_line,
-                    site_col=call.site_col,
+                    predicate=predicate,
+                    site_file=item.site_file,
+                    site_line=item.site_line,
+                    site_col=item.site_col,
                     confidence=confidence,
-                    provenance=call.provenance,
+                    provenance=item.provenance,
                 )
             )
     return relations

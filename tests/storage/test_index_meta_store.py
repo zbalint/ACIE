@@ -137,6 +137,58 @@ def test_opening_a_pre_existing_index_meta_table_without_cross_file_pass_done_mi
     store = IndexMetaStore(conn=conn)  # must not raise OperationalError
 
     assert store.cross_file_pass_done() is False
+
+
+def test_a_repo_migrated_only_under_the_old_calls_only_boolean_flag_still_reports_not_done():
+    # Codex review finding (P1), slice A2: the old boolean column can only
+    # mean "the calls-only catch-up ran" -- it cannot distinguish that from
+    # "calls+inherits both ran" (CURRENT_CROSS_FILE_PASS_VERSION). A repo
+    # already at the legacy done=1 state must still report False here so
+    # BootstrapCoordinator's catch-up pass runs once more and closes the new
+    # inherits gap, exactly like a repo that never ran any pass at all.
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS index_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 0),
+            generation INTEGER NOT NULL,
+            head_sha TEXT,
+            cross_file_pass_done INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    conn.execute("INSERT INTO index_meta (id, generation, head_sha, cross_file_pass_done) VALUES (0, 5, 'abc123', 1)")
+    conn.commit()
+
+    store = IndexMetaStore(conn=conn)
+
+    assert store.cross_file_pass_done() is False
+
+
+def test_marking_cross_file_pass_done_after_the_legacy_upgrade_makes_it_report_done():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS index_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 0),
+            generation INTEGER NOT NULL,
+            head_sha TEXT,
+            cross_file_pass_done INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    conn.execute("INSERT INTO index_meta (id, generation, head_sha, cross_file_pass_done) VALUES (0, 5, 'abc123', 1)")
+    conn.commit()
+    store = IndexMetaStore(conn=conn)
+    assert store.cross_file_pass_done() is False
+
+    store.mark_cross_file_pass_done()
+
+    assert store.cross_file_pass_done() is True
     assert store.current_generation() == 5
     assert store.get_last_indexed_head_sha() == "abc123"
 

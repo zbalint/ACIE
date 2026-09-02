@@ -1,4 +1,4 @@
-from acie.adapters.python.extract_relations import extract_relations, extract_relations_with_deferred_calls
+from acie.adapters.python.extract_relations import extract_relations, extract_relations_with_deferred_edges
 from acie.ir.symbol import Confidence
 
 
@@ -104,6 +104,66 @@ def test_class_inherits_from_a_name_not_defined_in_this_file():
 
     inherits = [r for r in relations if r.predicate == "inherits"]
     assert inherits == []
+
+
+def test_class_inheriting_from_a_name_imported_from_another_module_is_deferred_not_dropped():
+    # Mirrors test_call_to_a_name_imported_from_another_module_is_deferred_not_dropped:
+    # extract_relations is single-file-scoped and cannot itself resolve a
+    # base class imported from elsewhere -- it must be deferred, not
+    # silently dropped like a genuinely undefined name would be.
+    source = "from pkg.other import Base\n\n\nclass Foo(Base):\n    pass\n"
+
+    relations, deferred_calls, deferred_inherits = extract_relations_with_deferred_edges(
+        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    )
+
+    assert [r for r in relations if r.predicate == "inherits"] == []
+    assert deferred_calls == []
+    assert len(deferred_inherits) == 1
+    deferred_inherit = deferred_inherits[0]
+    assert deferred_inherit.source == "pkg/mod.py:Foo#class"
+    assert deferred_inherit.module_path == "pkg.other"
+    assert deferred_inherit.name == "Base"
+    assert deferred_inherit.site_file == "pkg/mod.py"
+    assert deferred_inherit.site_line == 4
+    assert deferred_inherit.provenance.provider == "tree-sitter"
+
+
+def test_class_with_one_same_file_base_and_one_imported_base_defers_only_the_imported_one():
+    # agy review suggestion, slice A2: superclasses.named_children is a
+    # sequential loop over every base -- a mixed `class Foo(SameFile,
+    # Imported):` must resolve the same-file base immediately AND defer
+    # the imported one, not treat the whole class as one all-or-nothing case.
+    source = "from pkg.other import Imported\n\n\nclass SameFile:\n    pass\n\n\nclass Foo(SameFile, Imported):\n    pass\n"
+
+    relations, deferred_calls, deferred_inherits = extract_relations_with_deferred_edges(
+        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    )
+
+    inherits = [r for r in relations if r.predicate == "inherits"]
+    assert len(inherits) == 1
+    assert inherits[0].source == "pkg/mod.py:Foo#class"
+    assert inherits[0].target == "pkg/mod.py:SameFile#class"
+    assert inherits[0].confidence == Confidence.EXTRACTED
+    assert deferred_calls == []
+    assert len(deferred_inherits) == 1
+    assert deferred_inherits[0].source == "pkg/mod.py:Foo#class"
+    assert deferred_inherits[0].module_path == "pkg.other"
+    assert deferred_inherits[0].name == "Imported"
+
+
+def test_class_inheriting_from_a_name_from_a_plain_import_statement_is_not_deferred():
+    # `import pkg.other` is used as `pkg.other.Base`, never as a bare
+    # identifier base class -- it must never populate the alias map used to
+    # defer cross-module inherits, same as the calls-side equivalent.
+    source = "import pkg.other\n\n\nclass Foo(other):\n    pass\n"
+
+    relations, deferred_calls, deferred_inherits = extract_relations_with_deferred_edges(
+        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    )
+
+    assert deferred_inherits == []
+    assert [r for r in relations if r.predicate == "inherits"] == []
 
 
 def test_method_overrides_a_base_class_method_in_the_same_file():
@@ -361,7 +421,7 @@ def test_reference_to_a_name_not_defined_in_this_file_produces_no_edge():
 def test_call_to_a_name_imported_from_another_module_is_deferred_not_dropped():
     source = "from pkg.other import helper\n\n\nhelper()\n"
 
-    relations, deferred = extract_relations_with_deferred_calls(
+    relations, deferred, deferred_inherits = extract_relations_with_deferred_edges(
         path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
     )
 
@@ -369,6 +429,7 @@ def test_call_to_a_name_imported_from_another_module_is_deferred_not_dropped():
     # itself -- it must be deferred, not silently dropped like a genuinely
     # undefined name would be.
     assert [r for r in relations if r.predicate == "calls"] == []
+    assert deferred_inherits == []
     assert len(deferred) == 1
     deferred_call = deferred[0]
     assert deferred_call.source == "pkg/mod.py:#module"
@@ -393,9 +454,10 @@ def test_call_to_a_name_from_a_plain_import_statement_is_not_deferred():
     # cross-module calls.
     source = "import pkg.other\n\n\nother()\n"
 
-    relations, deferred = extract_relations_with_deferred_calls(
+    relations, deferred, deferred_inherits = extract_relations_with_deferred_edges(
         path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
     )
 
     assert deferred == []
+    assert deferred_inherits == []
     assert [r for r in relations if r.predicate == "calls"] == []

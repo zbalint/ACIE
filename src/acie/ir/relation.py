@@ -34,3 +34,25 @@ class DeferredImportCall:
     site_line: int
     site_col: int
     provenance: Provenance
+
+
+@dataclass(frozen=True)
+class DeferredImportInherit:
+    """A `class Foo(Base): ...` base identifier that resolves to no same-file
+    class but *is* imported (`from module_path import name`) in this file --
+    mirrors DeferredImportCall's split for the `inherits` predicate: this
+    slice's extract_relations (single-file, pure) can go no further than
+    naming the subclass and the imported base name/module it came from.
+    Cross-file resolution against the repo-wide symbol index happens in
+    indexer.py, turning a successfully-resolved one into a normal `inherits`
+    Relation; one that stays unresolved (base file not yet indexed, or
+    genuinely external) simply produces no edge, same as DeferredImportCall.
+    """
+
+    source: str
+    module_path: str
+    name: str
+    site_file: str
+    site_line: int
+    site_col: int
+    provenance: Provenance

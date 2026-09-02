@@ -418,6 +418,145 @@ def test_removing_a_callee_symbol_does_not_disturb_an_unrelated_ambiguous_siblin
     assert remaining[0].target == "vendor_b/pkg/other.py:helper#function"
 
 
+def test_cross_file_inherited_base_resolves_once_the_base_file_is_indexed():
+    """Slice A2: mirrors test_cross_file_imported_call_resolves_once_the_callee_file_is_indexed
+    exactly, for a base class imported from another module instead of a
+    called function -- base indexed first, matching bootstrap's own
+    walk-then-resolve order within one file's index_file call.
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/other.py", source_text="class Base:\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    inherits = relation_store.list_by_site_file("pkg/mod.py", predicates={"inherits"})
+    assert len(inherits) == 1
+    assert inherits[0].source == "pkg/mod.py:Foo#class"
+    assert inherits[0].target == "pkg/other.py:Base#class"
+    assert inherits[0].confidence == Confidence.EXTRACTED
+
+
+def test_cross_file_inherited_base_stays_unresolved_when_the_base_is_indexed_first_the_other_way_around():
+    """Pins the same known ordering limitation as the calls-side equivalent:
+    indexing the subclass before the base file leaves `inherits` unresolved
+    until the subclass's file is reindexed (e.g. bootstrap's second pass).
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert relation_store.list_by_site_file("pkg/mod.py", predicates={"inherits"}) == []
+
+    index_file(
+        path="pkg/other.py", source_text="class Base:\n    pass\n",
+        observed_at="2026-08-31T00:01:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert relation_store.list_by_site_file("pkg/mod.py", predicates={"inherits"}) == []
+
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    pass\n",
+        observed_at="2026-08-31T00:02:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    inherits = relation_store.list_by_site_file("pkg/mod.py", predicates={"inherits"})
+    assert len(inherits) == 1
+    assert inherits[0].target == "pkg/other.py:Base#class"
+
+
+def test_cross_file_inherit_matching_two_same_suffix_module_paths_is_ambiguous():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="vendor_a/pkg/other.py", source_text="class Base:\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="vendor_b/pkg/other.py", source_text="class Base:\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    inherits = relation_store.list_by_site_file("pkg/mod.py", predicates={"inherits"})
+    assert len(inherits) == 2
+    targets = {r.target for r in inherits}
+    assert targets == {"vendor_a/pkg/other.py:Base#class", "vendor_b/pkg/other.py:Base#class"}
+    assert all(r.confidence == Confidence.AMBIGUOUS for r in inherits)
+
+
+def test_removing_a_base_class_symbol_tombstones_a_cross_file_inherits_edge_into_it():
+    """Mirrors test_removing_a_callee_symbol_tombstones_a_cross_file_call_edge_into_it:
+    index_file's stale-cross-file-relation cleanup (removed_symbol_ids vs
+    relation_store.list_by_target) is predicate-agnostic already, so it
+    must cover a renamed/removed cross-file base class exactly like it does
+    a renamed/removed callee.
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    index_file(
+        path="pkg/other.py", source_text="class Base:\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg.other import Base\n\n\nclass Foo(Base):\n    pass\n",
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert len(relation_store.list_by_site_file("pkg/mod.py", predicates={"inherits"})) == 1
+
+    result = index_file(
+        path="pkg/other.py", source_text="class Renamed:\n    pass\n",
+        observed_at="2026-08-31T00:01:00Z",
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    assert symbol_store.get("pkg/other.py:Base#class") is None
+    stale_inherits = relation_store.list_by_site_file("pkg/mod.py", predicates={"inherits"})
+    assert stale_inherits == []
+    assert result.relations_tombstoned >= 1
+
+
 def test_index_file_persists_to_a_real_on_disk_index_for_a_resolved_repo(tmp_path):
     """Closes slice 7 follow-up e3414030's roadmap-gap half: proves
     index_file + SymbolStore/RelationStore actually work end-to-end against

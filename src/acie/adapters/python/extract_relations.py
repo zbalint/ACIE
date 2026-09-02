@@ -4,7 +4,7 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 
 from acie.adapters.python.extract_symbols import extract_symbols
-from acie.ir.relation import DeferredImportCall, Relation
+from acie.ir.relation import DeferredImportCall, DeferredImportInherit, Relation
 from acie.ir.symbol import Confidence, Provenance, Symbol
 
 _LANGUAGE = Language(tspython.language())
@@ -12,29 +12,32 @@ _PROVENANCE_VERSION = version("tree-sitter-python")
 
 
 def extract_relations(path: str, source_text: str, observed_at: str) -> list[Relation]:
-    """Same-file relations only -- see extract_relations_with_deferred_calls
+    """Same-file relations only -- see extract_relations_with_deferred_edges
     for the sibling entry point that also surfaces cross-file-candidate
-    calls this pure, single-file function cannot itself resolve.
+    calls/inherits this pure, single-file function cannot itself resolve.
     """
-    relations, _deferred = _extract(path=path, source_text=source_text, observed_at=observed_at)
+    relations, _deferred_calls, _deferred_inherits = _extract(
+        path=path, source_text=source_text, observed_at=observed_at
+    )
     return relations
 
 
-def extract_relations_with_deferred_calls(
+def extract_relations_with_deferred_edges(
     path: str, source_text: str, observed_at: str
-) -> tuple[list[Relation], list[DeferredImportCall]]:
-    """Like extract_relations, but also returns bare-identifier calls whose
-    name resolves to no same-file symbol yet *is* imported in this file --
-    candidates for cross-file resolution against the repo-wide symbol index,
-    which only indexer.py (not this pure, single-file function) can do. See
-    DeferredImportCall.
+) -> tuple[list[Relation], list[DeferredImportCall], list[DeferredImportInherit]]:
+    """Like extract_relations, but also returns bare-identifier calls and
+    `class Foo(Base):` base identifiers whose name resolves to no same-file
+    symbol yet *is* imported in this file -- candidates for cross-file
+    resolution against the repo-wide symbol index, which only indexer.py
+    (not this pure, single-file function) can do. See DeferredImportCall /
+    DeferredImportInherit.
     """
     return _extract(path=path, source_text=source_text, observed_at=observed_at)
 
 
 def _extract(
     path: str, source_text: str, observed_at: str
-) -> tuple[list[Relation], list[DeferredImportCall]]:
+) -> tuple[list[Relation], list[DeferredImportCall], list[DeferredImportInherit]]:
     symbols = extract_symbols(path=path, source_text=source_text, observed_at=observed_at)
     provenance = Provenance(
         provider="tree-sitter", version=_PROVENANCE_VERSION, observed_at=observed_at
@@ -60,14 +63,19 @@ def _extract(
         provenance=provenance,
     )
 
+    inherits_relations, deferred_inherits = _inherits_relations(
+        tree.root_node,
+        symbols,
+        top_level_by_name=top_level_by_name,
+        import_alias_map=import_alias_map,
+        path=path,
+        provenance=provenance,
+    )
+
     relations: list[Relation] = []
     relations.extend(_defines_relations(symbols, path=path, provenance=provenance))
     relations.extend(import_relations)
-    relations.extend(
-        _inherits_relations(
-            tree.root_node, symbols, top_level_by_name=top_level_by_name, path=path, provenance=provenance
-        )
-    )
+    relations.extend(inherits_relations)
     relations.extend(
         _overrides_relations(
             tree.root_node,
@@ -78,7 +86,7 @@ def _extract(
         )
     )
     relations.extend(call_relations)
-    return relations, deferred_calls
+    return relations, deferred_calls, deferred_inherits
 
 
 def _call_and_reference_relations(
@@ -252,13 +260,23 @@ def _inherits_relations(
     symbols: list[Symbol],
     *,
     top_level_by_name: dict[str, list[Symbol]],
+    import_alias_map: dict[str, str],
     path: str,
     provenance: Provenance,
-) -> list[Relation]:
+) -> tuple[list[Relation], list[DeferredImportInherit]]:
     """Top-level `class Foo(Base): ...` only (this slice's narrow first cut,
     matching extract_symbols's own top-level-only scope) -- decorated
     classes, keyword base-class args like `metaclass=M` (correctly skipped,
     not an identifier), and multi-level nesting are out of scope here.
+
+    A base identifier that matches neither a same-file class nor
+    import_alias_map is a genuinely undefined/unresolvable name and produces
+    no edge at all -- unchanged from before this slice. One that resolves to
+    no same-file class but *is* a `from`-imported name produces a
+    DeferredImportInherit instead (slice A2), mirroring how
+    _call_and_reference_relations defers a bare call to an imported name:
+    indexer.py resolves it against the repo-wide symbol index, which this
+    pure, single-file function has no access to.
     """
     by_position = _symbol_by_position(symbols)
     class_candidates_by_name = {
@@ -266,7 +284,8 @@ def _inherits_relations(
         for name, candidates in top_level_by_name.items()
     }
 
-    relations = []
+    relations: list[Relation] = []
+    deferred: list[DeferredImportInherit] = []
     for child in root.named_children:
         if child.type != "class_definition":
             continue
@@ -277,8 +296,21 @@ def _inherits_relations(
         for base in superclasses.named_children:
             if base.type != "identifier":
                 continue
-            candidates = class_candidates_by_name.get(base.text.decode("utf-8"), [])
+            base_name = base.text.decode("utf-8")
+            candidates = class_candidates_by_name.get(base_name, [])
             if not candidates:
+                if base_name in import_alias_map:
+                    deferred.append(
+                        DeferredImportInherit(
+                            source=source_symbol.id,
+                            module_path=import_alias_map[base_name],
+                            name=base_name,
+                            site_file=path,
+                            site_line=base.start_point.row + 1,
+                            site_col=base.start_point.column,
+                            provenance=provenance,
+                        )
+                    )
                 continue
             confidence = Confidence.EXTRACTED if len(candidates) == 1 else Confidence.AMBIGUOUS
             for candidate in candidates:
@@ -294,7 +326,7 @@ def _inherits_relations(
                         provenance=provenance,
                     )
                 )
-    return relations
+    return relations, deferred
 
 
 def _overrides_relations(

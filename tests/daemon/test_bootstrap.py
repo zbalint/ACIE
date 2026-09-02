@@ -343,6 +343,48 @@ def test_register_does_not_repeat_the_cross_file_migration_once_done(tmp_path):
     write_queue.close()
 
 
+def test_register_retroactively_resolves_cross_file_inherits_for_a_repo_stuck_at_the_old_calls_only_migration_version(
+    tmp_path,
+):
+    """Codex review finding (P1), slice A2: a repo that already completed
+    the pre-A2 calls-only catch-up pass (persisted at cross-file-pass
+    version 1) must NOT be skipped by BootstrapCoordinator's flag-gated
+    catch-up check just because that old flag reads "done" -- only a repo
+    at or above CURRENT_CROSS_FILE_PASS_VERSION (2, calls+inherits) may be
+    skipped. Otherwise an install upgraded straight from the calls-only
+    migration would never gain cross-file inherits resolution for its
+    pre-existing files at all, exactly like the original calls-only gap
+    this same catch-up mechanism was built to close.
+    """
+    files = {
+        "repo-a": [
+            ("pkg/mod.py", "from pkg.other import Base\n\n\nclass Foo(Base):\n    pass\n"),
+            ("pkg/other.py", "class Base:\n    pass\n"),
+        ]
+    }
+    coordinator, write_queue, db_path_for = _make_coordinator(tmp_path, files_by_repo=files)
+    _index_files_once_directly(db_path_for("repo-a"), files["repo-a"])
+    # Simulate an install that already fully completed the pre-A2
+    # calls-only migration (persisted version 1) -- not a fresh/never-
+    # migrated repo (version 0), which the older test above already covers.
+    conn = sqlite3.connect(db_path_for("repo-a"))
+    conn.execute("UPDATE index_meta SET cross_file_pass_version = 1 WHERE id = 0")
+    conn.commit()
+    conn.close()
+    assert RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"inherits"}) == []
+    coordinator._walk_repo = lambda repo_root: files.get(repo_root, [])
+
+    coordinator.register("repo-a", "repo-a")
+
+    assert _wait_until(
+        lambda: RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"inherits"}) != []
+    ), "cross-file inherits was never retroactively resolved for a repo stuck at the old calls-only version"
+    inherits = RelationStore(db_path_for("repo-a")).list_by_site_file("pkg/mod.py", predicates={"inherits"})
+    assert len(inherits) == 1
+    assert inherits[0].target == "pkg/other.py:Base#class"
+    write_queue.close()
+
+
 def test_cross_file_migration_flag_persists_across_a_simulated_daemon_restart(tmp_path):
     """The in-memory _in_progress/_ready guards alone don't prove the flag
     is actually persisted to disk -- a brand-new BootstrapCoordinator
