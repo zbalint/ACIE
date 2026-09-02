@@ -183,7 +183,7 @@ def create_daemon(
 
     def _dispatch_notify_hook(request: dict, *, resolved: tuple[str, str] | None) -> dict:
         # A control-plane call like server.py's shutdown/ping, not one of
-        # the 8 read-only tools in dispatch.py's DISPATCH_TABLE -- it never
+        # the 9 read-only tools in dispatch.py's DISPATCH_TABLE -- it never
         # touches repo_ready/INDEX_NOT_READY, since its whole point is to
         # work on a repo that isn't indexed yet (register_repo above
         # already kicked off bootstrap if this is the first time).

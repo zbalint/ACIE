@@ -13,12 +13,22 @@ extract_relations actually produce.
 This file indexes one realistic fixture module exactly once (via the real
 on-disk .acie index path, same as test_indexer.py's
 test_index_file_persists_to_a_real_on_disk_index_for_a_resolved_repo) and
-runs all 8 MCP tools against that single shared state together, cross-
+runs all 9 MCP tools against that single shared state together, cross-
 checking their outputs agree with each other where they should (e.g.
 graph's call-graph nodes match find_references' usage sites for the same
 symbol). Call-site positions used for position-based lookups are read back
 from the real indexed RelationStore, not hand-guessed line/column numbers,
 so this test can't silently drift from what the indexer actually produces.
+
+v1 slice B1 (code review finding, P2): `affected_tests` was added to
+DISPATCH_TABLE without ever being exercised against real indexer-produced
+state -- its 24 unit tests only prove the BFS/classification logic against
+hand-built stores, which structurally cannot catch a mismatch between what
+`affected_tests` assumes a real cross-file `calls` edge from an actual
+pytest-convention file looks like and what the indexer really produces for
+one. A second fixture module (`tests/test_mod.py`, indexed via the same
+real `index_file` pipeline, callee-before-caller per the cross-file-import
+ordering rule test_indexer.py already documents) closes that gap.
 """
 
 import subprocess
@@ -31,6 +41,7 @@ from acie.repo_id import resolve_index_db_path
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
+from acie.tools.affected_tests import affected_tests
 from acie.tools.explain import explain
 from acie.tools.find_references import find_references
 from acie.tools.find_symbol import find_symbol
@@ -78,6 +89,20 @@ _DOG_SPEAK_ID = f"{_PATH}:Dog.speak#method"
 _BARK_ID = f"{_PATH}:bark#function"
 _MAIN_ID = f"{_PATH}:main#function"
 
+# Second fixture module, pytest-convention-named, importing and calling
+# `bark` cross-file -- gives affected_tests a real indexer-produced `calls`
+# edge from an actual test file to exercise, instead of only hand-built
+# Relation objects (code review finding, P2).
+_TEST_PATH = "tests/test_mod.py"
+_TEST_SOURCE = (
+    "from pkg.mod import bark\n"
+    "\n"
+    "\n"
+    "def test_bark():\n"
+    "    assert bark() == \"woof\"\n"
+)
+_TEST_BARK_ID = f"{_TEST_PATH}:test_bark#function"
+
 
 def _indexed_stores(tmp_path):
     repo = tmp_path / "repo"
@@ -95,15 +120,29 @@ def _indexed_stores(tmp_path):
         index_meta_store=index_meta_store,
     )
     assert result.skipped is False, "fixture source must parse cleanly"
+
+    # Indexed strictly after _PATH: cross-file imported-call resolution
+    # requires the callee to already exist (test_indexer.py's
+    # test_cross_file_imported_call_stays_unresolved_when_the_callee_is_
+    # indexed_first_the_other_way_around) -- there is no retarget-in-place,
+    # so indexing the test file first would leave its call to bark
+    # unresolved.
+    test_result = index_file(
+        path=_TEST_PATH, source_text=_TEST_SOURCE, observed_at=_OBSERVED_AT,
+        symbol_store=symbol_store, relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert test_result.skipped is False, "test fixture source must parse cleanly"
     return symbol_store, relation_store, index_meta_store
 
 
-def test_all_eight_mcp_tools_operate_correctly_against_one_real_indexed_repo(tmp_path):
+def test_all_nine_mcp_tools_operate_correctly_against_one_real_indexed_repo(tmp_path):
     symbol_store, relation_store, index_meta_store = _indexed_stores(tmp_path)
 
-    # 1. find_symbol: substring name lookup finds the real indexed function.
+    # 1. find_symbol: substring name lookup finds the real indexed function
+    # -- "bark" also substring-matches test_bark, ordered by symbol ID.
     found = find_symbol(symbol_store=symbol_store, index_meta_store=index_meta_store, name="bark")
-    assert [r["id"] for r in found["results"]] == [_BARK_ID]
+    assert [r["id"] for r in found["results"]] == [_BARK_ID, _TEST_BARK_ID]
 
     # 2. get_definition by symbol_id.
     definition = get_definition(
@@ -115,7 +154,7 @@ def test_all_eight_mcp_tools_operate_correctly_against_one_real_indexed_repo(tmp
     # 2b. get_definition by position, resolved against a call site the real
     # indexer produced (not a hand-guessed line/column).
     call_sites = relation_store.list_by_target(_BARK_ID, predicates={"calls"})
-    assert len(call_sites) == 2  # Dog.speak's and main's calls to bark()
+    assert len(call_sites) == 3  # Dog.speak's, main's, and test_bark's calls to bark()
     a_call_site = call_sites[0]
     by_position = get_definition(
         symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
@@ -127,14 +166,15 @@ def test_all_eight_mcp_tools_operate_correctly_against_one_real_indexed_repo(tmp
     )
     assert [r["id"] for r in by_position["results"]] == [_BARK_ID]
 
-    # 3. find_references: defines (1) + calls (2) + references (1, "sound =
-    # bark") -- USAGE_PREDICATES includes defines, unlike resolve.py's
-    # position-resolution predicate set.
+    # 3. find_references: defines (1) + calls (3, incl. test_bark's
+    # cross-file call) + references (1, "sound = bark") -- USAGE_PREDICATES
+    # includes defines, unlike resolve.py's position-resolution predicate
+    # set.
     references = find_references(
         symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
         symbol_id=_BARK_ID,
     )
-    assert references["total_count"] == 4
+    assert references["total_count"] == 5
     assert {r["predicate"] for r in references["results"]} == {"defines", "calls", "references"}
 
     # 4. list_imports: the real extract_relations-produced import edge, an
@@ -158,7 +198,7 @@ def test_all_eight_mcp_tools_operate_correctly_against_one_real_indexed_repo(tmp
         root=_BARK_ID, graph_type="call", direction="upstream",
     )
     caller_ids = {n["id"] for n in call_graph["nodes"] if n["id"] != _BARK_ID}
-    assert caller_ids == {_MAIN_ID, _DOG_SPEAK_ID}
+    assert caller_ids == {_MAIN_ID, _DOG_SPEAK_ID, _TEST_BARK_ID}
 
     # 6b. graph: dependency graph, downstream from the module ("what the
     # module imports") -- the unresolved-leaf path (extract_relations never
@@ -171,16 +211,16 @@ def test_all_eight_mcp_tools_operate_correctly_against_one_real_indexed_repo(tmp
     unresolved = [n for n in dependency_graph["nodes"] if n["id"] != _MODULE_ID]
     assert unresolved == [{"id": "os", "resolved": False}]
 
-    # 7. impact_analysis: blast radius of changing bark -- both of its
-    # callers, confidence-tiered.
+    # 7. impact_analysis: blast radius of changing bark -- all three of its
+    # callers (incl. test_bark's cross-file call), confidence-tiered.
     impact = impact_analysis(
         symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
         root=_BARK_ID,
     )
     affected_ids = {s["id"] for s in impact["affected_symbols"]}
-    assert affected_ids == {_MAIN_ID, _DOG_SPEAK_ID}
-    assert impact["impact_summary"]["total"] == 2
-    assert impact["impact_summary"]["EXTRACTED"] == 2
+    assert affected_ids == {_MAIN_ID, _DOG_SPEAK_ID, _TEST_BARK_ID}
+    assert impact["impact_summary"]["total"] == 3
+    assert impact["impact_summary"]["EXTRACTED"] == 3
 
     # 8. explain: full observation history, confidence/provenance always
     # shown even at the default full=False (the terse-mode follow-up
@@ -192,6 +232,19 @@ def test_all_eight_mcp_tools_operate_correctly_against_one_real_indexed_repo(tmp
     assert history["results"][0]["id"] == _BARK_ID
     assert history["results"][0]["confidence"] == "EXTRACTED"
     assert history["results"][0]["provenance"]["provider"] == "tree-sitter"
+
+    # 9. affected_tests: of bark's three real callers, only test_bark (the
+    # real, indexer-produced, cross-file pytest-convention caller) is
+    # surfaced -- Dog.speak/main are non-test and correctly excluded despite
+    # also being discovered during the same BFS (code review finding, P2:
+    # closes the gap where B1's 24 unit tests only proved this against
+    # hand-built Relation objects, never a real indexed cross-file call).
+    covering_tests = affected_tests(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        root=_BARK_ID,
+    )
+    assert {t["id"] for t in covering_tests["affected_tests"]} == {_TEST_BARK_ID}
+    assert covering_tests["test_summary"]["total"] == 1
 
     # Cross-tool consistency: the inherits edge graph's call/dependency
     # traversal doesn't cover is independently visible via find_references

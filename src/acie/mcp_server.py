@@ -1,4 +1,4 @@
-"""Stdio MCP adapter that forwards ACIE's eight tools to the local daemon."""
+"""Stdio MCP adapter that forwards ACIE's nine tools to the local daemon."""
 
 import inspect
 import json

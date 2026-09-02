@@ -6,7 +6,7 @@ import anyio
 from acie.cli import main
 
 
-def test_serve_mcp_exposes_and_routes_the_eight_tools(monkeypatch, tmp_path):
+def test_serve_mcp_exposes_and_routes_the_nine_tools(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -36,6 +36,7 @@ def test_serve_mcp_exposes_and_routes_the_eight_tools(monkeypatch, tmp_path):
                     "graph",
                     "impact_analysis",
                     "explain",
+                    "affected_tests",
                 }
 
                 initial_result = await session.call_tool("find_symbol", {"name": "target"})

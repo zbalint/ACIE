@@ -8,7 +8,7 @@ repo's write connection directly: they submit a transaction closure via
 `WriteQueue.submit` and block on the returned Future for the result.
 
 This module owns write concurrency only. dispatch.py's fresh-per-call
-stores (the 8 read-only tools) are a deliberately separate, simpler path
+stores (the 9 read-only tools) are a deliberately separate, simpler path
 per DAEMON.md's "Store lifecycle: fresh-per-call" -- nothing here is
 wired into request dispatch yet; that wiring, and the bootstrap-indexing
 pass that will be this queue's first real caller, are later slices.
