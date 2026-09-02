@@ -91,6 +91,8 @@ This is wider than an originally-considered simpler `(source, target, predicate)
 
 **v0 predicate vocabulary** (the relation "kinds" ACIE tracks): `imports | calls | references | defines | inherits`.
 
+*(v1, in progress, adds `overrides` -- source = the overriding method, target = its immediate overridden base method; EXTRACTED when unambiguous, AMBIGUOUS when more than one immediate-base candidate exists. Locked in the v1 design-spec wayfinder map, not restated here since this section documents v0's own historically-locked vocabulary; see that map's ticket resolution for the full rationale.)*
+
 Exact column-level DDL/type details beyond what's stated above were worked out during the design process but are not fully reproduced here — exact DDL is to be finalized during implementation against this design, not invented for this document.
 
 ## Symbol Identity & Reconciliation

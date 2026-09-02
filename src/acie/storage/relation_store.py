@@ -3,11 +3,13 @@ import sqlite3
 from acie.ir.relation import Relation
 from acie.ir.symbol import Confidence, Provenance
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS relations_live (
+# Shared between _SCHEMA (fresh install) and the overrides-predicate
+# migration below (rebuilding an existing relations_live table) so the
+# column list/CHECK constraint has exactly one source of truth.
+_RELATIONS_LIVE_COLUMNS = """(
     source TEXT NOT NULL,
     target TEXT NOT NULL,
-    predicate TEXT NOT NULL CHECK (predicate IN ('imports', 'calls', 'references', 'defines', 'inherits')),
+    predicate TEXT NOT NULL CHECK (predicate IN ('imports', 'calls', 'references', 'defines', 'inherits', 'overrides')),
     site_file TEXT NOT NULL,
     site_line INTEGER NOT NULL,
     site_col INTEGER NOT NULL,
@@ -16,7 +18,15 @@ CREATE TABLE IF NOT EXISTS relations_live (
     provenance_version TEXT NOT NULL,
     observed_at TEXT NOT NULL,
     PRIMARY KEY (source, target, predicate, site_file, site_line, site_col)
-);
+)"""
+
+_RELATIONS_LIVE_COLUMN_NAMES = (
+    "source, target, predicate, site_file, site_line, site_col, "
+    "confidence, provenance_provider, provenance_version, observed_at"
+)
+
+_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS relations_live {_RELATIONS_LIVE_COLUMNS};
 
 CREATE TABLE IF NOT EXISTS relations_history (
     history_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,6 +50,50 @@ class RelationStore:
         # See SymbolStore.__init__ for why an already-open conn is accepted.
         self._conn = conn if conn is not None else sqlite3.connect(db_path)
         self._conn.executescript(_SCHEMA)
+        self._migrate_add_overrides_predicate_if_missing()
+
+    def _migrate_add_overrides_predicate_if_missing(self) -> None:
+        """CREATE TABLE IF NOT EXISTS (_SCHEMA above) is a no-op against a
+        real pre-existing index.sqlite from before 'overrides' was added to
+        the predicate CHECK constraint -- every such repo would otherwise
+        reject any overrides relation with a CHECK-constraint IntegrityError
+        forever (code review finding, 2026-09-02). SQLite has no ALTER TABLE
+        support for modifying a CHECK constraint in place (unlike
+        IndexMetaStore's simpler ADD COLUMN migrations), so this is a
+        create-copy-drop-rename rebuild of relations_live.
+
+        `with self._conn:` protects everything from the INSERT onward (the
+        first DML statement, which is where Python's legacy sqlite3
+        isolation mode auto-opens an implicit transaction) but NOT the
+        leading CREATE TABLE itself -- as the very first statement issued
+        on the connection, with no transaction open yet, it auto-commits
+        immediately and independently (agy/gemini review finding,
+        2026-09-02, verified empirically: a `with conn:` block's own
+        exception does not undo a CREATE TABLE that was its first
+        statement). So a crash between that CREATE and the final RENAME
+        below leaves `relations_live__migrating` committed on disk (no data
+        loss -- `relations_live` itself is only ever touched from the INSERT
+        onward, which *does* roll back together) but would otherwise wedge
+        every future call to this method with "table already exists". The
+        leading `DROP TABLE IF EXISTS` makes retrying (e.g. on the next
+        daemon startup after such a crash) self-healing rather than fatal.
+        relations_history carries no predicate CHECK at all (see _SCHEMA)
+        and needs no equivalent migration.
+        """
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'relations_live'"
+        ).fetchone()
+        if row is None or "'overrides'" in row[0]:
+            return
+        self._conn.execute("DROP TABLE IF EXISTS relations_live__migrating")
+        with self._conn:
+            self._conn.execute(f"CREATE TABLE relations_live__migrating {_RELATIONS_LIVE_COLUMNS}")
+            self._conn.execute(
+                f"INSERT INTO relations_live__migrating ({_RELATIONS_LIVE_COLUMN_NAMES}) "
+                f"SELECT {_RELATIONS_LIVE_COLUMN_NAMES} FROM relations_live"
+            )
+            self._conn.execute("DROP TABLE relations_live")
+            self._conn.execute("ALTER TABLE relations_live__migrating RENAME TO relations_live")
 
     def upsert(self, relation: Relation) -> None:
         existing = self.get(

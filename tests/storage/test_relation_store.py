@@ -31,6 +31,154 @@ def make_relation(**overrides) -> Relation:
     return Relation(**defaults)
 
 
+def test_overrides_predicate_is_accepted_by_the_schema():
+    store = RelationStore()
+    relation = make_relation(
+        source="pkg/mod.py:Foo.bar#method",
+        target="pkg/mod.py:Base.bar#method",
+        predicate="overrides",
+    )
+
+    store.upsert(relation)
+
+    assert store.get(**_key(relation)) == relation
+
+
+def test_opening_a_pre_existing_relations_live_table_without_overrides_migrates_it_in_place():
+    # Regression (code review, 2026-09-02): CREATE TABLE IF NOT EXISTS
+    # (_SCHEMA) is a no-op against a real pre-existing index.sqlite from
+    # before 'overrides' was added to the predicate CHECK constraint --
+    # every such repo would otherwise reject every overrides relation with
+    # a CHECK-constraint IntegrityError forever. Same lazy-migration idiom
+    # as IndexMetaStore's head_sha/cross_file_pass_done regressions.
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS relations_live (
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            predicate TEXT NOT NULL CHECK (predicate IN ('imports', 'calls', 'references', 'defines', 'inherits')),
+            site_file TEXT NOT NULL,
+            site_line INTEGER NOT NULL,
+            site_col INTEGER NOT NULL,
+            confidence TEXT NOT NULL CHECK (confidence IN ('EXTRACTED', 'INFERRED', 'AMBIGUOUS')),
+            provenance_provider TEXT NOT NULL,
+            provenance_version TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (source, target, predicate, site_file, site_line, site_col)
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO relations_live (
+            source, target, predicate, site_file, site_line, site_col,
+            confidence, provenance_provider, provenance_version, observed_at
+        ) VALUES (
+            'pkg/mod.py:foo#function', 'pkg/other.py:bar#function', 'calls',
+            'pkg/mod.py', 5, 4, 'EXTRACTED', 'tree-sitter', '0.25.0', '2026-08-31T00:00:00Z'
+        )
+        """
+    )
+    conn.commit()
+
+    store = RelationStore(conn=conn)  # must not raise OperationalError/IntegrityError
+
+    # Pre-existing row survived the rebuild untouched.
+    preexisting = make_relation()
+    assert store.get(**_key(preexisting)) == preexisting
+
+    # The whole point: an overrides relation is now accepted against the
+    # migrated table.
+    overrides = make_relation(
+        source="pkg/mod.py:Foo.bar#method",
+        target="pkg/mod.py:Base.bar#method",
+        predicate="overrides",
+    )
+    store.upsert(overrides)
+    assert store.get(**_key(overrides)) == overrides
+
+
+def test_migration_self_heals_after_a_crash_leaves_a_partially_migrated_temp_table_behind():
+    # Regression (agy/gemini review, 2026-09-02): the migration's `with
+    # self._conn:` block does NOT protect its own leading CREATE TABLE --
+    # Python's legacy sqlite3 transaction handling only auto-opens an
+    # implicit transaction before the first DML statement (the INSERT), so a
+    # standalone leading CREATE TABLE auto-commits immediately, independent
+    # of anything that happens (or crashes) afterward. Empirically verified
+    # outside this test: a crash between that CREATE and the final RENAME
+    # leaves relations_live__migrating committed on disk (no data loss --
+    # the original table's own DROP/RENAME never commits -- but the leftover
+    # temp table blocks retrying the CREATE step on next startup, an
+    # OperationalError that previously wedged RelationStore.__init__
+    # permanently). The fix must be idempotent: a leftover
+    # relations_live__migrating from an interrupted prior attempt must not
+    # prevent this constructor from completing the migration.
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS relations_live (
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            predicate TEXT NOT NULL CHECK (predicate IN ('imports', 'calls', 'references', 'defines', 'inherits')),
+            site_file TEXT NOT NULL,
+            site_line INTEGER NOT NULL,
+            site_col INTEGER NOT NULL,
+            confidence TEXT NOT NULL CHECK (confidence IN ('EXTRACTED', 'INFERRED', 'AMBIGUOUS')),
+            provenance_provider TEXT NOT NULL,
+            provenance_version TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (source, target, predicate, site_file, site_line, site_col)
+        );
+        -- Simulates a prior interrupted migration attempt: its leading
+        -- CREATE TABLE committed (per the mechanism above) before a crash
+        -- prevented the rest of that attempt from finishing.
+        CREATE TABLE relations_live__migrating (
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            predicate TEXT NOT NULL CHECK (predicate IN ('imports', 'calls', 'references', 'defines', 'inherits', 'overrides')),
+            site_file TEXT NOT NULL,
+            site_line INTEGER NOT NULL,
+            site_col INTEGER NOT NULL,
+            confidence TEXT NOT NULL CHECK (confidence IN ('EXTRACTED', 'INFERRED', 'AMBIGUOUS')),
+            provenance_provider TEXT NOT NULL,
+            provenance_version TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (source, target, predicate, site_file, site_line, site_col)
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO relations_live (
+            source, target, predicate, site_file, site_line, site_col,
+            confidence, provenance_provider, provenance_version, observed_at
+        ) VALUES (
+            'pkg/mod.py:foo#function', 'pkg/other.py:bar#function', 'calls',
+            'pkg/mod.py', 5, 4, 'EXTRACTED', 'tree-sitter', '0.25.0', '2026-08-31T00:00:00Z'
+        )
+        """
+    )
+    conn.commit()
+
+    store = RelationStore(conn=conn)  # must not raise OperationalError (self-heal)
+
+    preexisting = make_relation()
+    assert store.get(**_key(preexisting)) == preexisting
+
+    overrides = make_relation(
+        source="pkg/mod.py:Foo.bar#method",
+        target="pkg/mod.py:Base.bar#method",
+        predicate="overrides",
+    )
+    store.upsert(overrides)
+    assert store.get(**_key(overrides)) == overrides
+
+
 def test_conn_kwarg_reuses_an_already_open_connection_instead_of_opening_its_own():
     import sqlite3
 

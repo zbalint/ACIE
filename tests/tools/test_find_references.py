@@ -317,6 +317,27 @@ def test_find_references_includes_a_defines_relation_targeting_the_symbol():
     assert envelope["total_count"] == 2
 
 
+def test_find_references_includes_an_overrides_relation_targeting_the_symbol():
+    # overrides is IDE-style "find all usages" too, same reasoning already
+    # locked for inherits above: a subclass method overriding a base method
+    # is a usage of that base method (agy/gemini review finding 3, approved
+    # by the user, 2026-09-02).
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+    base_method = _symbol("pkg/mod.py:Base.bar#method", "pkg/mod.py", "Base.bar", "method", line=2)
+    override_method = _symbol("pkg/mod.py:Foo.bar#method", "pkg/mod.py", "Foo.bar", "method", line=7)
+    symbol_store.upsert(base_method)
+    symbol_store.upsert(override_method)
+    relation_store.upsert(_relation(override_method.id, base_method.id, "overrides", "pkg/mod.py", 7, 4))
+
+    envelope = find_references(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        symbol_id=base_method.id,
+    )
+
+    assert [r["source"] for r in envelope["results"]] == [override_method.id]
+    assert envelope["total_count"] == 1
+
+
 def test_find_references_by_position_raises_symbol_not_found_when_nothing_resolves():
     symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
 

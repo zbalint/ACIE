@@ -18,8 +18,11 @@ _DEFAULT_LIMIT = 50
 # is IDE-style "find all usages", which includes the symbol's own
 # declaration site, so `defines` is included here even though resolve.py
 # still excludes it from resolution (where it's redundant with the
-# symbol-start fallback).
-USAGE_PREDICATES = {"calls", "references", "inherits", "defines"}
+# symbol-start fallback). `overrides` joins the set for the same reason as
+# `inherits`: a subclass method overriding a base method is a usage of that
+# base method (agy/gemini code-review finding, approved by the user,
+# 2026-09-02).
+USAGE_PREDICATES = {"calls", "references", "inherits", "defines", "overrides"}
 
 
 def find_references(

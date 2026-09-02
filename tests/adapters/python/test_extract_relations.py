@@ -106,6 +106,104 @@ def test_class_inherits_from_a_name_not_defined_in_this_file():
     assert inherits == []
 
 
+def test_method_overrides_a_base_class_method_in_the_same_file():
+    source = "class Base:\n    def bar(self):\n        pass\n\n\nclass Foo(Base):\n    def bar(self):\n        pass\n"
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    overrides = [r for r in relations if r.predicate == "overrides"]
+    assert len(overrides) == 1
+    rel = overrides[0]
+    assert rel.source == "pkg/mod.py:Foo.bar#method"
+    assert rel.target == "pkg/mod.py:Base.bar#method"
+    assert rel.confidence == Confidence.EXTRACTED
+    assert rel.site_file == "pkg/mod.py"
+    assert rel.site_line == 7
+    assert rel.provenance.provider == "tree-sitter"
+
+
+def test_class_with_no_base_class_produces_no_overrides():
+    source = "class Foo:\n    def bar(self):\n        pass\n"
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "overrides"] == []
+
+
+def test_method_with_no_matching_base_method_produces_no_override():
+    source = "class Base:\n    def bar(self):\n        pass\n\n\nclass Foo(Base):\n    def baz(self):\n        pass\n"
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "overrides"] == []
+
+
+def test_override_from_a_base_class_not_defined_in_this_file_produces_no_edge():
+    source = "class Foo(SomeImportedBase):\n    def bar(self):\n        pass\n"
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "overrides"] == []
+
+
+def test_override_from_an_ambiguous_redefined_base_class_is_ambiguous():
+    source = (
+        "class Base:\n    def bar(self):\n        pass\n\n\n"
+        "class Base:\n    def bar(self):\n        pass\n\n\n"
+        "class Foo(Base):\n    def bar(self):\n        pass\n"
+    )
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    overrides = [r for r in relations if r.predicate == "overrides"]
+    assert len(overrides) == 2
+    targets = {r.target for r in overrides}
+    assert targets == {"pkg/mod.py:Base.bar#method", "pkg/mod.py:Base.bar#method@2"}
+    assert all(r.source == "pkg/mod.py:Foo.bar#method" for r in overrides)
+    assert all(r.confidence == Confidence.AMBIGUOUS for r in overrides)
+
+
+def test_redefined_subclass_name_does_not_leak_an_unrelated_occurrences_methods_into_overrides():
+    # Regression (agy/gemini review, 2026-09-02): methods_by_class is keyed
+    # by bare qualname text, so a redefined class name (two `class Foo:`
+    # bodies) merges both occurrences' methods under the same key. Without
+    # scoping to the specific class_definition node being evaluated, the
+    # first Foo's bar (whose class has no base at all) would incorrectly be
+    # treated as a candidate override source when processing the second,
+    # unrelated Foo(Base) occurrence, purely because they share a qualname.
+    source = (
+        "class Foo:\n    def bar(self):\n        pass\n\n\n"
+        "class Base:\n    def bar(self):\n        pass\n\n\n"
+        "class Foo(Base):\n    def bar(self):\n        pass\n"
+    )
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    overrides = [r for r in relations if r.predicate == "overrides"]
+    assert len(overrides) == 1
+    rel = overrides[0]
+    assert rel.source == "pkg/mod.py:Foo.bar#method@2"
+    assert rel.target == "pkg/mod.py:Base.bar#method"
+    assert rel.confidence == Confidence.EXTRACTED
+
+
+def test_override_from_multiple_inheritance_with_more_than_one_base_defining_the_method_is_ambiguous():
+    source = (
+        "class A:\n    def bar(self):\n        pass\n\n\n"
+        "class B:\n    def bar(self):\n        pass\n\n\n"
+        "class Foo(A, B):\n    def bar(self):\n        pass\n"
+    )
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    overrides = [r for r in relations if r.predicate == "overrides"]
+    assert len(overrides) == 2
+    targets = {r.target for r in overrides}
+    assert targets == {"pkg/mod.py:A.bar#method", "pkg/mod.py:B.bar#method"}
+    assert all(r.source == "pkg/mod.py:Foo.bar#method" for r in overrides)
+    assert all(r.confidence == Confidence.AMBIGUOUS for r in overrides)
+
+
 def test_module_level_call_to_a_top_level_function():
     source = "def foo():\n    pass\n\n\nfoo()\n"
 

@@ -45,6 +45,7 @@ def _extract(
     module = next(s for s in symbols if s.kind == "module")
 
     top_level_by_name = _index_top_level_symbols(symbols)
+    methods_by_class = _index_methods_by_class(symbols)
     import_relations, import_alias_map = _import_relations(
         tree.root_node, module=module, path=path, provenance=provenance
     )
@@ -52,7 +53,7 @@ def _extract(
         tree.root_node,
         symbols,
         top_level_by_name=top_level_by_name,
-        methods_by_class=_index_methods_by_class(symbols),
+        methods_by_class=methods_by_class,
         import_alias_map=import_alias_map,
         module=module,
         path=path,
@@ -65,6 +66,15 @@ def _extract(
     relations.extend(
         _inherits_relations(
             tree.root_node, symbols, top_level_by_name=top_level_by_name, path=path, provenance=provenance
+        )
+    )
+    relations.extend(
+        _overrides_relations(
+            tree.root_node,
+            top_level_by_name=top_level_by_name,
+            methods_by_class=methods_by_class,
+            path=path,
+            provenance=provenance,
         )
     )
     relations.extend(call_relations)
@@ -224,6 +234,19 @@ def _symbol_by_position(symbols: list[Symbol]) -> dict[tuple[int, int], Symbol]:
     return {(s.start_line, s.start_col): s for s in symbols}
 
 
+def _within_span(symbol: Symbol, node) -> bool:
+    """Whether symbol's start position falls within node's [start, end] span
+    (row,col tuple comparison -- same (line, col) ordering _symbol_by_position
+    already keys on elsewhere in this module). Used by _overrides_relations
+    to scope a qualname-keyed methods_by_class lookup down to only the
+    methods physically defined inside one specific class_definition node.
+    """
+    start = (node.start_point.row + 1, node.start_point.column)
+    end = (node.end_point.row + 1, node.end_point.column)
+    pos = (symbol.start_line, symbol.start_col)
+    return start <= pos <= end
+
+
 def _inherits_relations(
     root,
     symbols: list[Symbol],
@@ -271,6 +294,107 @@ def _inherits_relations(
                         provenance=provenance,
                     )
                 )
+    return relations
+
+
+def _overrides_relations(
+    root,
+    *,
+    top_level_by_name: dict[str, list[Symbol]],
+    methods_by_class: dict[str, dict[str, list[Symbol]]],
+    path: str,
+    provenance: Provenance,
+) -> list[Relation]:
+    """Top-level `class Foo(Base): def bar(...)` where an immediate base
+    (same scope as _inherits_relations resolves -- same-file only, this
+    slice's narrow first cut) already defines a method of the same name.
+    `overrides` points at the immediate overridden base method, not the
+    transitive root -- multi-level chains fall out for free via BFS hopping
+    through the edges (impact_analysis, a later slice).
+
+    Ambiguity is computed per (subclass, method_name) pair over the *union*
+    of every immediate base's matching method candidates -- not per base
+    independently -- because Python's MRO would pick exactly one candidate
+    deterministically, but tree-sitter alone cannot compute MRO linearization
+    across multiple bases; more than one candidate anywhere in that union
+    means the override target is genuinely ambiguous without semantic
+    resolution (later upgraded to INFERRED by pyright enrichment).
+
+    Base qualnames are deduplicated via a set before the methods_by_class
+    lookup: a redefined base class name (e.g. two `class Base:` definitions)
+    produces multiple same-qualname Symbol candidates, but methods_by_class
+    is itself keyed by qualname text (not id), so it already folds their
+    methods into one shared candidate list -- iterating per Symbol instead
+    of per unique qualname would double-count that list.
+
+    On the SUBCLASS side, the opposite care is needed (agy/gemini review
+    finding, 2026-09-02): methods_by_class's own qualname-text keying means
+    a *redefined subclass name* (e.g. an unrelated earlier `class Foo:` with
+    no base at all, followed later by `class Foo(Base):`) would otherwise
+    merge both occurrences' methods together, letting the first Foo's bar
+    leak in as a spurious override source when processing the second,
+    unrelated Foo(Base) node. `own_methods` is therefore scoped down to only
+    the methods physically contained within *this* class_definition node's
+    own span via `_within_span`, not the raw qualname-keyed dict -- this is
+    the one place in this function where per-occurrence, not per-qualname,
+    identity matters.
+    """
+    class_candidates_by_name = {
+        name: [s for s in candidates if s.kind == "class"]
+        for name, candidates in top_level_by_name.items()
+    }
+
+    relations: list[Relation] = []
+    for child in root.named_children:
+        if child.type != "class_definition":
+            continue
+        superclasses = child.child_by_field_name("superclasses")
+        name_node = child.child_by_field_name("name")
+        if superclasses is None or name_node is None:
+            continue
+        all_same_named_methods = methods_by_class.get(name_node.text.decode("utf-8"), {})
+        own_methods: dict[str, list[Symbol]] = {}
+        for method_name, candidates in all_same_named_methods.items():
+            scoped = [m for m in candidates if _within_span(m, child)]
+            if scoped:
+                own_methods[method_name] = scoped
+        if not own_methods:
+            continue
+
+        base_qualnames: set[str] = set()
+        for base in superclasses.named_children:
+            if base.type != "identifier":
+                continue
+            for candidate in class_candidates_by_name.get(base.text.decode("utf-8"), []):
+                base_qualnames.add(candidate.qualname)
+
+        for method_name, subclass_methods in own_methods.items():
+            base_method_candidates = [
+                method
+                for base_qualname in sorted(base_qualnames)
+                for method in methods_by_class.get(base_qualname, {}).get(method_name, [])
+            ]
+            if not base_method_candidates:
+                continue
+            confidence = (
+                Confidence.AMBIGUOUS
+                if len(base_method_candidates) > 1 or len(subclass_methods) > 1
+                else Confidence.EXTRACTED
+            )
+            for subclass_method in subclass_methods:
+                for base_method in base_method_candidates:
+                    relations.append(
+                        Relation(
+                            source=subclass_method.id,
+                            target=base_method.id,
+                            predicate="overrides",
+                            site_file=path,
+                            site_line=subclass_method.start_line,
+                            site_col=subclass_method.start_col,
+                            confidence=confidence,
+                            provenance=provenance,
+                        )
+                    )
     return relations
 
 
