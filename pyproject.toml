@@ -7,7 +7,15 @@ license = "AGPL-3.0-only"
 requires-python = ">=3.11"
 dependencies = [
     "mcp==2.1.1",
-    "tree-sitter>=0.26.0",
+    # 0.26.0 has an unfixed Point.row/Point.column reference-counting bug
+    # (borrowed ref returned instead of a new one for non-immortal ints,
+    # i.e. line/column numbers >256) that silently corrupts the pymalloc
+    # free list and causes a deferred SIGSEGV -- see
+    # https://github.com/tree-sitter/py-tree-sitter/pull/466 and
+    # https://github.com/tree-sitter/py-tree-sitter/issues/472. Fixed on
+    # py-tree-sitter's master but not yet in a tagged release; pin below
+    # 0.26.0 until a release containing that fix exists, then re-open.
+    "tree-sitter>=0.25.0,<0.26.0",
     "tree-sitter-python>=0.25.0",
 ]
 
