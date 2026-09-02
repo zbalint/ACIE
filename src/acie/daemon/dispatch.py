@@ -138,16 +138,38 @@ def _call_tool(
     return tool(**kwargs)
 
 
-def _read_source_files(repo_root: str, path_glob: str | None) -> dict[str, str]:
+def _read_source_files(
+    repo_root: str, path_glob: str | None, is_ignored: Callable[[str], bool] | None = None
+) -> dict[str, str]:
+    """`is_ignored`, when given, is a repo-relative-path predicate (e.g.
+    ignore.IgnoreMatcher.matches) shared with the filesystem watcher -- see
+    ignore.py's module docstring for why bootstrap and the watcher must
+    agree on scope. Optional and defaults to "nothing ignored" so this
+    function's other caller (structural_search's live disk-read seam in
+    _call_tool, which was never part of that grilling decision) is
+    unaffected unless a future change explicitly opts it in too.
+    """
     files: dict[str, str] = {}
     for dirpath, dirnames, filenames in os.walk(repo_root):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        if is_ignored is not None:
+            rel_dirpath = os.path.relpath(dirpath, repo_root)
+            # Pruned, not just filtered-later: real git doesn't descend
+            # into an ignored directory to look for negated files inside
+            # it either, so this matches actual gitignore semantics, not
+            # just an efficiency shortcut.
+            dirnames[:] = [
+                d for d in dirnames
+                if not is_ignored(d if rel_dirpath == "." else f"{rel_dirpath}/{d}")
+            ]
         for filename in filenames:
             if not filename.endswith(_SOURCE_EXTENSION):
                 continue
             abs_path = os.path.join(dirpath, filename)
             rel_path = os.path.relpath(abs_path, repo_root)
             if path_glob is not None and not fnmatch.fnmatchcase(rel_path, path_glob):
+                continue
+            if is_ignored is not None and is_ignored(rel_path):
                 continue
             try:
                 with open(abs_path, encoding="utf-8") as f:

@@ -1,3 +1,4 @@
+import io
 import json
 import threading
 
@@ -5,7 +6,7 @@ import acie.cli
 from acie.cli import main
 from acie.daemon.client import daemon_is_running
 from acie.daemon.discovery import write_discovery_file
-from acie.daemon.protocol import build_error_response
+from acie.daemon.protocol import build_error_response, build_success_response
 from acie.daemon.server import DaemonServer
 
 
@@ -85,3 +86,57 @@ def test_daemon_start_spawns_a_daemon_and_stop_shuts_it_down(monkeypatch, tmp_pa
         assert not daemon_is_running(discovery_path)
     finally:
         main(["daemon", "stop"])
+
+
+def test_notify_hook_returns_0_when_no_daemon_is_running(monkeypatch, tmp_path):
+    # ARCHITECTURE.md "Agent Hook Integration": must never break or delay
+    # the calling agent's tool-use flow -- an unreachable daemon is a
+    # silent no-op, never a nonzero exit.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+
+    exit_code = main(["notify-hook", "--agent", "claude-code"])
+
+    assert exit_code == 0
+
+
+def test_notify_hook_returns_0_even_when_the_daemon_answers_with_an_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+    server = DaemonServer(
+        lambda request: build_error_response(request["id"], "INTERNAL_ERROR", "boom"),
+        port=0,
+        discovery_path=str(tmp_path / ".acie" / "daemon.json"),
+    )
+    server.start()
+    try:
+        exit_code = main(["notify-hook", "--agent", "git"])
+    finally:
+        server.shutdown()
+
+    assert exit_code == 0
+
+
+def test_notify_hook_sends_the_agent_and_stdin_payload_to_the_daemon(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"tool_input": {"file_path": "x.py"}}'))
+    received = []
+
+    def dispatch(request):
+        received.append(request)
+        return build_success_response(request["id"], {"status": "accepted"})
+
+    server = DaemonServer(dispatch, port=0, discovery_path=str(tmp_path / ".acie" / "daemon.json"))
+    server.start()
+    try:
+        exit_code = main(["notify-hook", "--agent", "claude-code"])
+    finally:
+        server.shutdown()
+
+    assert exit_code == 0
+    assert len(received) == 1
+    assert received[0]["method"] == "notify_hook"
+    assert received[0]["params"]["agent"] == "claude-code"
+    assert received[0]["params"]["payload"] == '{"tool_input": {"file_path": "x.py"}}'
+    assert received[0]["repo_path"] == str(tmp_path)

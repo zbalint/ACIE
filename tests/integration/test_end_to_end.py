@@ -22,7 +22,10 @@ so this test can't silently drift from what the indexer actually produces.
 """
 
 import subprocess
+import time
 
+from acie.daemon.protocol import build_request
+from acie.daemon.runtime import create_daemon
 from acie.indexer import index_file
 from acie.repo_id import resolve_index_db_path
 from acie.storage.index_meta_store import IndexMetaStore
@@ -36,6 +39,7 @@ from acie.tools.graph import graph
 from acie.tools.impact_analysis import impact_analysis
 from acie.tools.list_imports import list_imports
 from acie.tools.structural_search import structural_search
+from tests.daemon.rpc import send_request
 
 _OBSERVED_AT = "2026-08-31T00:00:00Z"
 _PATH = "pkg/mod.py"
@@ -199,3 +203,83 @@ def test_all_eight_mcp_tools_operate_correctly_against_one_real_indexed_repo(tmp
     assert any(
         r["source"] == _DOG_ID and r["predicate"] == "inherits" for r in animal_refs["results"]
     )
+
+
+def _poll_find_symbol(port, repo, name, *, expect_present, deadline_seconds=3):
+    """Polls find_symbol until it reflects an on-disk change the watcher's
+    debounce window hasn't necessarily settled yet -- there's no push
+    signal for "the watcher just finished", so this is the correct way to
+    wait for tier-1 incremental indexing to catch up in a live-daemon test.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    last_response = None
+    while time.monotonic() < deadline:
+        last_response = send_request(port, build_request("find_symbol", str(repo), {"name": name}))
+        present = last_response["ok"] and bool(last_response["result"]["results"])
+        if present == expect_present:
+            return last_response
+        time.sleep(0.05)
+    raise AssertionError(
+        f"find_symbol({name!r}) never reached expect_present={expect_present}; "
+        f"last response: {last_response}"
+    )
+
+
+def test_watcher_controlled_reindex_lifecycle_against_a_real_daemon(tmp_path):
+    """The "controlled mutation/reindex in a disposable repo" scenario a
+    prior live audit (memory b79e087e) named as the single highest-value
+    missing test -- a real daemon, a real watchdog.Observer, and real
+    on-disk add/edit/delete/rename, each verified through the actual
+    find_symbol MCP tool rather than by inspecting internal state.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "mod.py").write_text("def original():\n    pass\n", encoding="utf-8")
+
+    server = create_daemon(state_dir=str(tmp_path / "state"), port=0)
+    server.start()
+    try:
+        # Bootstrap completes -- the starting symbol is queryable.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            response = send_request(server.port, build_request("find_symbol", str(repo), {"name": "original"}))
+            if response["ok"]:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("repo did not finish bootstrap indexing")
+
+        # ADD: a brand-new file becomes queryable without any explicit reindex call.
+        (repo / "added.py").write_text("def added_symbol():\n    pass\n", encoding="utf-8")
+        _poll_find_symbol(server.port, repo, "added_symbol", expect_present=True)
+
+        # EDIT: rewriting mod.py's content is picked up -- the old symbol
+        # disappears, the new one appears.
+        (repo / "mod.py").write_text("def edited():\n    pass\n", encoding="utf-8")
+        _poll_find_symbol(server.port, repo, "edited", expect_present=True)
+        _poll_find_symbol(server.port, repo, "original", expect_present=False)
+
+        # DELETE: removing added.py tombstones its symbol.
+        (repo / "added.py").unlink()
+        _poll_find_symbol(server.port, repo, "added_symbol", expect_present=False)
+
+        # RENAME: mod.py -> renamed.py -- old path's symbols gone, same
+        # symbol now attributed to the new path. Polls on the path
+        # attribution itself, not mere name-presence -- "edited" stays
+        # visible by name throughout (it's still findable under the old
+        # path) right up until the rename's two jobs both land, so a
+        # presence-only poll would pass on stale, pre-rename state.
+        (repo / "mod.py").rename(repo / "renamed.py")
+        deadline = time.monotonic() + 3
+        renamed_path = None
+        while time.monotonic() < deadline:
+            response = send_request(server.port, build_request("find_symbol", str(repo), {"name": "edited"}))
+            if response["ok"] and response["result"]["results"]:
+                renamed_path = response["result"]["results"][0]["path"]
+                if renamed_path == "renamed.py":
+                    break
+            time.sleep(0.05)
+        assert renamed_path == "renamed.py", f"expected path to update to renamed.py, got {renamed_path!r}"
+    finally:
+        server.shutdown()

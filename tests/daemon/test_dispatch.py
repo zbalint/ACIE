@@ -1,6 +1,6 @@
 import subprocess
 
-from acie.daemon.dispatch import DISPATCH_TABLE, dispatch_request
+from acie.daemon.dispatch import DISPATCH_TABLE, _read_source_files, dispatch_request
 from acie.daemon.protocol import build_request
 from acie.indexer import index_file
 from acie.repo_id import resolve_index_db_path
@@ -270,3 +270,44 @@ def test_dispatch_request_honors_structural_search_path_glob_by_only_reading_mat
     assert response["ok"] is True
     assert response["result"]["total_count"] == 1
     assert response["result"]["results"][0]["captures"]["func.name"][0]["text"] == "bar"
+
+
+def test_read_source_files_with_no_is_ignored_reads_everything_as_before(tmp_path):
+    repo_root = tmp_path
+    (repo_root / "foo.py").write_text("x = 1\n")
+
+    files = _read_source_files(str(repo_root), path_glob=None)
+
+    assert files == {"foo.py": "x = 1\n"}
+
+
+def test_read_source_files_skips_files_the_predicate_says_are_ignored(tmp_path):
+    repo_root = tmp_path
+    (repo_root / "foo.py").write_text("x = 1\n")
+    (repo_root / "generated.py").write_text("y = 2\n")
+
+    files = _read_source_files(
+        str(repo_root), path_glob=None, is_ignored=lambda rel_path: rel_path == "generated.py"
+    )
+
+    assert files == {"foo.py": "x = 1\n"}
+
+
+def test_read_source_files_prunes_ignored_directories_instead_of_just_filtering_their_files(tmp_path):
+    repo_root = tmp_path
+    (repo_root / "foo.py").write_text("x = 1\n")
+    build_dir = repo_root / "build"
+    build_dir.mkdir()
+    (build_dir / "output.py").write_text("z = 3\n")
+    visited_dirs: list[str] = []
+
+    def is_ignored(rel_path: str) -> bool:
+        visited_dirs.append(rel_path)
+        return rel_path == "build"
+
+    files = _read_source_files(str(repo_root), path_glob=None, is_ignored=is_ignored)
+
+    assert files == {"foo.py": "x = 1\n"}
+    # build/output.py's rel_path is never even checked -- the whole
+    # directory was pruned before descending into it.
+    assert "build/output.py" not in visited_dirs

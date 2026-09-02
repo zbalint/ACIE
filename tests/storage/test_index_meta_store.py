@@ -48,3 +48,71 @@ def test_conn_kwarg_reuses_an_already_open_connection_instead_of_opening_its_own
     reader = IndexMetaStore(conn=conn)
 
     assert reader.current_generation() == 1
+
+
+def test_last_indexed_head_sha_is_none_for_a_fresh_store():
+    store = IndexMetaStore(":memory:")
+
+    assert store.get_last_indexed_head_sha() is None
+
+
+def test_set_then_get_last_indexed_head_sha_round_trips():
+    store = IndexMetaStore(":memory:")
+
+    store.set_last_indexed_head_sha("abc123")
+
+    assert store.get_last_indexed_head_sha() == "abc123"
+
+
+def test_set_last_indexed_head_sha_again_overwrites_the_prior_value():
+    store = IndexMetaStore(":memory:")
+    store.set_last_indexed_head_sha("first-sha")
+
+    store.set_last_indexed_head_sha("second-sha")
+
+    assert store.get_last_indexed_head_sha() == "second-sha"
+
+
+def test_last_indexed_head_sha_persists_across_store_instances_on_the_same_db_path(tmp_path):
+    db_path = str(tmp_path / "index.sqlite")
+    first_instance = IndexMetaStore(db_path)
+    first_instance.set_last_indexed_head_sha("abc123")
+
+    reopened = IndexMetaStore(db_path)
+
+    assert reopened.get_last_indexed_head_sha() == "abc123"
+
+
+def test_setting_head_sha_does_not_disturb_the_generation_counter():
+    store = IndexMetaStore(":memory:")
+    store.bump_generation()
+
+    store.set_last_indexed_head_sha("abc123")
+
+    assert store.current_generation() == 1
+
+
+def test_opening_a_pre_existing_index_meta_table_without_head_sha_migrates_it_in_place():
+    # Regression (codex review, 2026-09-02): CREATE TABLE IF NOT EXISTS is a
+    # no-op against a real pre-existing index.sqlite from before head_sha
+    # was added -- every such repo's daemon would hard-fail on next open.
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS index_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 0),
+            generation INTEGER NOT NULL
+        );
+        """
+    )
+    conn.execute("INSERT INTO index_meta (id, generation) VALUES (0, 5)")
+    conn.commit()
+
+    store = IndexMetaStore(conn=conn)  # must not raise OperationalError
+
+    assert store.current_generation() == 5
+    assert store.get_last_indexed_head_sha() is None
+    store.set_last_indexed_head_sha("abc123")
+    assert store.get_last_indexed_head_sha() == "abc123"

@@ -17,6 +17,14 @@ _STARTUP_ATTEMPTS = 25
 _STARTUP_POLL_SECONDS = 0.05
 _RESPAWN_EVERY_ATTEMPTS = 5
 
+# ARCHITECTURE.md "Agent Hook Integration": a hook integration must never
+# break or delay the calling agent's own tool-use flow under any failure
+# condition, so this is a strict client-side budget, not a generous one --
+# Claude Code's PostToolUse hook blocks the agent's current turn until
+# this process exits.
+_NOTIFY_HOOK_TIMEOUT_SECONDS = 0.2
+_NOTIFY_HOOK_AGENTS = ("git", "claude-code", "codex")
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run an ACIE command and return its process exit status."""
@@ -31,6 +39,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     daemon_commands.add_parser("stop")
     status = daemon_commands.add_parser("status")
     status.add_argument("--json", action="store_true")
+    notify_hook = subcommands.add_parser("notify-hook")
+    notify_hook.add_argument("--agent", required=True, choices=_NOTIFY_HOOK_AGENTS)
 
     args = parser.parse_args(argv)
     if args.command == "serve-mcp":
@@ -42,6 +52,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _daemon_stop()
         if args.daemon_command == "status":
             return _daemon_status(as_json=args.json)
+    if args.command == "notify-hook":
+        return _notify_hook(agent=args.agent)
     parser.error("unsupported command")
 
 
@@ -66,6 +78,24 @@ def _daemon_start(*, foreground: bool) -> int:
     if foreground:
         return run_daemon_foreground()
     return 0 if _ensure_daemon() else 1
+
+
+def _notify_hook(*, agent: str) -> int:
+    """The sole public integration contract for tier-2/tier-3 incremental
+    indexing (ARCHITECTURE.md "Agent Hook Integration") -- fire-and-forget,
+    always exits 0 regardless of outcome (daemon not installed, not
+    running, unreachable, slow, or returning an error) so a git hook or an
+    agent's PostToolUse hook can pipe into this unconditionally.
+    """
+    try:
+        payload = sys.stdin.read()
+    except Exception:  # noqa: BLE001 -- stdin read failures must not surface; see docstring.
+        payload = ""
+    request_daemon(
+        _discovery_path(), method="notify_hook", repo_path=os.getcwd(),
+        params={"agent": agent, "payload": payload}, timeout=_NOTIFY_HOOK_TIMEOUT_SECONDS,
+    )
+    return 0
 
 
 def _daemon_stop() -> int:
