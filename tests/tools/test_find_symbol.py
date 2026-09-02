@@ -3,18 +3,18 @@ import pytest
 from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.symbol_store import SymbolStore
-from acie.tools.errors import InvalidCursorError, InvalidLimitError, StaleIndexGenerationError
+from acie.tools.errors import InvalidArgumentError, InvalidCursorError, InvalidLimitError, StaleIndexGenerationError
 from acie.tools.find_symbol import find_symbol
 from acie.tools.pagination import encode_cursor
 
 _PROVENANCE = Provenance(provider="tree-sitter", version="0.25.0", observed_at="2026-08-31T00:00:00Z")
 
 
-def _symbol(id_, path, qualname, kind, line=1):
+def _symbol(id_, path, qualname, kind, line=1, confidence=Confidence.EXTRACTED):
     return Symbol(
         id=id_, path=path, qualname=qualname, kind=kind,
         start_line=line, start_col=0, end_line=line + 1, end_col=8,
-        confidence=Confidence.EXTRACTED, provenance=_PROVENANCE,
+        confidence=confidence, provenance=_PROVENANCE,
     )
 
 
@@ -146,3 +146,28 @@ def test_find_symbol_raises_invalid_cursor_for_a_semantically_wrong_last_id_type
 
     with pytest.raises(InvalidCursorError):
         find_symbol(symbol_store=symbol_store, index_meta_store=index_meta_store, name="foo", cursor=bad_cursor)
+
+
+def test_find_symbol_min_confidence_excludes_less_certain_matches():
+    symbol_store, index_meta_store = _stores_with_generation(1)
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))
+    symbol_store.upsert(
+        _symbol("pkg/mod.py:foo#function@2", "pkg/mod.py", "foo", "function", confidence=Confidence.AMBIGUOUS)
+    )
+
+    envelope = find_symbol(
+        symbol_store=symbol_store, index_meta_store=index_meta_store, name="foo", min_confidence="EXTRACTED",
+    )
+
+    assert envelope["total_count"] == 1
+    assert envelope["results"][0]["id"] == "pkg/mod.py:foo#function"
+
+
+def test_find_symbol_min_confidence_rejects_invalid_value():
+    symbol_store, index_meta_store = _stores_with_generation(1)
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))
+
+    with pytest.raises(InvalidArgumentError):
+        find_symbol(
+            symbol_store=symbol_store, index_meta_store=index_meta_store, name="foo", min_confidence="NOPE",
+        )

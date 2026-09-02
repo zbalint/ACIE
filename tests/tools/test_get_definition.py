@@ -18,11 +18,11 @@ from acie.tools.pagination import encode_cursor
 _PROVENANCE = Provenance(provider="tree-sitter", version="0.25.0", observed_at="2026-08-31T00:00:00Z")
 
 
-def _symbol(id_, path, qualname, kind, line=1, col=0):
+def _symbol(id_, path, qualname, kind, line=1, col=0, confidence=Confidence.EXTRACTED):
     return Symbol(
         id=id_, path=path, qualname=qualname, kind=kind,
         start_line=line, start_col=col, end_line=line + 1, end_col=8,
-        confidence=Confidence.EXTRACTED, provenance=_PROVENANCE,
+        confidence=confidence, provenance=_PROVENANCE,
     )
 
 
@@ -187,6 +187,39 @@ def test_get_definition_by_position_returns_multiple_candidates_for_an_ambiguous
 
     assert {r["id"] for r in envelope["results"]} == {"pkg/a.py:dup#function", "pkg/b.py:dup#function"}
     assert envelope["total_count"] == 2
+
+
+def test_get_definition_min_confidence_excludes_a_less_certain_candidate():
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+    caller = _symbol("pkg/mod.py:caller#function", "pkg/mod.py", "caller", "function", line=1)
+    candidate_a = _symbol("pkg/a.py:dup#function", "pkg/a.py", "dup", "function", line=1)
+    candidate_b = _symbol(
+        "pkg/b.py:dup#function", "pkg/b.py", "dup", "function", line=1, confidence=Confidence.AMBIGUOUS
+    )
+    symbol_store.upsert(caller)
+    symbol_store.upsert(candidate_a)
+    symbol_store.upsert(candidate_b)
+    relation_store.upsert(_relation(caller.id, candidate_a.id, "calls", "pkg/mod.py", 2, 4, confidence=Confidence.AMBIGUOUS))
+    relation_store.upsert(_relation(caller.id, candidate_b.id, "calls", "pkg/mod.py", 2, 4, confidence=Confidence.AMBIGUOUS))
+
+    envelope = get_definition(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        position={"file": "pkg/mod.py", "line": 2, "column": 4}, min_confidence="EXTRACTED",
+    )
+
+    assert envelope["total_count"] == 1
+    assert envelope["results"][0]["id"] == "pkg/a.py:dup#function"
+
+
+def test_get_definition_min_confidence_rejects_invalid_value():
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))
+
+    with pytest.raises(InvalidArgumentError):
+        get_definition(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            symbol_id="pkg/mod.py:foo#function", min_confidence="NOPE",
+        )
 
 
 def test_get_definition_by_position_falls_back_to_the_symbols_own_start_when_no_relation_site_matches():

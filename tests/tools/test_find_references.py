@@ -70,6 +70,36 @@ def test_find_references_by_symbol_id_returns_call_sites_terse():
     assert "provenance" not in result
 
 
+def test_find_references_min_confidence_excludes_a_less_certain_call_site():
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+    callee = _symbol("pkg/mod.py:callee#function", "pkg/mod.py", "callee", "function", line=5)
+    caller = _symbol("pkg/mod.py:caller#function", "pkg/mod.py", "caller", "function", line=1)
+    symbol_store.upsert(callee)
+    symbol_store.upsert(caller)
+    relation_store.upsert(_relation(caller.id, callee.id, "calls", "pkg/mod.py", 2, 4, confidence=Confidence.EXTRACTED))
+    relation_store.upsert(_relation(caller.id, callee.id, "calls", "pkg/mod.py", 3, 4, confidence=Confidence.AMBIGUOUS))
+
+    envelope = find_references(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        symbol_id=callee.id, min_confidence="EXTRACTED",
+    )
+
+    assert envelope["total_count"] == 1
+    assert envelope["results"][0]["site_line"] == 2
+
+
+def test_find_references_min_confidence_rejects_invalid_value():
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+    callee = _symbol("pkg/mod.py:callee#function", "pkg/mod.py", "callee", "function", line=5)
+    symbol_store.upsert(callee)
+
+    with pytest.raises(InvalidArgumentError):
+        find_references(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            symbol_id=callee.id, min_confidence="NOPE",
+        )
+
+
 def test_find_references_full_reveals_confidence_and_provenance():
     symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
     callee = _symbol("pkg/mod.py:callee#function", "pkg/mod.py", "callee", "function", line=5)

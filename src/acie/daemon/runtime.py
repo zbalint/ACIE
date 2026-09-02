@@ -5,6 +5,7 @@ queue, and dispatch modules become one running process. CLI and MCP-server
 client concerns intentionally remain outside this module.
 """
 
+import logging
 import os
 import time
 
@@ -14,11 +15,52 @@ from acie.daemon.dispatch import _read_source_files, dispatch_request
 from acie.daemon.notify_hook import handle_notify_hook
 from acie.daemon.protocol import build_error_response, build_success_response
 from acie.daemon.server import DaemonServer
-from acie.daemon.watcher import WatcherRegistry
+from acie.daemon.staleness import extract_staleness_target
+from acie.daemon.watcher import WatcherRegistry, make_reindex_job
 from acie.daemon.write_queue import WriteQueue
 from acie.repo_id import resolve_repo_id, resolve_repo_root
 
+_logger = logging.getLogger(__name__)
+
 _NOTIFY_HOOK_METHOD = "notify_hook"
+
+# Tier 4 (DAEMON.md "Incremental Indexing Wiring"): bounded so a query
+# naming a file never hangs behind a backlogged writer thread -- proceed
+# with whatever the index currently has rather than delay or fail the
+# caller, same "never break the caller" principle notify-hook's own
+# 200ms fire-and-forget timeout already uses. Deliberately more generous
+# than that budget since this one blocks a real query's answer on the
+# outcome (when it finishes in time) rather than firing and forgetting.
+_LAZY_STALENESS_TIMEOUT_SECONDS = 2.0
+
+def ensure_fresh(
+    write_queue: WriteQueue, repo_id: str, repo_root: str, method: object, params: object,
+    *, timeout: float = _LAZY_STALENESS_TIMEOUT_SECONDS,
+) -> None:
+    """Tier 4: a synchronous, best-effort pre-query reindex of the one file
+    this request's params name (see staleness.py's module docstring for
+    exact scope). Never raises -- a query naming a stale file still gets
+    an answer even if this check itself times out or the reindex job
+    fails, per DAEMON.md "Incremental Indexing Wiring"'s "never break the
+    caller" contract. Module-level (not a create_daemon() closure) so it's
+    directly unit-testable against a real WriteQueue without needing a
+    full daemon/socket harness.
+    """
+    if not isinstance(method, str):
+        return
+    rel_path = extract_staleness_target(method, params if isinstance(params, dict) else None, repo_root)
+    if rel_path is None:
+        return
+    future = write_queue.submit(repo_id, make_reindex_job(repo_root, rel_path))
+    try:
+        future.result(timeout=timeout)
+    except Exception:  # noqa: BLE001 -- best-effort, see docstring above (covers Future's own TimeoutError too).
+        _logger.warning(
+            "Tier 4 lazy staleness check for %r in repo %r did not complete within %.1fs "
+            "or failed -- proceeding with whatever the index currently has.",
+            rel_path, repo_id, timeout,
+        )
+
 
 # Overall budget for on_shutdown()'s whole drain (watchers.close() AND
 # write_queue.close() together, sharing one deadline -- codex review,
@@ -113,6 +155,11 @@ def create_daemon(
 
         if request.get("method") == _NOTIFY_HOOK_METHOD:
             return _dispatch_notify_hook(request, resolved=resolved)
+
+        if resolved is not None:
+            repo_id, repo_root = resolved
+            if bootstrap.repo_ready(repo_id):
+                ensure_fresh(write_queue, repo_id, repo_root, request.get("method"), request.get("params"))
 
         def repo_ready(_repo_path: str) -> bool:
             # dispatch_request owns the malformed-repo response and calls

@@ -5,7 +5,7 @@ import threading
 import time
 
 from acie.daemon import ignore
-from acie.daemon.watcher import RepoWatcher, WatcherRegistry, _DebouncedEventHandler, _make_watch_job
+from acie.daemon.watcher import RepoWatcher, WatcherRegistry, _DebouncedEventHandler, make_reindex_job
 from acie.daemon.write_queue import WriteQueue
 from acie.storage.file_state_store import FileStateStore
 from acie.storage.index_meta_store import IndexMetaStore
@@ -88,7 +88,7 @@ def test_touching_gitignore_itself_invalidates_the_cached_matcher(tmp_path):
     assert matcher_after.matches("generated.py") is True
 
 
-# -- _make_watch_job: the per-file reindex/staleness decision --
+# -- make_reindex_job: the per-file reindex/staleness decision --
 
 
 def _fresh_conn():
@@ -100,7 +100,7 @@ def test_watch_job_for_a_new_file_indexes_it_and_records_its_state(tmp_path):
     _write(repo_root, "mod.py", "def foo():\n    pass\n")
     conn = _fresh_conn()
 
-    job = _make_watch_job(repo_root, "mod.py")
+    job = make_reindex_job(repo_root, "mod.py")
     job(conn)
 
     assert [s.qualname for s in SymbolStore(conn=conn).list_by_path("mod.py")] == ["", "foo"]
@@ -113,7 +113,7 @@ def test_watch_job_is_a_no_op_when_mtime_is_unchanged(tmp_path):
     repo_root = str(tmp_path)
     _write(repo_root, "mod.py", "def foo():\n    pass\n")
     conn = _fresh_conn()
-    job = _make_watch_job(repo_root, "mod.py")
+    job = make_reindex_job(repo_root, "mod.py")
     job(conn)
     generation_after_first = IndexMetaStore(conn=conn).current_generation()
 
@@ -126,7 +126,7 @@ def test_watch_job_updates_recorded_mtime_but_skips_reindex_when_content_is_unch
     repo_root = str(tmp_path)
     _write(repo_root, "mod.py", "def foo():\n    pass\n")
     conn = _fresh_conn()
-    job = _make_watch_job(repo_root, "mod.py")
+    job = make_reindex_job(repo_root, "mod.py")
     job(conn)
     generation_after_first = IndexMetaStore(conn=conn).current_generation()
     state_after_first = FileStateStore(conn=conn).get("mod.py")
@@ -149,7 +149,7 @@ def test_watch_job_reindexes_when_content_actually_changes(tmp_path):
     repo_root = str(tmp_path)
     _write(repo_root, "mod.py", "def foo():\n    pass\n")
     conn = _fresh_conn()
-    job = _make_watch_job(repo_root, "mod.py")
+    job = make_reindex_job(repo_root, "mod.py")
     job(conn)
 
     abs_path = os.path.join(repo_root, "mod.py")
@@ -166,7 +166,7 @@ def test_watch_job_for_a_deleted_file_tombstones_its_prior_symbols(tmp_path):
     repo_root = str(tmp_path)
     _write(repo_root, "mod.py", "def foo():\n    pass\n")
     conn = _fresh_conn()
-    job = _make_watch_job(repo_root, "mod.py")
+    job = make_reindex_job(repo_root, "mod.py")
     job(conn)
     os.remove(os.path.join(repo_root, "mod.py"))
 
@@ -184,7 +184,7 @@ def test_watch_job_for_a_deleted_file_that_was_only_ever_bootstrap_indexed_still
     repo_root = str(tmp_path)
     _write(repo_root, "mod.py", "def foo():\n    pass\n")
     conn = _fresh_conn()
-    # Simulate bootstrap: index directly, bypassing _make_watch_job (and
+    # Simulate bootstrap: index directly, bypassing make_reindex_job (and
     # therefore FileStateStore) entirely, exactly like bootstrap.py does.
     from datetime import datetime, timezone
 
@@ -200,7 +200,7 @@ def test_watch_job_for_a_deleted_file_that_was_only_ever_bootstrap_indexed_still
     assert FileStateStore(conn=conn).get("mod.py") is None  # bootstrap never sets this
     os.remove(os.path.join(repo_root, "mod.py"))
 
-    _make_watch_job(repo_root, "mod.py")(conn)
+    make_reindex_job(repo_root, "mod.py")(conn)
 
     assert SymbolStore(conn=conn).list_by_path("mod.py") == []
 
@@ -210,7 +210,7 @@ def test_watch_job_for_a_delete_never_indexed_before_is_a_no_op(tmp_path):
     conn = _fresh_conn()
     generation_before = IndexMetaStore(conn=conn).current_generation()
 
-    job = _make_watch_job(repo_root, "never_existed.py")
+    job = make_reindex_job(repo_root, "never_existed.py")
     job(conn)  # must not raise
 
     assert IndexMetaStore(conn=conn).current_generation() == generation_before
@@ -220,12 +220,12 @@ def test_rename_decomposes_into_tombstoning_the_old_path_and_indexing_the_new_on
     repo_root = str(tmp_path)
     _write(repo_root, "old_name.py", "def foo():\n    pass\n")
     conn = _fresh_conn()
-    _make_watch_job(repo_root, "old_name.py")(conn)
+    make_reindex_job(repo_root, "old_name.py")(conn)
 
     os.rename(os.path.join(repo_root, "old_name.py"), os.path.join(repo_root, "new_name.py"))
 
-    _make_watch_job(repo_root, "old_name.py")(conn)
-    _make_watch_job(repo_root, "new_name.py")(conn)
+    make_reindex_job(repo_root, "old_name.py")(conn)
+    make_reindex_job(repo_root, "new_name.py")(conn)
 
     assert SymbolStore(conn=conn).list_by_path("old_name.py") == []
     assert [s.qualname for s in SymbolStore(conn=conn).list_by_path("new_name.py")] == ["", "foo"]

@@ -12,7 +12,7 @@ rationale behind:
   repo's current HEAD itself.
 - decision 13: every changed/deleted path this module discovers is
   submitted through the exact same per-path job watcher.py's tier 1 uses
-  (_make_watch_job) -- same mtime/hash gate, same delete/rename handling,
+  (make_reindex_job) -- same mtime/hash gate, same delete/rename handling,
   no separate reindex logic duplicated here.
 
 decision 12 (register() runs unconditionally first) was superseded by
@@ -31,8 +31,9 @@ import subprocess
 from typing import Callable
 
 from acie.daemon import ignore
-from acie.daemon.watcher import _make_watch_job
+from acie.daemon.watcher import make_reindex_job
 from acie.daemon.write_queue import WriteQueue
+from acie.repo_id import to_repo_relative
 from acie.storage.index_meta_store import IndexMetaStore
 
 _SOURCE_EXTENSION = ".py"
@@ -69,7 +70,7 @@ def _submit_if_in_scope(
         return
     if ignore.get_ignore_matcher(repo_root).matches(rel_path):
         return
-    write_queue.submit(repo_id, _make_watch_job(repo_root, rel_path))
+    write_queue.submit(repo_id, make_reindex_job(repo_root, rel_path))
 
 
 def _handle_git(
@@ -141,7 +142,7 @@ def _parse_claude_code_payload(payload: str, repo_root: str) -> str | None:
     file_path = tool_input.get("file_path")
     if not isinstance(file_path, str) or not file_path:
         return None
-    return _to_repo_relative(file_path, repo_root)
+    return to_repo_relative(file_path, repo_root)
 
 
 def _parse_codex_payload(payload: str, repo_root: str) -> list[str]:
@@ -167,7 +168,7 @@ def _parse_codex_payload(payload: str, repo_root: str) -> list[str]:
 def _extract_paths_from_diff_header(diff_text: str, repo_root: str) -> list[str]:
     """Untrusted input -- diff_text is agent-hook payload content, not
     daemon-generated. Every extracted path is run through the same
-    containment check _to_repo_relative already applies to Claude Code's
+    containment check to_repo_relative already applies to Claude Code's
     file_path (codex review, 2026-09-02: an unvalidated "../outside.py"
     header let a crafted payload index/tombstone a file outside the repo).
     """
@@ -178,18 +179,10 @@ def _extract_paths_from_diff_header(diff_text: str, repo_root: str) -> list[str]
                 raw_path = line[len(prefix):].strip()
                 if raw_path == "/dev/null":
                     continue  # a pure add ("--- a/") or pure delete ("+++ b/") side.
-                rel_path = _to_repo_relative(raw_path, repo_root)
+                rel_path = to_repo_relative(raw_path, repo_root)
                 if rel_path is not None and rel_path not in paths:
                     paths.append(rel_path)
     return paths
-
-
-def _to_repo_relative(file_path: str, repo_root: str) -> str | None:
-    abs_path = file_path if os.path.isabs(file_path) else os.path.join(repo_root, file_path)
-    rel_path = os.path.relpath(abs_path, repo_root).replace(os.sep, "/")
-    if rel_path == ".." or rel_path.startswith("../"):
-        return None
-    return rel_path
 
 
 def _load_json_object(payload: str) -> dict | None:

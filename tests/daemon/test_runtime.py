@@ -1,9 +1,11 @@
 import os
 import subprocess
+import threading
 import time
 
 from acie.daemon.protocol import build_request
-from acie.daemon.runtime import create_daemon
+from acie.daemon.runtime import create_daemon, ensure_fresh
+from acie.daemon.write_queue import WriteQueue
 from tests.daemon.rpc import send_request
 
 _DEBOUNCE_WAIT = 1.0
@@ -238,5 +240,136 @@ def test_runtime_worktree_smoke_shared_bootstrap_state_does_not_crash_or_deadloc
         # first-registrant-wins behavior it reads as ready immediately too.
         response = send_request(server.port, build_request("find_symbol", str(worktree), {"name": "target"}))
         assert response["ok"] is True
+    finally:
+        server.shutdown()
+
+
+def test_runtime_list_imports_sees_a_fresh_edit_with_no_wait_for_the_watchers_debounce(tmp_path):
+    # Tier 4 (DAEMON.md "Incremental Indexing Wiring"): proves the *very
+    # next* query reflects an on-disk edit with a single immediate call --
+    # unlike the watcher tests above, this deliberately never polls/sleeps
+    # for the ~500ms debounce window, since the point is that tier 4 makes
+    # that wait unnecessary for the 3 tools it covers.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "module.py").write_text("import os\n", encoding="utf-8")
+
+    server = create_daemon(state_dir=str(tmp_path / "state"), port=0)
+    server.start()
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            response = send_request(server.port, build_request("list_imports", str(repo), {"file": "module.py"}))
+            if response["ok"]:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("repo did not finish bootstrap indexing")
+        assert len(response["result"]["results"]) == 1
+
+        (repo / "module.py").write_text("import os\nimport sys\n", encoding="utf-8")
+
+        response = send_request(server.port, build_request("list_imports", str(repo), {"file": "module.py"}))
+        assert response["ok"] is True
+        assert len(response["result"]["results"]) == 2
+    finally:
+        server.shutdown()
+
+
+def test_runtime_get_definition_by_position_sees_a_fresh_edit_with_no_wait_for_the_watchers_debounce(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "module.py").write_text("def target():\n    pass\n", encoding="utf-8")
+
+    server = create_daemon(state_dir=str(tmp_path / "state"), port=0)
+    server.start()
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            response = send_request(server.port, build_request("find_symbol", str(repo), {"name": "target"}))
+            if response["ok"] and response["result"]["results"]:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("repo did not finish bootstrap indexing")
+
+        (repo / "module.py").write_text(
+            "def target():\n    pass\n\n\ndef caller():\n    target()\n", encoding="utf-8"
+        )
+
+        response = send_request(
+            server.port,
+            build_request("get_definition", str(repo), {"position": {"file": "module.py", "line": 6, "column": 4}}),
+        )
+        assert response["ok"] is True
+        assert [r["id"] for r in response["result"]["results"]] == ["module.py:target#function"]
+    finally:
+        server.shutdown()
+
+
+def test_ensure_fresh_never_blocks_the_caller_past_its_own_timeout_when_the_writer_thread_is_backlogged(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "module.py").write_text("import os\n", encoding="utf-8")
+    db_path = str(tmp_path / "index.sqlite")
+    write_queue = WriteQueue(db_path_for=lambda repo_id: db_path)
+
+    release = threading.Event()
+
+    def slow_job(conn):
+        release.wait(timeout=5)
+
+    write_queue.submit("repo-1", slow_job)  # occupies repo-1's only writer thread
+
+    start = time.monotonic()
+    ensure_fresh(write_queue, "repo-1", str(repo_root), "list_imports", {"file": "module.py"}, timeout=0.1)
+    elapsed = time.monotonic() - start
+
+    release.set()
+    write_queue.close(timeout=2)
+
+    assert elapsed < 1.0, "ensure_fresh blocked well past its own bounded timeout"
+
+
+def test_runtime_list_imports_with_a_traversal_file_param_never_reads_outside_the_repo(tmp_path):
+    # P1 regression (codex review, 2026-09-02): a "../outside.py" file
+    # param used to reach make_reindex_job with no containment check,
+    # letting tier 4 read/index a file outside the repo. This proves the
+    # fix end-to-end: the request completes normally (no crash, no
+    # INTERNAL_ERROR) and the file living just outside the repo is never
+    # touched.
+    outside = tmp_path / "outside.py"
+    outside.write_text("import shutil\n", encoding="utf-8")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "module.py").write_text("import os\n", encoding="utf-8")
+
+    server = create_daemon(state_dir=str(tmp_path / "state"), port=0)
+    server.start()
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            response = send_request(server.port, build_request("list_imports", str(repo), {"file": "module.py"}))
+            if response["ok"]:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("repo did not finish bootstrap indexing")
+
+        response = send_request(
+            server.port, build_request("list_imports", str(repo), {"file": "../outside.py"})
+        )
+        assert response["ok"] is True
+        assert response["result"]["results"] == []
+
+        # The traversal attempt must not have caused outside.py to be read
+        # and indexed under some collapsed/mangled path either.
+        untouched = send_request(server.port, build_request("find_symbol", str(repo), {"name": "shutil"}))
+        assert untouched["ok"] is True
+        assert untouched["result"]["results"] == []
     finally:
         server.shutdown()

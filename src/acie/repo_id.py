@@ -82,3 +82,24 @@ def resolve_index_db_path(repo_path: str, base_dir: str | None = None) -> str | 
     if state_dir is None:
         return None
     return os.path.join(state_dir, "index.sqlite")
+
+
+def to_repo_relative(file_path: str, repo_root: str) -> str | None:
+    """Resolves file_path (absolute or already repo-relative) against
+    repo_root, rejecting anything that escapes it -- None for an absolute
+    path outside repo_root or a relative path containing a ".." that
+    walks above it. No filesystem I/O: pure path arithmetic, so this is
+    safe to call before repo_root is even known to exist.
+
+    Extracted from notify_hook.py's private _to_repo_relative (codex
+    review, 2026-09-02: an unvalidated "../outside.py" diff-header path
+    let a crafted agent-hook payload index/tombstone a file outside the
+    repo) once staleness.py needed the identical containment check for
+    tier 4's file params -- the same untrusted-input shape (a caller-
+    supplied path string), the same fix.
+    """
+    abs_path = file_path if os.path.isabs(file_path) else os.path.join(repo_root, file_path)
+    rel_path = os.path.relpath(abs_path, repo_root).replace(os.sep, "/")
+    if rel_path == ".." or rel_path.startswith("../"):
+        return None
+    return rel_path

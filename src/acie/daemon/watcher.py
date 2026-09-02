@@ -4,7 +4,7 @@ zero cooperation from any editor/agent/tool.
 
 See the watcher/incremental-indexing grilling session (SALTMDB decision
 f4bdfc9d) for the full set of locked decisions this module implements:
-- decision 1: hybrid mtime-then-hash staleness check (_make_watch_job).
+- decision 1: hybrid mtime-then-hash staleness check (make_reindex_job).
 - decision 2: ~500ms debounce/coalescing window (_DebouncedEventHandler).
 - decision 5: a watcher starts lazily on a repo's first register() call
   and lives for the daemon's whole process life, same as WriteQueue's
@@ -57,7 +57,7 @@ _GITIGNORE_FILENAME = ".gitignore"
 _DEBOUNCE_SECONDS = 0.5
 
 
-def _make_watch_job(repo_root: str, rel_path: str) -> Callable[[sqlite3.Connection], None]:
+def make_reindex_job(repo_root: str, rel_path: str) -> Callable[[sqlite3.Connection], None]:
     """One write-queue job for one touched repo-relative path.
 
     Same job for a create, an edit, a delete, or either half of a rename --
@@ -268,7 +268,7 @@ class RepoWatcher:
 
     def _on_paths_changed(self, rel_paths: set[str]) -> None:
         for rel_path in rel_paths:
-            self._write_queue.submit(self._repo_id, _make_watch_job(self._repo_root, rel_path))
+            self._write_queue.submit(self._repo_id, make_reindex_job(self._repo_root, rel_path))
 
     def stop(self, timeout: float | None = None) -> bool:
         """Stops this repo's Observer, bounded by `timeout` seconds overall.

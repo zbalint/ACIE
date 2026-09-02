@@ -1,6 +1,7 @@
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
+from acie.tools.confidence import filter_by_min_confidence
 from acie.tools.errors import InvalidArgumentError, StaleIndexGenerationError
 from acie.tools.pagination import decode_cursor, filter_since, paginate
 from acie.tools.render import render_symbol
@@ -19,6 +20,7 @@ def get_definition(
     limit: int = _DEFAULT_LIMIT,
     cursor: str | None = None,
     full: bool = False,
+    min_confidence: str | None = None,
 ) -> dict:
     if (symbol_id is None) == (position is None):
         raise InvalidArgumentError("get_definition requires exactly one of symbol_id or position")
@@ -37,6 +39,7 @@ def get_definition(
     matches = resolve_symbol_or_position(
         symbol_store, relation_store, symbol_id=symbol_id, position=position
     )
+    matches = filter_by_min_confidence(matches, min_confidence)
     matches.sort(key=lambda s: s.id)
     remaining = filter_since(matches, after_id, cursor_key=lambda s: s.id)
 

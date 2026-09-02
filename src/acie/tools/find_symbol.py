@@ -1,5 +1,6 @@
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.symbol_store import SymbolStore
+from acie.tools.confidence import filter_by_min_confidence
 from acie.tools.errors import StaleIndexGenerationError
 from acie.tools.pagination import decode_cursor, filter_since, paginate
 from acie.tools.render import render_symbol
@@ -19,6 +20,7 @@ def find_symbol(
     limit: int = _DEFAULT_LIMIT,
     cursor: str | None = None,
     full: bool = False,
+    min_confidence: str | None = None,
 ) -> dict:
     index_generation = index_meta_store.current_generation()
 
@@ -32,6 +34,7 @@ def find_symbol(
             )
 
     matches = symbol_store.search(qualname_substring=name, kind=kind, path_glob=path_glob)
+    matches = filter_by_min_confidence(matches, min_confidence)
     remaining = filter_since(matches, after_id, cursor_key=lambda s: s.id)
 
     page, truncated, next_cursor = paginate(remaining, limit, index_generation, cursor_key=lambda s: s.id)
