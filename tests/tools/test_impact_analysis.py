@@ -5,7 +5,7 @@ from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
-from acie.tools.errors import SymbolNotFoundError
+from acie.tools.errors import InvalidArgumentError, SymbolNotFoundError
 from acie.tools.impact_analysis import impact_analysis
 
 _PROVENANCE = Provenance(provider="tree-sitter", version="0.25.0", observed_at="2026-08-31T00:00:00Z")
@@ -341,6 +341,30 @@ def test_impact_analysis_raises_symbol_not_found_for_tombstoned_root():
         impact_analysis(
             symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
             root="pkg/mod.py:foo#function",
+        )
+
+
+def test_impact_analysis_raises_invalid_argument_for_non_positive_node_cap():
+    # Regression for LIVE_MCP_QUALIFICATION_REPORT.md (2026-09-01): node_cap
+    # <= 0 used to still return the root node, contradicting the cap.
+    symbol_store, relation_store, index_meta_store = _stores()
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))
+
+    with pytest.raises(InvalidArgumentError):
+        impact_analysis(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            root="pkg/mod.py:foo#function", node_cap=0,
+        )
+
+
+def test_impact_analysis_raises_invalid_argument_for_non_positive_depth_clamp():
+    symbol_store, relation_store, index_meta_store = _stores()
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))
+
+    with pytest.raises(InvalidArgumentError):
+        impact_analysis(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            root="pkg/mod.py:foo#function", depth_clamp=-1,
         )
 
 

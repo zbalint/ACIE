@@ -53,7 +53,7 @@ from acie.ir.relation import Relation
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
-from acie.tools.errors import SymbolNotFoundError
+from acie.tools.errors import InvalidArgumentError, SymbolNotFoundError
 from acie.tools.render import render_relation, render_symbol
 
 # Local v0 defaults, not specified in ARCHITECTURE.md -- same status as
@@ -80,11 +80,18 @@ def graph(
     full: bool = False,
 ) -> dict:
     if graph_type not in _PREDICATES_BY_GRAPH_TYPE:
-        raise ValueError(
+        raise InvalidArgumentError(
             f"graph_type must be one of {sorted(_PREDICATES_BY_GRAPH_TYPE)}, got {graph_type!r}"
         )
     if direction not in _DIRECTIONS:
-        raise ValueError(f"direction must be one of {sorted(_DIRECTIONS)}, got {direction!r}")
+        raise InvalidArgumentError(f"direction must be one of {sorted(_DIRECTIONS)}, got {direction!r}")
+    # LIVE_MCP_QUALIFICATION_REPORT.md (2026-09-01): root is seeded into
+    # `nodes` before any cap check below, so a non-positive node_cap/
+    # depth_clamp used to still return the root node, contradicting the cap.
+    if node_cap <= 0:
+        raise InvalidArgumentError(f"node_cap must be a positive integer, got {node_cap!r}")
+    if depth_clamp <= 0:
+        raise InvalidArgumentError(f"depth_clamp must be a positive integer, got {depth_clamp!r}")
 
     predicate = _PREDICATES_BY_GRAPH_TYPE[graph_type]
     index_generation = index_meta_store.current_generation()

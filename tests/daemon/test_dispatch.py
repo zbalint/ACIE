@@ -7,6 +7,7 @@ from acie.repo_id import resolve_index_db_path
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
+from acie.tools.pagination import encode_cursor
 
 _OBSERVED_AT = "2026-09-01T00:00:00Z"
 
@@ -153,15 +154,80 @@ def test_dispatch_request_maps_any_other_exception_to_internal_error(tmp_path):
     base_dir = tmp_path / "acie-home"
     _index_one_file(repo, base_dir)
 
-    # get_definition requires exactly one of symbol_id/position -- giving
-    # neither raises a plain ValueError from inside the tool, not an
-    # AcieToolError subclass.
-    request = build_request("get_definition", str(repo), {})
+    # get_definition's exactly-one-selector check now raises a typed
+    # InvalidArgumentError (see test_dispatch_request_maps_missing_selector_
+    # to_invalid_argument below), so it no longer exercises this fallback.
+    # An unexpected extra param does: _call_tool forwards params straight
+    # through as kwargs, so a bogus one raises a plain TypeError from
+    # inside find_symbol()'s own call, not an AcieToolError subclass.
+    request = build_request("find_symbol", str(repo), {"name": "foo", "bogus_param": 1})
 
     response = dispatch_request(request, repo_ready=_ALL_ALWAYS_READY, base_dir=str(base_dir))
 
     assert response["ok"] is False
     assert response["error"]["code"] == "INTERNAL_ERROR"
+
+
+# Regression tests for LIVE_MCP_QUALIFICATION_REPORT.md (2026-09-01): these
+# reproduce the exact live-observed bugs end-to-end through dispatch_request,
+# confirming the fix at the level codex actually probed (a real MCP request),
+# not just the underlying tool function.
+def test_dispatch_request_maps_malformed_cursor_to_invalid_cursor(tmp_path):
+    repo = _git_repo(tmp_path)
+    base_dir = tmp_path / "acie-home"
+    _index_one_file(repo, base_dir)
+
+    request = build_request("find_symbol", str(repo), {"name": "foo", "cursor": "not-valid-base64!!!"})
+
+    response = dispatch_request(request, repo_ready=_ALL_ALWAYS_READY, base_dir=str(base_dir))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_CURSOR"
+
+
+def test_dispatch_request_maps_zero_limit_to_invalid_limit(tmp_path):
+    repo = _git_repo(tmp_path)
+    base_dir = tmp_path / "acie-home"
+    _index_one_file(repo, base_dir)
+
+    request = build_request("find_symbol", str(repo), {"name": "foo", "limit": 0})
+
+    response = dispatch_request(request, repo_ready=_ALL_ALWAYS_READY, base_dir=str(base_dir))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_LIMIT"
+
+
+def test_dispatch_request_maps_missing_selector_to_invalid_argument(tmp_path):
+    repo = _git_repo(tmp_path)
+    base_dir = tmp_path / "acie-home"
+    _index_one_file(repo, base_dir)
+
+    request = build_request("get_definition", str(repo), {})
+
+    response = dispatch_request(request, repo_ready=_ALL_ALWAYS_READY, base_dir=str(base_dir))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_dispatch_request_maps_a_semantically_wrong_cursor_last_id_to_invalid_cursor(tmp_path):
+    # Code-review regression (2026-09-02): the exact repro from the review --
+    # a syntactically valid [1, 0] cursor (int last_id where find_symbol
+    # expects a string symbol id) used to crash with a bare
+    # "'>' not supported between instances of 'str' and 'int'" TypeError,
+    # which this dispatcher's generic exception handler then mapped to
+    # INTERNAL_ERROR instead of INVALID_CURSOR.
+    repo = _git_repo(tmp_path)
+    base_dir = tmp_path / "acie-home"
+    _index_one_file(repo, base_dir)
+
+    request = build_request("find_symbol", str(repo), {"name": "foo", "cursor": encode_cursor(1, 0)})
+
+    response = dispatch_request(request, repo_ready=_ALL_ALWAYS_READY, base_dir=str(base_dir))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_CURSOR"
 
 
 def test_dispatch_request_fills_structural_search_files_from_real_disk(tmp_path):

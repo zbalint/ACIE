@@ -3,8 +3,9 @@ import pytest
 from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.symbol_store import SymbolStore
-from acie.tools.errors import StaleIndexGenerationError
+from acie.tools.errors import InvalidCursorError, InvalidLimitError, StaleIndexGenerationError
 from acie.tools.find_symbol import find_symbol
+from acie.tools.pagination import encode_cursor
 
 _PROVENANCE = Provenance(provider="tree-sitter", version="0.25.0", observed_at="2026-08-31T00:00:00Z")
 
@@ -122,3 +123,26 @@ def test_find_symbol_returns_empty_results_when_nothing_matches():
     assert envelope["results"] == []
     assert envelope["total_count"] == 0
     assert envelope["truncated"] is False
+
+
+def test_find_symbol_raises_invalid_limit_for_a_non_positive_limit():
+    # Regression for LIVE_MCP_QUALIFICATION_REPORT.md (2026-09-01): limit=0
+    # used to crash with IndexError instead of a typed error.
+    symbol_store, index_meta_store = _stores_with_generation(1)
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))
+
+    with pytest.raises(InvalidLimitError):
+        find_symbol(symbol_store=symbol_store, index_meta_store=index_meta_store, name="foo", limit=0)
+
+
+def test_find_symbol_raises_invalid_cursor_for_a_semantically_wrong_last_id_type():
+    # Code-review regression (2026-09-02): a syntactically valid cursor
+    # encoding an int last_id (symbol ids are strings) used to crash with a
+    # bare "'>' not supported between instances of 'str' and 'int'" instead
+    # of a typed error.
+    symbol_store, index_meta_store = _stores_with_generation(1)
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))
+    bad_cursor = encode_cursor(1, 0)
+
+    with pytest.raises(InvalidCursorError):
+        find_symbol(symbol_store=symbol_store, index_meta_store=index_meta_store, name="foo", cursor=bad_cursor)

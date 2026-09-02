@@ -1,7 +1,8 @@
 import pytest
 
 from acie.storage.index_meta_store import IndexMetaStore
-from acie.tools.errors import InvalidPatternError, StaleIndexGenerationError
+from acie.tools.errors import InvalidCursorError, InvalidLimitError, InvalidPatternError, StaleIndexGenerationError
+from acie.tools.pagination import encode_cursor
 from acie.tools.structural_search import structural_search
 
 _OBSERVED_AT = "2026-08-31T00:00:00Z"
@@ -184,6 +185,30 @@ def test_structural_search_raises_stale_index_generation_when_generation_changed
             files=files, index_meta_store=index_meta_store,
             pattern="(function_definition name: (identifier) @func.name)",
             observed_at=_OBSERVED_AT, limit=1, cursor=page1["next_cursor"],
+        )
+
+
+def test_structural_search_raises_invalid_limit_for_a_non_positive_limit():
+    index_meta_store = _index_meta_store_with_generation(1)
+
+    with pytest.raises(InvalidLimitError):
+        structural_search(
+            files={"pkg/mod.py": _TWO_FUNCTIONS}, index_meta_store=index_meta_store,
+            pattern="(function_definition name: (identifier) @func.name)",
+            observed_at=_OBSERVED_AT, limit=0,
+        )
+
+
+def test_structural_search_raises_invalid_cursor_for_a_non_composite_last_id():
+    # Code-review regression (2026-09-02): see test_find_references' equivalent.
+    index_meta_store = _index_meta_store_with_generation(1)
+    bad_cursor = encode_cursor(1, 0)
+
+    with pytest.raises(InvalidCursorError):
+        structural_search(
+            files={"pkg/mod.py": _TWO_FUNCTIONS}, index_meta_store=index_meta_store,
+            pattern="(function_definition name: (identifier) @func.name)",
+            observed_at=_OBSERVED_AT, cursor=bad_cursor,
         )
 
 

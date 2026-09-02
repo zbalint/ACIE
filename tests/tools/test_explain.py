@@ -5,8 +5,15 @@ from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
-from acie.tools.errors import EdgeNotFoundError, SymbolNotFoundError
+from acie.tools.errors import (
+    EdgeNotFoundError,
+    InvalidArgumentError,
+    InvalidCursorError,
+    InvalidLimitError,
+    SymbolNotFoundError,
+)
 from acie.tools.explain import explain
+from acie.tools.pagination import encode_cursor
 
 _PROVENANCE = Provenance(provider="tree-sitter", version="0.25.0", observed_at="2026-08-31T00:00:00Z")
 
@@ -248,11 +255,40 @@ def test_explain_deleted_edge_returns_history_tagged_deleted_not_edge_not_found(
 
 
 def test_explain_requires_exactly_one_of_symbol_id_or_edge_ref():
+    # Regression for LIVE_MCP_QUALIFICATION_REPORT.md (2026-09-01): this used
+    # to raise a bare ValueError, which dispatch.py's generic exception
+    # handler then demoted to an unhelpful INTERNAL_ERROR.
     symbol_store, relation_store, index_meta_store = _stores()
 
-    with pytest.raises(ValueError):
+    with pytest.raises(InvalidArgumentError):
         explain(
             symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        )
+
+
+def test_explain_raises_invalid_limit_for_a_non_positive_limit():
+    symbol_store, relation_store, index_meta_store = _stores()
+    foo = _symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function", line=1)
+    symbol_store.upsert(foo)
+
+    with pytest.raises(InvalidLimitError):
+        explain(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            symbol_id=foo.id, limit=0,
+        )
+
+
+def test_explain_raises_invalid_cursor_for_a_non_composite_last_id():
+    # Code-review regression (2026-09-02): see test_find_references' equivalent.
+    symbol_store, relation_store, index_meta_store = _stores()
+    foo = _symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function", line=1)
+    symbol_store.upsert(foo)
+    bad_cursor = encode_cursor(1, 0)
+
+    with pytest.raises(InvalidCursorError):
+        explain(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            symbol_id=foo.id, cursor=bad_cursor,
         )
 
 

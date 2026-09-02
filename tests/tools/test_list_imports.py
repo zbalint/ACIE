@@ -4,8 +4,9 @@ from acie.ir.relation import Relation
 from acie.ir.symbol import Confidence, Provenance
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
-from acie.tools.errors import StaleIndexGenerationError
+from acie.tools.errors import InvalidCursorError, InvalidLimitError, StaleIndexGenerationError
 from acie.tools.list_imports import list_imports
+from acie.tools.pagination import encode_cursor
 
 _PROVENANCE = Provenance(provider="tree-sitter", version="0.25.0", observed_at="2026-08-31T00:00:00Z")
 
@@ -184,4 +185,27 @@ def test_list_imports_raises_stale_index_generation_when_generation_changed_sinc
         list_imports(
             relation_store=relation_store, index_meta_store=index_meta_store, file="pkg/mod.py",
             limit=1, cursor=page1["next_cursor"],
+        )
+
+
+def test_list_imports_raises_invalid_limit_for_a_non_positive_limit():
+    relation_store, index_meta_store = _stores_with_generation(1)
+    relation_store.upsert(_import_relation("pkg/mod.py:<module>#module", "os", 1))
+
+    with pytest.raises(InvalidLimitError):
+        list_imports(
+            relation_store=relation_store, index_meta_store=index_meta_store, file="pkg/mod.py", limit=0,
+        )
+
+
+def test_list_imports_raises_invalid_cursor_for_a_non_composite_last_id():
+    # Code-review regression (2026-09-02): see test_find_references' equivalent.
+    relation_store, index_meta_store = _stores_with_generation(1)
+    relation_store.upsert(_import_relation("pkg/mod.py:<module>#module", "os", 1))
+    bad_cursor = encode_cursor(1, 0)
+
+    with pytest.raises(InvalidCursorError):
+        list_imports(
+            relation_store=relation_store, index_meta_store=index_meta_store, file="pkg/mod.py",
+            cursor=bad_cursor,
         )

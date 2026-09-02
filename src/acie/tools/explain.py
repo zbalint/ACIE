@@ -46,8 +46,8 @@ real third shape shows up, unify then.
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
-from acie.tools.errors import EdgeNotFoundError, SymbolNotFoundError
-from acie.tools.pagination import decode_cursor, encode_cursor
+from acie.tools.errors import EdgeNotFoundError, InvalidArgumentError, SymbolNotFoundError
+from acie.tools.pagination import coerce_tuple_key, decode_cursor, filter_since, paginate
 from acie.tools.render import render_relation, render_symbol
 
 _DEFAULT_LIMIT = 50
@@ -64,7 +64,7 @@ def explain(
     full: bool = False,
 ) -> dict:
     if (symbol_id is None) == (edge_ref is None):
-        raise ValueError("explain requires exactly one of symbol_id or edge_ref")
+        raise InvalidArgumentError("explain requires exactly one of symbol_id or edge_ref")
 
     index_generation = index_meta_store.current_generation()
 
@@ -80,14 +80,14 @@ def explain(
     after_key = None
     if cursor is not None:
         _cursor_generation, after_key = decode_cursor(cursor)
-        after_key = tuple(after_key)
+        after_key = coerce_tuple_key(after_key)
 
     entries.sort(key=lambda pair: pair[0], reverse=True)
-    remaining = entries if after_key is None else [e for e in entries if e[0] < after_key]
+    remaining = filter_since(entries, after_key, cursor_key=lambda entry: entry[0], reverse=True)
 
-    page = remaining[:limit]
-    truncated = len(remaining) > limit
-    next_cursor = encode_cursor(index_generation, list(page[-1][0])) if truncated else None
+    page, truncated, next_cursor = paginate(
+        remaining, limit, index_generation, cursor_key=lambda entry: list(entry[0])
+    )
 
     return {
         "index_generation": index_generation,

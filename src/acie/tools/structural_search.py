@@ -40,7 +40,7 @@ from tree_sitter import Language, Parser, Query, QueryCursor, QueryError
 from acie.ir.symbol import Confidence, Provenance
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.tools.errors import InvalidPatternError, StaleIndexGenerationError
-from acie.tools.pagination import decode_cursor, encode_cursor
+from acie.tools.pagination import coerce_tuple_key, decode_cursor, filter_since, paginate
 
 # Same duplication-not-yet-extracted precedent as extract_symbols.py /
 # extract_relations.py, which each already define their own copy of this
@@ -75,7 +75,7 @@ def structural_search(
                 f"index_generation changed from {cursor_generation} to {index_generation} "
                 "since this cursor was issued"
             )
-        after_key = tuple(after_key)
+        after_key = coerce_tuple_key(after_key)
 
     try:
         query = Query(_LANGUAGE, pattern)
@@ -100,11 +100,11 @@ def structural_search(
 
     matches.sort(key=_ordering_key)
 
-    remaining = matches if after_key is None else [m for m in matches if _ordering_key(m) > after_key]
+    remaining = filter_since(matches, after_key, cursor_key=_ordering_key)
 
-    page = remaining[:limit]
-    truncated = len(remaining) > limit
-    next_cursor = encode_cursor(index_generation, list(_ordering_key(page[-1]))) if truncated else None
+    page, truncated, next_cursor = paginate(
+        remaining, limit, index_generation, cursor_key=lambda m: list(_ordering_key(m))
+    )
 
     return {
         "index_generation": index_generation,

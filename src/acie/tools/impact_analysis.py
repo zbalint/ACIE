@@ -68,7 +68,7 @@ from acie.ir.symbol import Confidence
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
-from acie.tools.errors import SymbolNotFoundError
+from acie.tools.errors import InvalidArgumentError, SymbolNotFoundError
 from acie.tools.render import render_symbol
 
 _DEFAULT_NODE_CAP = 100
@@ -86,6 +86,14 @@ def impact_analysis(
     depth_clamp: int = _DEFAULT_DEPTH_CLAMP,
     full: bool = False,
 ) -> dict:
+    # LIVE_MCP_QUALIFICATION_REPORT.md (2026-09-01): root is seeded into
+    # `nodes` before any cap check below, so a non-positive node_cap/
+    # depth_clamp used to still return the root node, contradicting the cap.
+    if node_cap <= 0:
+        raise InvalidArgumentError(f"node_cap must be a positive integer, got {node_cap!r}")
+    if depth_clamp <= 0:
+        raise InvalidArgumentError(f"depth_clamp must be a positive integer, got {depth_clamp!r}")
+
     index_generation = index_meta_store.current_generation()
 
     root_symbol = symbol_store.get(root)

@@ -5,8 +5,15 @@ from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
-from acie.tools.errors import StaleIndexGenerationError, SymbolNotFoundError
+from acie.tools.errors import (
+    InvalidArgumentError,
+    InvalidCursorError,
+    InvalidLimitError,
+    StaleIndexGenerationError,
+    SymbolNotFoundError,
+)
 from acie.tools.get_definition import get_definition
+from acie.tools.pagination import encode_cursor
 
 _PROVENANCE = Provenance(provider="tree-sitter", version="0.25.0", observed_at="2026-08-31T00:00:00Z")
 
@@ -92,10 +99,13 @@ def test_get_definition_raises_symbol_not_found_for_tombstoned_symbol_id():
         )
 
 
-def test_get_definition_raises_value_error_when_both_symbol_id_and_position_given():
+def test_get_definition_raises_invalid_argument_when_both_symbol_id_and_position_given():
+    # Regression for LIVE_MCP_QUALIFICATION_REPORT.md (2026-09-01): this used
+    # to raise a bare ValueError, which dispatch.py's generic exception
+    # handler then demoted to an unhelpful INTERNAL_ERROR.
     symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(InvalidArgumentError):
         get_definition(
             symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
             symbol_id="pkg/mod.py:foo#function",
@@ -103,12 +113,36 @@ def test_get_definition_raises_value_error_when_both_symbol_id_and_position_give
         )
 
 
-def test_get_definition_raises_value_error_when_neither_symbol_id_nor_position_given():
+def test_get_definition_raises_invalid_argument_when_neither_symbol_id_nor_position_given():
     symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(InvalidArgumentError):
         get_definition(
             symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        )
+
+
+def test_get_definition_raises_invalid_limit_for_a_non_positive_limit():
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))
+
+    with pytest.raises(InvalidLimitError):
+        get_definition(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            symbol_id="pkg/mod.py:foo#function", limit=0,
+        )
+
+
+def test_get_definition_raises_invalid_cursor_for_a_semantically_wrong_last_id_type():
+    # Code-review regression (2026-09-02): see test_find_symbol's equivalent.
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))
+    bad_cursor = encode_cursor(1, 0)
+
+    with pytest.raises(InvalidCursorError):
+        get_definition(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            symbol_id="pkg/mod.py:foo#function", cursor=bad_cursor,
         )
 
 

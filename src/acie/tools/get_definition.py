@@ -1,8 +1,8 @@
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
-from acie.tools.errors import StaleIndexGenerationError
-from acie.tools.pagination import decode_cursor, encode_cursor
+from acie.tools.errors import InvalidArgumentError, StaleIndexGenerationError
+from acie.tools.pagination import decode_cursor, filter_since, paginate
 from acie.tools.render import render_symbol
 from acie.tools.resolve import resolve_symbol_or_position
 
@@ -21,7 +21,7 @@ def get_definition(
     full: bool = False,
 ) -> dict:
     if (symbol_id is None) == (position is None):
-        raise ValueError("get_definition requires exactly one of symbol_id or position")
+        raise InvalidArgumentError("get_definition requires exactly one of symbol_id or position")
 
     index_generation = index_meta_store.current_generation()
 
@@ -38,11 +38,9 @@ def get_definition(
         symbol_store, relation_store, symbol_id=symbol_id, position=position
     )
     matches.sort(key=lambda s: s.id)
-    remaining = matches if after_id is None else [s for s in matches if s.id > after_id]
+    remaining = filter_since(matches, after_id, cursor_key=lambda s: s.id)
 
-    page = remaining[:limit]
-    truncated = len(remaining) > limit
-    next_cursor = encode_cursor(index_generation, page[-1].id) if truncated else None
+    page, truncated, next_cursor = paginate(remaining, limit, index_generation, cursor_key=lambda s: s.id)
 
     return {
         "index_generation": index_generation,

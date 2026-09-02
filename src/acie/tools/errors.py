@@ -31,3 +31,15 @@ class InvalidPatternError(AcieToolError):
 
 class EdgeNotFoundError(AcieToolError):
     code = "EDGE_NOT_FOUND"
+
+
+class InvalidCursorError(AcieToolError):
+    code = "INVALID_CURSOR"
+
+
+class InvalidLimitError(AcieToolError):
+    code = "INVALID_LIMIT"
+
+
+class InvalidArgumentError(AcieToolError):
+    code = "INVALID_ARGUMENT"
