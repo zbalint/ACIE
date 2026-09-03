@@ -16,13 +16,15 @@ node/edge shape and the rest decided locally following
 graph.py/impact_analysis.py/affected_tests.py precedent).
 """
 
+import json
+
 from acie.indexer import index_file
 from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
 from acie.tools.architecture import architecture, build_dotted_name_index
-from acie.tools.errors import InvalidArgumentError
+from acie.tools.errors import InvalidArgumentError, InvalidConfigError
 
 _PROVENANCE = Provenance(provider="tree-sitter", version="0.25.0", observed_at="2026-09-03T00:00:00Z")
 _OBSERVED_AT = "2026-09-03T00:00:00Z"
@@ -620,3 +622,246 @@ def test_package_granularity_is_echoed_in_the_envelope():
     result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
 
     assert result["granularity"] == "package"
+
+
+# ---------------------------------------------------------------------------
+# architecture() -- v1 slice C5, layering-violation detection.
+# ---------------------------------------------------------------------------
+
+
+def _write_layer_config(tmp_path, payload: dict) -> None:
+    acie_dir = tmp_path / ".acie"
+    acie_dir.mkdir(exist_ok=True)
+    (acie_dir / "config.json").write_text(json.dumps(payload))
+
+
+def test_no_repo_root_supplied_layering_is_disabled():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["layering_enabled"] is False
+    assert result["layer_violations"] == []
+
+
+def test_repo_root_supplied_but_no_acie_config_layering_is_disabled(tmp_path):
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    result = architecture(symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path))
+
+    assert result["layering_enabled"] is False
+    assert result["layer_violations"] == []
+
+
+def test_acie_config_present_with_no_crossing_edges_layering_enabled_no_violations(tmp_path):
+    _write_layer_config(
+        tmp_path,
+        {"layers": {"api": ["pkg/api/*"], "core": ["pkg/core/*"]}, "allowed_dependencies": {}},
+    )
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/api/a.py", "def a():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path))
+
+    assert result["layering_enabled"] is True
+    assert result["layer_violations"] == []
+
+
+def test_disallowed_cross_layer_import_is_reported_as_a_violation(tmp_path):
+    # api -> core is fine (declared), but core has no declared dependency on
+    # api at all, so a core file importing an api file must be flagged.
+    _write_layer_config(
+        tmp_path,
+        {
+            "layers": {"api": ["pkg/api/*"], "core": ["pkg/core/*"]},
+            "allowed_dependencies": {"api": ["core"]},
+        },
+    )
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/api/a.py", "def a():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/core/b.py",
+        "from pkg.api.a import a\n\n\na()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path))
+
+    assert result["layer_violations"] == [
+        {"source": "pkg/core/b.py", "target": "pkg/api/a.py", "from_layer": "core", "to_layer": "api"}
+    ]
+
+
+def test_allowed_cross_layer_import_produces_no_violation(tmp_path):
+    _write_layer_config(
+        tmp_path,
+        {
+            "layers": {"api": ["pkg/api/*"], "core": ["pkg/core/*"]},
+            "allowed_dependencies": {"api": ["core"]},
+        },
+    )
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/core/b.py", "def b():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/api/a.py",
+        "from pkg.core.b import b\n\n\nb()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path))
+
+    assert result["layer_violations"] == []
+
+
+def test_same_layer_import_never_flagged_even_with_no_allowed_dependencies_entry(tmp_path):
+    _write_layer_config(tmp_path, {"layers": {"core": ["pkg/core/*"]}, "allowed_dependencies": {}})
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/core/a.py", "def a():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/core/b.py",
+        "from pkg.core.a import a\n\n\na()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path))
+
+    assert result["layer_violations"] == []
+
+
+def test_edge_where_an_endpoint_matches_no_declared_layer_is_not_a_violation(tmp_path):
+    _write_layer_config(tmp_path, {"layers": {"core": ["pkg/core/*"]}, "allowed_dependencies": {}})
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/core/a.py", "def a():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "other/b.py",
+        "from pkg.core.a import a\n\n\na()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path))
+
+    assert result["layer_violations"] == []
+
+
+def test_ambiguous_layer_classification_fans_out_over_every_disallowed_combination(tmp_path):
+    # pkg/shared/a.py matches both "shared" and "restricted" (overlapping
+    # globs, a real config-authoring ambiguity) -- classify_layers (C4)
+    # never folds this to one guess, and neither does violation detection:
+    # every disallowed (from_layer, to_layer) combination is its own entry.
+    _write_layer_config(
+        tmp_path,
+        {
+            "layers": {
+                "shared": ["pkg/shared/*"],
+                "restricted": ["pkg/shared/*"],
+                "consumer": ["pkg/consumer/*"],
+            },
+            "allowed_dependencies": {"consumer": ["shared"]},
+        },
+    )
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/shared/a.py", "def a():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/consumer/b.py",
+        "from pkg.shared.a import a\n\n\na()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path))
+
+    # consumer->shared is allowed; consumer->restricted is not declared.
+    assert result["layer_violations"] == [
+        {
+            "source": "pkg/consumer/b.py", "target": "pkg/shared/a.py",
+            "from_layer": "consumer", "to_layer": "restricted",
+        }
+    ]
+
+
+def test_violations_are_detected_regardless_of_requested_granularity(tmp_path):
+    # Per memory b75c92b3: classify_layers was only ever validated at file
+    # granularity (a naturally-authored glob like "pkg/api/*" does not
+    # match the bare directory string "pkg/api"), so layering-violation
+    # detection always classifies at file granularity internally, even
+    # when the caller requested granularity="package" for nodes/edges.
+    _write_layer_config(
+        tmp_path,
+        {
+            "layers": {"api": ["pkg/api/*"], "core": ["pkg/core/*"]},
+            "allowed_dependencies": {"api": ["core"]},
+        },
+    )
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/api/a.py", "def a():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/core/b.py",
+        "from pkg.api.a import a\n\n\na()\n",
+    )
+
+    result = architecture(
+        symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path), granularity="package",
+    )
+
+    assert result["layer_violations"] == [
+        {"source": "pkg/core/b.py", "target": "pkg/api/a.py", "from_layer": "core", "to_layer": "api"}
+    ]
+
+
+def test_violations_are_not_scoped_by_node_cap(tmp_path):
+    # node_cap bounds response size for rendered nodes/edges; a layering
+    # policy check must not silently miss a real violation just because
+    # the caller asked for a small page of nodes.
+    _write_layer_config(
+        tmp_path,
+        {
+            "layers": {"api": ["pkg/api/*"], "core": ["pkg/core/*"]},
+            "allowed_dependencies": {"api": ["core"]},
+        },
+    )
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/api/a.py", "def a():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/core/b.py",
+        "from pkg.api.a import a\n\n\na()\n",
+    )
+
+    result = architecture(
+        symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path), node_cap=1,
+    )
+
+    assert result["layer_violations"] == [
+        {"source": "pkg/core/b.py", "target": "pkg/api/a.py", "from_layer": "core", "to_layer": "api"}
+    ]
+
+
+def test_violations_respect_root_scope(tmp_path):
+    # A disallowed edge whose endpoints are both outside root's scope is
+    # not in `in_scope` at all, so it produces no violation -- root scoping
+    # applies to layering detection the same way it applies to nodes/edges.
+    _write_layer_config(
+        tmp_path,
+        {
+            "layers": {"api": ["pkg/api/*"], "core": ["pkg/core/*"]},
+            "allowed_dependencies": {"api": ["core"]},
+        },
+    )
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/api/a.py", "def a():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/core/b.py",
+        "from pkg.api.a import a\n\n\na()\n",
+    )
+
+    result = architecture(
+        symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path), root="other",
+    )
+
+    assert result["layer_violations"] == []
+
+
+def test_malformed_acie_config_raises_invalid_config_error(tmp_path):
+    acie_dir = tmp_path / ".acie"
+    acie_dir.mkdir()
+    (acie_dir / "config.json").write_text("not valid json")
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    try:
+        architecture(symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path))
+        assert False, "expected InvalidConfigError"
+    except InvalidConfigError:
+        pass

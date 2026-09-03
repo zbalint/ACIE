@@ -43,3 +43,7 @@ class InvalidLimitError(AcieToolError):
 
 class InvalidArgumentError(AcieToolError):
     code = "INVALID_ARGUMENT"
+
+
+class InvalidConfigError(AcieToolError):
+    code = "INVALID_CONFIG"

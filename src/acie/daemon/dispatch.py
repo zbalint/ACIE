@@ -137,6 +137,13 @@ def _call_tool(
         # repo root resolved from repo_path.
         repo_root = resolve_repo_root(repo_path)
         kwargs["files"] = _read_source_files(repo_root, params.get("path_glob"))
+    if "repo_root" in sig_params:
+        # architecture's C5 layering-violation detection reads
+        # `<repo_root>/.acie/config.json` (acie.layer_config) -- the same
+        # resolved repo root "files" already derives from repo_path above,
+        # injected independently since not every tool needing one also
+        # needs the other.
+        kwargs["repo_root"] = resolve_repo_root(repo_path)
     if "observed_at" in sig_params and "observed_at" not in kwargs:
         kwargs["observed_at"] = datetime.now(timezone.utc).isoformat()
     return tool(**kwargs)

@@ -312,3 +312,42 @@ def test_read_source_files_prunes_ignored_directories_instead_of_just_filtering_
     # build/output.py's rel_path is never even checked -- the whole
     # directory was pruned before descending into it.
     assert "build/output.py" not in visited_dirs
+
+
+def test_dispatch_request_fills_architecture_repo_root_and_flags_a_real_layering_violation(tmp_path):
+    # End-to-end: dispatch injects `repo_root` (resolved from repo_path,
+    # same mechanism "files" already uses) into `architecture`'s kwargs so
+    # C5's layering-violation detection can read a real `.acie/config.json`
+    # off disk, not just get exercised via a direct-call unit test.
+    repo = _git_repo(tmp_path)
+    base_dir = tmp_path / "acie-home"
+    acie_dir = repo / ".acie"
+    acie_dir.mkdir()
+    (acie_dir / "config.json").write_text(
+        '{"layers": {"api": ["pkg/api/*"], "core": ["pkg/core/*"]}, '
+        '"allowed_dependencies": {"api": ["core"]}}'
+    )
+    db_path = resolve_index_db_path(str(repo), base_dir=str(base_dir))
+    symbol_store = SymbolStore(db_path)
+    relation_store = RelationStore(db_path)
+    index_meta_store = IndexMetaStore(db_path)
+    index_file(
+        path="pkg/api/a.py", source_text="def a():\n    pass\n", observed_at=_OBSERVED_AT,
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+    )
+    index_file(
+        # core -> api is not declared (only api -> core is), so this is a
+        # real layering violation.
+        path="pkg/core/b.py", source_text="from pkg.api.a import a\n\n\na()\n", observed_at=_OBSERVED_AT,
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+    )
+
+    request = build_request("architecture", str(repo), {})
+
+    response = dispatch_request(request, repo_ready=_ALL_ALWAYS_READY, base_dir=str(base_dir))
+
+    assert response["ok"] is True
+    assert response["result"]["layering_enabled"] is True
+    assert response["result"]["layer_violations"] == [
+        {"source": "pkg/core/b.py", "target": "pkg/api/a.py", "from_layer": "core", "to_layer": "api"}
+    ]

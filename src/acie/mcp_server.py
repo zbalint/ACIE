@@ -17,6 +17,7 @@ _DAEMON_INJECTED_PARAMETERS = {
     "index_meta_store",
     "files",
     "observed_at",
+    "repo_root",
 }
 
 
