@@ -4,6 +4,7 @@ from acie.adapters.python.extract_relations import extract_relations_with_deferr
 from acie.adapters.python.extract_symbols import extract_symbols, has_syntax_error
 from acie.ir.relation import DeferredImportCall, DeferredImportInherit, DeferredImportOverride, Relation
 from acie.ir.symbol import Confidence
+from acie.module_paths import module_path_matches
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
@@ -142,7 +143,7 @@ def _resolve_deferred(
         candidates = [
             symbol
             for symbol in symbol_store.find_by_qualname_and_kind(qualname=item.name, kind=kind)
-            if _module_path_matches(symbol.path, item.module_path)
+            if module_path_matches(symbol.path, item.module_path)
         ]
         if not candidates:
             continue
@@ -197,7 +198,7 @@ def _resolve_deferred_overrides(
         base_candidates = [
             symbol
             for symbol in symbol_store.find_by_qualname_and_kind(qualname=item.base_name, kind="class")
-            if _module_path_matches(symbol.path, item.module_path)
+            if module_path_matches(symbol.path, item.module_path)
         ]
         method_candidates = [
             method
@@ -228,16 +229,6 @@ def _resolve_deferred_overrides(
                 )
             )
     return relations
-
-
-def _module_path_matches(candidate_file_path: str, imported_module_path: str) -> bool:
-    dotted = candidate_file_path
-    if dotted.endswith("/__init__.py"):
-        dotted = dotted[: -len("/__init__.py")]
-    elif dotted.endswith(".py"):
-        dotted = dotted[: -len(".py")]
-    dotted = dotted.replace("/", ".")
-    return dotted == imported_module_path or dotted.endswith(f".{imported_module_path}")
 
 
 def _relation_key(relation) -> tuple:
