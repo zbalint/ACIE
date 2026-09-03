@@ -79,6 +79,7 @@ were, following that file as the closest sibling tool):**
 
 from acie.ir.relation import Relation
 from acie.ir.symbol import Confidence
+from acie.pytest_conventions import is_test_file_path, is_test_qualname
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
@@ -184,15 +185,9 @@ def _render_node(node_id: str, symbol, *, full: bool) -> dict:
 def _is_test_node(rendered: dict) -> bool:
     if not rendered.get("resolved") or rendered["kind"] not in _TEST_KINDS:
         return False
-    if not _is_test_file_path(rendered["path"]):
+    if not is_test_file_path(rendered["path"]):
         return False
-    leaf = rendered["qualname"].rsplit(".", 1)[-1]
-    return leaf.startswith("test_")
-
-
-def _is_test_file_path(path: str) -> bool:
-    basename = path.rsplit("/", 1)[-1]
-    return (basename.startswith("test_") and basename.endswith(".py")) or basename.endswith("_test.py")
+    return is_test_qualname(rendered["qualname"])
 
 
 def _edge_ordering_key(relation: Relation) -> tuple:

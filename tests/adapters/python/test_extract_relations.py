@@ -540,4 +540,435 @@ def test_call_to_a_name_from_a_plain_import_statement_is_not_deferred():
 
     assert deferred == []
     assert deferred_inherits == []
+
+
+# ---------------------------------------------------------------------------
+# pytest-fixture dependency-injection heuristic (slice B2, wayfinder ticket
+# df13991a). Same-file only -- see extract_relations.py module docstring for
+# the cross-file/conftest.py scope note. Always AMBIGUOUS confidence,
+# provenance.provider="pytest-fixture-heuristic": a naming-convention
+# heuristic, never a resolved reference.
+# ---------------------------------------------------------------------------
+
+
+def test_test_function_parameter_matching_a_same_file_fixture_produces_an_ambiguous_calls_edge():
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    rel = calls[0]
+    assert rel.source == "tests/test_mod.py:test_uses_db#function"
+    assert rel.target == "tests/test_mod.py:db#function"
+    assert rel.confidence == Confidence.AMBIGUOUS
+    assert rel.provenance.provider == "pytest-fixture-heuristic"
+    assert rel.site_file == "tests/test_mod.py"
+
+
+def test_fixture_function_can_itself_depend_on_another_fixture_by_parameter_name():
+    # Fixture-to-fixture DI is real pytest behavior and not restricted to
+    # test-convention files -- a plain module can host a conftest-style
+    # fixture chain.
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def base():\n"
+        "    pass\n\n\n"
+        "@pytest.fixture\n"
+        "def derived(base):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="pkg/conftest.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    rel = calls[0]
+    assert rel.source == "pkg/conftest.py:derived#function"
+    assert rel.target == "pkg/conftest.py:base#function"
+    assert rel.confidence == Confidence.AMBIGUOUS
+
+
+def test_ordinary_helper_function_parameter_matching_a_fixture_name_produces_no_edge():
+    # Neither a test function nor a fixture itself -- pytest would never
+    # inject a fixture into it, so this is not a DI site even though the
+    # parameter name collides with a real fixture.
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def helper(db):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
     assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_test_function_outside_a_test_convention_file_is_not_a_di_site():
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_self_and_cls_parameters_are_never_treated_as_fixture_di():
+    source = (
+        "import pytest\n\n\n"
+        "class TestFoo:\n"
+        "    @pytest.fixture\n"
+        "    def self(self):\n"  # pathological but guards the skip explicitly
+        "        pass\n\n"
+        "    def test_thing(self):\n"
+        "        pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_fixture_decorator_called_with_arguments_is_still_recognized():
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture(scope=\"module\")\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    assert calls[0].target == "tests/test_mod.py:db#function"
+
+
+def test_bare_fixture_decorator_imported_from_pytest_is_recognized():
+    source = (
+        "from pytest import fixture\n\n\n"
+        "@fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    assert calls[0].target == "tests/test_mod.py:db#function"
+
+
+def test_a_bare_decorator_named_fixture_but_not_imported_from_pytest_is_not_recognized():
+    source = (
+        "from somewhere_else import fixture\n\n\n"
+        "@fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_parameter_name_with_no_matching_fixture_produces_no_edge():
+    source = "def test_thing(unrelated_param):\n    pass\n"
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+# --- P1 code-review fixes, 2026-09-03: class-scope precedence, name=
+# override, and mandatory-parameter-only matching. All three verified
+# against a real pytest run/source before implementing (see docstrings on
+# _fixture_definitions/_fixture_di_relations/_param_name_nodes). ---
+
+
+def test_a_class_local_fixture_shadows_a_same_named_module_fixture_for_its_own_class():
+    # A same-named class-level fixture takes precedence over the
+    # module-level one for members of its OWN class -- real pytest, not
+    # ambiguity. The module-level fixture is NOT also a candidate here.
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "class TestFoo:\n"
+        "    @pytest.fixture\n"
+        "    def db(self):\n"
+        "        pass\n\n"
+        "    def test_uses_db(self, db):\n"
+        "        pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    rel = calls[0]
+    assert rel.source == "tests/test_mod.py:TestFoo.test_uses_db#method"
+    assert rel.target == "tests/test_mod.py:TestFoo.db#method"
+    assert rel.confidence == Confidence.AMBIGUOUS
+
+
+def test_a_class_local_fixture_is_not_visible_to_a_sibling_class():
+    # TestB has no db fixture of its own -- it must fall back to the
+    # module-level db, never TestA's class-scoped one (real pytest class
+    # fixtures are invisible outside their own class).
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "class TestA:\n"
+        "    @pytest.fixture\n"
+        "    def db(self):\n"
+        "        pass\n\n\n"
+        "class TestB:\n"
+        "    def test_uses_db(self, db):\n"
+        "        pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    rel = calls[0]
+    assert rel.source == "tests/test_mod.py:TestB.test_uses_db#method"
+    assert rel.target == "tests/test_mod.py:db#function"
+
+
+def test_two_same_named_module_level_fixtures_are_genuinely_ambiguous():
+    # Real redefinition-collision ambiguity, distinct from the shadowing
+    # cases above -- both candidates are in the SAME (module) scope.
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 2
+    targets = {r.target for r in calls}
+    assert targets == {"tests/test_mod.py:db#function", "tests/test_mod.py:db#function@2"}
+    assert all(r.confidence == Confidence.AMBIGUOUS for r in calls)
+
+
+def test_fixture_with_a_custom_public_name_is_indexed_under_that_name():
+    source = (
+        "import pytest\n\n\n"
+        '@pytest.fixture(name="db")\n'
+        "def database():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    assert calls[0].target == "tests/test_mod.py:database#function"
+
+
+def test_a_renamed_fixtures_original_function_name_is_no_longer_a_match():
+    # pytest.fixture(name=...) REPLACES the registered name, it doesn't
+    # add to it -- a parameter matching the underlying function's own name
+    # must produce no edge.
+    source = (
+        "import pytest\n\n\n"
+        '@pytest.fixture(name="db")\n'
+        "def database():\n"
+        "    pass\n\n\n"
+        "def test_uses_database(database):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_fixture_decorator_with_name_and_other_keyword_arguments_together():
+    source = (
+        "import pytest\n\n\n"
+        '@pytest.fixture(scope="module", name="db")\n'
+        "def database():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    assert calls[0].target == "tests/test_mod.py:database#function"
+
+
+def test_a_non_literal_name_argument_falls_back_to_the_function_name():
+    source = (
+        "import pytest\n\n\n"
+        "custom_name = \"db\"\n\n\n"
+        "@pytest.fixture(name=custom_name)\n"
+        "def database():\n"
+        "    pass\n\n\n"
+        "def test_uses_database(database):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    assert calls[0].target == "tests/test_mod.py:database#function"
+
+
+def test_typed_parameter_without_a_default_is_still_matched_against_a_fixture():
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db: object):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    assert calls[0].target == "tests/test_mod.py:db#function"
+
+
+def test_a_defaulted_parameter_is_never_treated_as_a_fixture_request():
+    # pytest's own getfuncargnames only treats a parameter as a fixture
+    # request when it has no default value -- a defaulted parameter is a
+    # plain optional argument (verified against real pytest, 2026-09-03).
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db=None):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_a_typed_defaulted_parameter_is_never_treated_as_a_fixture_request():
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db: object = None):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_star_args_and_kwargs_are_never_treated_as_fixture_parameters():
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def args():\n"
+        "    pass\n\n\n"
+        "def test_thing(*args, **kwargs):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_a_fixture_cannot_depend_on_itself_via_a_same_named_parameter():
+    # Pathological, but guards against a fixture whose own bare name happens
+    # to equal one of its parameter names producing a self-loop edge.
+    source = "import pytest\n\n\n@pytest.fixture\ndef db(db):\n    pass\n"
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_class_scoped_fixture_matches_a_test_method_in_the_same_class():
+    source = (
+        "import pytest\n\n\n"
+        "class TestFoo:\n"
+        "    @pytest.fixture\n"
+        "    def local_db(self):\n"
+        "        pass\n\n"
+        "    def test_uses_local_db(self, local_db):\n"
+        "        pass\n"
+    )
+
+    relations = extract_relations(path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    rel = calls[0]
+    assert rel.source == "tests/test_mod.py:TestFoo.test_uses_local_db#method"
+    assert rel.target == "tests/test_mod.py:TestFoo.local_db#method"
+
+
+def test_fixture_di_edges_are_included_in_deferred_edges_entry_point_too():
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db):\n"
+        "    pass\n"
+    )
+
+    relations, deferred, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
+        path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    )
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    assert calls[0].target == "tests/test_mod.py:db#function"
+    assert deferred == []
+    assert deferred_inherits == []
+    assert deferred_overrides == []

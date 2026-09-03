@@ -770,3 +770,45 @@ def test_index_file_persists_to_a_real_on_disk_index_for_a_resolved_repo(tmp_pat
         source="pkg/mod.py:#module", target="pkg/mod.py:foo#function", predicate="defines",
         site_file="pkg/mod.py", site_line=1, site_col=0,
     ) is not None
+
+
+def test_indexing_a_real_test_file_produces_the_fixture_di_calls_edge():
+    """Real-pipeline coverage for slice B2 (pytest-fixture DI heuristic) --
+    the 17 tests in test_extract_relations.py prove the extraction logic
+    directly, but none of them go through index_file itself. Same "don't
+    let real-index integration coverage lag a new extractor" lesson B1's
+    own code review caught (memory d56588f1).
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    source = (
+        "import pytest\n\n\n"
+        "@pytest.fixture\n"
+        "def db():\n"
+        "    pass\n\n\n"
+        "def test_uses_db(db):\n"
+        "    pass\n"
+    )
+
+    result = index_file(
+        path="tests/test_mod.py",
+        source_text=source,
+        observed_at="2026-08-31T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    assert result.skipped is False
+    fixture_di_edge = relation_store.get(
+        source="tests/test_mod.py:test_uses_db#function",
+        target="tests/test_mod.py:db#function",
+        predicate="calls",
+        site_file="tests/test_mod.py",
+        site_line=9,
+        site_col=17,
+    )
+    assert fixture_di_edge is not None
+    assert fixture_di_edge.confidence == Confidence.AMBIGUOUS
+    assert fixture_di_edge.provenance.provider == "pytest-fixture-heuristic"

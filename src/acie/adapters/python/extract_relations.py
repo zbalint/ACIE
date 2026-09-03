@@ -6,9 +6,15 @@ from tree_sitter import Language, Parser
 from acie.adapters.python.extract_symbols import extract_symbols
 from acie.ir.relation import DeferredImportCall, DeferredImportInherit, DeferredImportOverride, Relation
 from acie.ir.symbol import Confidence, Provenance, Symbol
+from acie.pytest_conventions import is_test_file_path, is_test_qualname
 
 _LANGUAGE = Language(tspython.language())
 _PROVENANCE_VERSION = version("tree-sitter-python")
+
+# Bumped only if the fixture-DI heuristic's own matching logic changes --
+# not tied to any external package version, since this heuristic isn't
+# pytest's own behavior, just ACIE's static approximation of it.
+_FIXTURE_HEURISTIC_VERSION = "1"
 
 
 def extract_relations(path: str, source_text: str, observed_at: str) -> list[Relation]:
@@ -82,12 +88,29 @@ def _extract(
         provenance=provenance,
     )
 
+    fixture_provenance = Provenance(
+        provider="pytest-fixture-heuristic", version=_FIXTURE_HEURISTIC_VERSION, observed_at=observed_at
+    )
+    by_position = _symbol_by_position(symbols)
+    module_fixtures, class_fixtures = _fixture_definitions(
+        tree.root_node, by_position=by_position, import_alias_map=import_alias_map
+    )
+    fixture_relations = _fixture_di_relations(
+        tree.root_node,
+        by_position=by_position,
+        module_fixtures=module_fixtures,
+        class_fixtures=class_fixtures,
+        path=path,
+        fixture_provenance=fixture_provenance,
+    )
+
     relations: list[Relation] = []
     relations.extend(_defines_relations(symbols, path=path, provenance=provenance))
     relations.extend(import_relations)
     relations.extend(inherits_relations)
     relations.extend(overrides_relations)
     relations.extend(call_relations)
+    relations.extend(fixture_relations)
     return relations, deferred_calls, deferred_inherits, deferred_overrides
 
 
@@ -469,6 +492,303 @@ def _overrides_relations(
                         )
                     )
     return relations, deferred
+
+
+def _unwrap_decorated(node):
+    """Mirrors extract_symbols._unwrap_decorated (kept local rather than
+    imported across the module boundary, same as this file's other small
+    tree-walking helpers like _symbol_by_position/_within_span): a
+    decorated def is wrapped in a `decorated_definition` node whose
+    `definition` field holds the actual function_definition/
+    class_definition -- unwrap it so both fixture-definition and fixture-DI
+    detection below can treat a decorated function/class the same as an
+    undecorated one wherever decorators themselves aren't what's being
+    inspected.
+    """
+    if node.type == "decorated_definition":
+        return node.child_by_field_name("definition")
+    return node
+
+
+def _fixture_definitions(
+    root, *, by_position: dict[tuple[int, int], Symbol], import_alias_map: dict[str, str]
+) -> tuple[dict[str, list[Symbol]], dict[str, dict[str, list[Symbol]]]]:
+    """Returns (module_fixtures, class_fixtures):
+
+    - `module_fixtures`: public fixture name -> candidate Symbols, for
+      every module-level (top-level) `@pytest.fixture`-decorated function
+      -- visible file-wide to every test/fixture regardless of enclosing
+      class, matching pytest's own resolution.
+    - `class_fixtures`: class qualname -> {public fixture name -> candidate
+      Symbols}, for every class-level (one level into a class body)
+      `@pytest.fixture`-decorated method -- visible ONLY within that same
+      class. A sibling class's same-named fixture is never a candidate,
+      and a class-level fixture correctly SHADOWS a same-named module-level
+      one for its own class's members (both directions verified against a
+      real `pytest` run, 2026-09-03 code review, finding P1: a flat
+      by-name-only dict previously let `TestB.test_x(db)` wrongly resolve
+      against `TestA.db`, an impossible edge -- pytest class-scoped
+      fixtures are invisible outside their own class).
+
+    Recognizes `@pytest.fixture` (bare, `@pytest.fixture()`, or
+    `@pytest.fixture(scope=...)`), or `@fixture` when `fixture` is `from
+    pytest import`ed. Scoped to the same two tiers extract_symbols itself
+    recognizes (module-level defs, one level into a class body) -- no
+    Symbol exists to attach a Relation to at any deeper nesting regardless.
+    An aliased fixture import (`from pytest import fixture as fx`) is not
+    recognized -- same pre-existing limitation as extract_relations' own
+    aliased-import handling elsewhere in this module.
+
+    Public name resolution honors `@pytest.fixture(name="...")` (a real
+    pytest feature: `_pytest.fixtures.FixtureFunctionMarker.__call__` sets
+    `name = self.name or function.__name__` -- a `name=` override REPLACES
+    the function's own name as the fixture's sole public identifier, it
+    does not additionally register the original name too; verified
+    against the installed pytest's own source, 2026-09-03 code review,
+    finding P1). A parameter matching the underlying function's own name
+    after such a rename produces no edge, matching real pytest.
+    """
+    module_fixtures: dict[str, list[Symbol]] = {}
+    class_fixtures: dict[str, dict[str, list[Symbol]]] = {}
+
+    def consider(node, *, class_qualname: str | None) -> None:
+        if node.type != "decorated_definition":
+            return
+        definition = node.child_by_field_name("definition")
+        if definition is None or definition.type != "function_definition":
+            return
+        fixture_decorators = [
+            c for c in node.named_children if c.type == "decorator" and _is_pytest_fixture_decorator(c, import_alias_map)
+        ]
+        if not fixture_decorators:
+            return
+        sym = by_position.get((definition.start_point.row + 1, definition.start_point.column))
+        if sym is None:
+            return
+        own_name = sym.qualname.rsplit(".", 1)[-1]
+        public_name = _fixture_public_name(fixture_decorators[0], default_name=own_name)
+        if class_qualname is None:
+            module_fixtures.setdefault(public_name, []).append(sym)
+        else:
+            class_fixtures.setdefault(class_qualname, {}).setdefault(public_name, []).append(sym)
+
+    for child in root.named_children:
+        consider(child, class_qualname=None)
+        unwrapped = _unwrap_decorated(child)
+        if unwrapped.type == "class_definition":
+            body = unwrapped.child_by_field_name("body")
+            name_node = unwrapped.child_by_field_name("name")
+            if body is not None and name_node is not None:
+                class_qualname = name_node.text.decode("utf-8")
+                for member in body.named_children:
+                    consider(member, class_qualname=class_qualname)
+    return module_fixtures, class_fixtures
+
+
+def _is_pytest_fixture_decorator(decorator_node, import_alias_map: dict[str, str]) -> bool:
+    if not decorator_node.named_children:
+        return False
+    head = decorator_node.named_children[0]
+    if head.type == "call":
+        head = head.child_by_field_name("function")
+    if head is None:
+        return False
+    if head.type == "attribute":
+        object_node = head.child_by_field_name("object")
+        attribute_node = head.child_by_field_name("attribute")
+        return (
+            object_node is not None
+            and object_node.type == "identifier"
+            and object_node.text == b"pytest"
+            and attribute_node is not None
+            and attribute_node.text == b"fixture"
+        )
+    if head.type == "identifier":
+        return head.text.decode("utf-8") == "fixture" and import_alias_map.get("fixture") == "pytest"
+    return False
+
+
+def _fixture_public_name(decorator_node, *, default_name: str) -> str:
+    """The fixture's real registered name: default_name (the decorated
+    function's own bare name) unless overridden by a literal-string
+    `@pytest.fixture(name="...")` keyword argument -- see _fixture_
+    definitions' docstring for the pytest-source citation. A non-literal
+    `name=` value (a variable, an f-string) can't be resolved statically
+    and falls back to default_name, same as any other unresolvable case
+    in this heuristic.
+    """
+    if not decorator_node.named_children:
+        return default_name
+    head = decorator_node.named_children[0]
+    if head.type != "call":
+        return default_name
+    arguments = head.child_by_field_name("arguments")
+    if arguments is None:
+        return default_name
+    for arg in arguments.named_children:
+        if arg.type != "keyword_argument":
+            continue
+        key_node = arg.child_by_field_name("name")
+        if key_node is None or key_node.text != b"name":
+            continue
+        value_node = arg.child_by_field_name("value")
+        literal = _string_literal_value(value_node) if value_node is not None else None
+        if literal is not None:
+            return literal
+    return default_name
+
+
+def _string_literal_value(node) -> str | None:
+    """The literal text of a plain `string` node (no f-string
+    interpolation support needed here -- a `name=f"..."` argument simply
+    falls back to the decorated function's own name via
+    _fixture_public_name, same as any other statically-unresolvable case).
+    """
+    if node.type != "string":
+        return None
+    parts = [c.text.decode("utf-8") for c in node.named_children if c.type == "string_content"]
+    return "".join(parts)
+
+
+def _fixture_di_relations(
+    root,
+    *,
+    by_position: dict[tuple[int, int], Symbol],
+    module_fixtures: dict[str, list[Symbol]],
+    class_fixtures: dict[str, dict[str, list[Symbol]]],
+    path: str,
+    fixture_provenance: Provenance,
+) -> list[Relation]:
+    """Synthesizes an AMBIGUOUS-confidence `calls` edge from a test function
+    (or another fixture) to each same-file `@pytest.fixture` its parameter
+    list names -- pytest's own implicit by-name dependency injection is
+    never a real function call in the source, so tree-sitter's ordinary
+    call-site extraction (_call_and_reference_relations) can never see it.
+    Always AMBIGUOUS, even for a single same-file match: this is a naming-
+    convention heuristic, not a resolved reference -- pytest's real
+    fixture resolution also considers a conftest.py hierarchy this static
+    heuristic cannot model (see this module's cross-file scope note below).
+
+    Candidate resolution respects pytest's real class-vs-module fixture
+    visibility (verified against a real pytest run, 2026-09-03 code review
+    finding P1): for a method, its OWN class's class_fixtures are checked
+    FIRST and, if the name matches there, used exclusively -- a class-level
+    fixture shadows a same-named module-level one for its own class's
+    members, matching real pytest precedence. Only when the name has no
+    match in the method's own class does resolution fall back to
+    module_fixtures. A module-level DI-target (no enclosing class) only
+    ever consults module_fixtures. This means a fixture defined in one
+    class is NEVER a candidate for a different class's test -- pytest
+    class-scoped fixtures are invisible outside their own class.
+
+    A DI-target function is exactly one of the two kinds pytest itself
+    would inject fixtures into: a test function/method (is_test_file_path
+    + is_test_qualname, the identical convention affected_tests/B1 already
+    established -- shared via acie.pytest_conventions, a real second
+    caller) or a fixture function/method itself (fixtures can depend on
+    other fixtures). An ordinary helper is not a DI site even if one of its
+    parameter names happens to collide with a fixture's -- pytest would
+    never call it with injection semantics.
+
+    Cross-file scope (not this slice): a fixture defined in a conftest.py
+    ancestor directory, or any file this test file doesn't otherwise
+    reference, is invisible to this pass -- extract_relations is single-
+    file-scoped and fixtures are never imported (pytest auto-discovers
+    them), so there is no DeferredImportCall-style import_alias_map entry
+    to defer against, unlike the calls/inherits/overrides predicates. A
+    real cross-file version would need a persistent repo-wide fixture
+    registry (a Symbol-schema or storage change, not merely an indexer.py
+    resolution pass) -- deliberately left as a flagged follow-up, same
+    status as B1's own naming-convention-vs-actually-collected gap
+    (memory 9a12ed13), not built now.
+    """
+    fixture_symbol_ids = {sym.id for candidates in module_fixtures.values() for sym in candidates}
+    for by_name in class_fixtures.values():
+        fixture_symbol_ids |= {sym.id for candidates in by_name.values() for sym in candidates}
+    is_test_file = is_test_file_path(path)
+    relations: list[Relation] = []
+
+    def candidates_for(name: str, *, own_class: str | None) -> list[Symbol]:
+        if own_class is not None:
+            shadowed = class_fixtures.get(own_class, {}).get(name)
+            if shadowed:
+                return shadowed
+        return module_fixtures.get(name, [])
+
+    def consider(node, *, own_class: str | None) -> None:
+        node = _unwrap_decorated(node)
+        if node.type != "function_definition":
+            return
+        sym = by_position.get((node.start_point.row + 1, node.start_point.column))
+        if sym is None:
+            return
+        is_test = is_test_file and is_test_qualname(sym.qualname)
+        if not (is_test or sym.id in fixture_symbol_ids):
+            return
+        for name_node in _param_name_nodes(node):
+            name = name_node.text.decode("utf-8")
+            if name in ("self", "cls"):
+                continue
+            for fixture_symbol in candidates_for(name, own_class=own_class):
+                if fixture_symbol.id == sym.id:
+                    continue  # a fixture can't depend on itself via a same-named parameter
+                relations.append(
+                    Relation(
+                        source=sym.id,
+                        target=fixture_symbol.id,
+                        predicate="calls",
+                        site_file=path,
+                        site_line=name_node.start_point.row + 1,
+                        site_col=name_node.start_point.column,
+                        confidence=Confidence.AMBIGUOUS,
+                        provenance=fixture_provenance,
+                    )
+                )
+
+    for child in root.named_children:
+        consider(child, own_class=None)
+        unwrapped = _unwrap_decorated(child)
+        if unwrapped.type == "class_definition":
+            body = unwrapped.child_by_field_name("body")
+            name_node = unwrapped.child_by_field_name("name")
+            if body is not None and name_node is not None:
+                own_class = name_node.text.decode("utf-8")
+                for member in body.named_children:
+                    consider(member, own_class=own_class)
+    return relations
+
+
+def _param_name_nodes(function_node) -> list:
+    """The identifier node for each MANDATORY (no-default) parameter of a
+    function_definition -- plain (`x`) and typed-without-default (`x: T`)
+    only. `*args`/`**kwargs` (list_splat_pattern/dictionary_splat_pattern)
+    are excluded, since neither is ever a fixture-name binding. A defaulted
+    parameter (`x=1`, `x: T = 1` -- default_parameter/typed_default_
+    parameter) is ALSO deliberately excluded: pytest's own fixture-request
+    resolution (`_pytest.compat.getfuncargnames`, verified against the
+    installed pytest's real source, 2026-09-03 code review finding from
+    an independent reviewer) only ever treats a parameter as a fixture
+    request when it has no default value (`p.default is Parameter.empty`)
+    -- a defaulted parameter is a plain optional argument, never injected.
+    Confirmed empirically too: a real pytest run collecting `def test_x(db
+    ="x"): ...` never resolves `db` against a same-named fixture. Verified
+    against the live tree-sitter-python grammar (2026-09-02): typed_
+    parameter has no `name` field (its identifier is taken positionally),
+    unlike default_parameter/typed_default_parameter which do -- moot now
+    that both are excluded outright, kept here as the reason this function
+    only bothers with the two node shapes it still handles.
+    """
+    params_node = function_node.child_by_field_name("parameters")
+    if params_node is None:
+        return []
+    names = []
+    for p in params_node.named_children:
+        if p.type == "identifier":
+            names.append(p)
+        elif p.type == "typed_parameter":
+            if p.named_children and p.named_children[0].type == "identifier":
+                names.append(p.named_children[0])
+    return names
 
 
 def _import_relations(
