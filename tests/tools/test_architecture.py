@@ -8,11 +8,12 @@ acie.tools.architecture's module docstring and acie.module_paths for the
 suffix-tolerant derivation this index is built from.
 
 v1 slice C2 adds the `architecture(root, granularity, node_cap, full)` MCP
-tool itself, **file granularity only** -- package granularity is C3, not
-yet built. See architecture()'s own docstring for the seam decisions
-(root's path-prefix-scope semantics confirmed via AskUserQuestion; the
-rest decided locally following graph.py/impact_analysis.py/affected_tests.py
-precedent).
+tool itself, file granularity. v1 slice C3 adds `granularity="package"`,
+a directory-based rollup one level up from C2's file nodes. See
+architecture()'s own docstring for the seam decisions (C2's root
+path-prefix-scope semantics confirmed via AskUserQuestion; C3's package
+node/edge shape and the rest decided locally following
+graph.py/impact_analysis.py/affected_tests.py precedent).
 """
 
 from acie.indexer import index_file
@@ -352,14 +353,14 @@ def test_unrecognized_granularity_raises_invalid_argument_error():
         pass
 
 
-def test_package_granularity_raises_invalid_argument_error_as_not_yet_supported():
+def test_unrecognized_granularity_still_names_both_valid_values_in_the_message():
     symbol_store, relation_store, index_meta_store = _stores()
 
     try:
-        architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+        architecture(symbol_store, relation_store, index_meta_store, granularity="symbol")
         assert False, "expected InvalidArgumentError"
     except InvalidArgumentError as exc:
-        assert "package" in str(exc)
+        assert "'file'" in str(exc) and "'package'" in str(exc)
 
 
 def test_full_false_omits_confidence_and_provenance_on_nodes():
@@ -397,3 +398,209 @@ def test_root_and_node_cap_are_echoed_in_the_envelope():
 
     assert result["root"] == "pkg"
     assert result["node_cap"] == 42
+
+
+# ---------------------------------------------------------------------------
+# architecture() -- v1 slice C3, package (directory-based rollup) granularity.
+# ---------------------------------------------------------------------------
+
+
+def test_package_empty_repo_produces_no_nodes_or_edges():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    assert result["nodes"] == []
+    assert result["edges"] == []
+    assert result["truncated"] is False
+
+
+def test_package_node_path_is_the_files_immediate_containing_directory():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/sub/mod.py", "def helper():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    assert len(result["nodes"]) == 1
+    assert result["nodes"][0]["path"] == "pkg/sub"
+    assert result["nodes"][0]["kind"] == "package"
+    assert result["nodes"][0]["external_dependency_count"] == 0
+
+
+def test_package_a_repo_root_file_with_no_directory_rolls_up_to_the_empty_string_package():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "mod.py", "def helper():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    assert result["nodes"] == [{"path": "", "kind": "package", "external_dependency_count": 0}]
+
+
+def test_package_two_files_in_the_same_directory_collapse_to_one_node():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "def b():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    assert result["nodes"] == [{"path": "pkg", "kind": "package", "external_dependency_count": 0}]
+
+
+def test_package_an_import_between_files_in_the_same_directory_produces_no_self_edge():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/foo.py", "def helper():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/bar.py",
+        "from pkg.foo import helper\n\n\nhelper()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    assert result["nodes"] == [{"path": "pkg", "kind": "package", "external_dependency_count": 0}]
+    assert result["edges"] == []
+
+
+def test_package_a_resolvable_cross_directory_import_produces_one_edge_between_package_dirs():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg_a/foo.py", "def helper():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg_b/bar.py",
+        "from pkg_a.foo import helper\n\n\nhelper()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    assert result["edges"] == [{"source": "pkg_b", "target": "pkg_a"}]
+
+
+def test_package_multiple_cross_directory_imports_between_the_same_two_packages_collapse_to_one_edge():
+    # pkg_b/bar.py imports from two different files in pkg_a/ -- several
+    # file-level imports relations, still one edge once rolled up to
+    # package granularity.
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg_a/foo.py", "def helper():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg_a/other.py", "def other():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg_b/bar.py",
+        "from pkg_a.foo import helper\nfrom pkg_a.other import other\n\n\nhelper()\nother()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    assert result["edges"] == [{"source": "pkg_b", "target": "pkg_a"}]
+
+
+def test_package_an_unresolvable_import_increments_the_package_level_external_dependency_count():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "import os\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "import sys\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    # Both files' external imports roll up onto the single "pkg" node.
+    assert result["nodes"] == [{"path": "pkg", "kind": "package", "external_dependency_count": 2}]
+
+
+def test_package_root_scopes_nodes_to_directories_under_that_path_prefix():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/sub/a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/subx/b.py", "def b():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, root="pkg/sub", granularity="package")
+
+    assert {node["path"] for node in result["nodes"]} == {"pkg/sub"}
+
+
+def test_package_import_resolving_outside_the_scoped_root_produces_no_edge_and_is_not_external():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/other/c.py", "def c():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/sub/a.py",
+        "from pkg.other.c import c\n\n\nc()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, root="pkg/sub", granularity="package")
+
+    assert result["nodes"] == [{"path": "pkg/sub", "kind": "package", "external_dependency_count": 0}]
+    assert result["edges"] == []
+
+
+def test_package_an_ambiguously_resolving_import_produces_an_edge_to_each_candidate_package():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "vendor_a/pkg/other.py", "def x():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "vendor_b/pkg/other.py", "def x():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "main/entry.py",
+        "from pkg.other import x\n\n\nx()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    assert result["edges"] == [
+        {"source": "main", "target": "vendor_a/pkg"},
+        {"source": "main", "target": "vendor_b/pkg"},
+    ]
+
+
+def test_package_node_cap_truncates_directory_count_not_file_count():
+    # Two files sharing one directory must count as ONE node against the
+    # cap, not two -- node_cap bounds packages, not the underlying files.
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "def b():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package", node_cap=1)
+
+    assert len(result["nodes"]) == 1
+    assert result["truncated"] is False
+
+
+def test_package_node_cap_truncates_when_directory_count_exceeds_it():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg_a/a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg_b/b.py", "def b():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package", node_cap=1)
+
+    assert len(result["nodes"]) == 1
+    assert result["nodes"][0]["path"] == "pkg_a"
+    assert result["truncated"] is True
+
+
+def test_package_files_in_a_truncated_away_directory_produce_no_edge_and_are_not_external():
+    # pkg_b is truncated out of view (node_cap=1, pkg_a sorts first). An
+    # import from pkg_a into pkg_b must not appear as an edge, and must not
+    # inflate pkg_a's external_dependency_count either -- it resolved
+    # in-repo, it's just outside this capped view (same simplification as
+    # file granularity's out-of-scope-root case, extended to the cap).
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg_b/target.py", "def helper():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg_a/a.py",
+        "from pkg_b.target import helper\n\n\nhelper()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package", node_cap=1)
+
+    assert result["nodes"] == [{"path": "pkg_a", "kind": "package", "external_dependency_count": 0}]
+    assert result["edges"] == []
+
+
+def test_package_full_true_has_no_effect_on_synthetic_package_nodes():
+    # Unlike file granularity, a package node is not a real Symbol -- there
+    # is no confidence/provenance to reveal.
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "def a():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package", full=True)
+
+    assert "confidence" not in result["nodes"][0]
+    assert "provenance" not in result["nodes"][0]
+
+
+def test_package_granularity_is_echoed_in_the_envelope():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    assert result["granularity"] == "package"

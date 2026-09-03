@@ -1,10 +1,9 @@
 """architecture: module/package-aggregation MCP tool (v1 capability C,
 wayfinder ticket 47d8cd0d).
 
-**Slices C1+C2 only** -- package-directory rollup (C3), `.acie/config.json`
-layering rules (C4/C5), and cycle detection (C6) are not yet built (see
-wayfinder map 5d8fa498's "Decisions so far" / memory 3627eece for the full
-C1-C6 breakdown).
+**Slices C1-C3 only** -- `.acie/config.json` layering rules (C4/C5) and
+cycle detection (C6) are not yet built (see wayfinder map 5d8fa498's
+"Decisions so far" / memory 3627eece for the full C1-C6 breakdown).
 
 ## The gap C1 closes
 
@@ -24,11 +23,10 @@ one-time index rather than a per-lookup scan.
 `architecture(symbol_store, relation_store, index_meta_store, root=None,
 granularity="file", node_cap=100, full=False)` -- the ticket resolution
 (wayfinder map 5d8fa498) locked this exact signature; `granularity` is
-`"file"` (this slice) or `"package"` (C3, not yet built -- raises
-`InvalidArgumentError` for now). Unlike graph/impact_analysis/
-affected_tests, this is not a BFS from an anchor node: it's a rollup view
-of the whole (optionally scoped) repo, so there is no `depth_clamp`
-parameter, matching the locked signature.
+`"file"` (C2) or `"package"` (C3, directory-based rollup, this section).
+Unlike graph/impact_analysis/affected_tests, this is not a BFS from an
+anchor node: it's a rollup view of the whole (optionally scoped) repo, so
+there is no `depth_clamp` parameter, matching the locked signature.
 
 Seam decisions:
 
@@ -98,6 +96,54 @@ Seam decisions:
    `nodes` alone (an empty-scope result looks identical for any
    non-matching prefix), so the caller needs it echoed back to know what
    was actually queried.
+
+## C3: `granularity="package"`, directory-based rollup
+
+Package nodes are one level up from C2's file nodes: every distinct
+directory among in-scope files becomes one node, with per-file edges and
+`external_dependency_count` rolled up onto their containing directory.
+`root`'s path-prefix scope is unchanged -- it still filters files first
+(decision 1 above), exactly as C2 already anticipated ("a package root is
+just another path prefix").
+
+8. **A file's package is its own immediate containing directory**
+   (`pkg/sub/mod.py` -> `pkg/sub`), not every ancestor up to `root` and not
+   a search for the nearest `__init__.py`. This needs no filesystem access
+   beyond the file's own path and treats namespace packages (no
+   `__init__.py`, valid since Python 3.3) identically to regular ones --
+   ACIE has no other place that special-cases `__init__.py` presence, so
+   inventing one here would be new machinery for a distinction nothing
+   downstream needs yet. A repo-root file with no directory component
+   (`mod.py`) rolls up to the empty-string package `""`.
+9. **Package nodes are synthetic dicts (`{path, kind: "package",
+   external_dependency_count}`), never `render_symbol`.** Unlike C2's file
+   nodes, no real Symbol represents "this directory" -- reusing an
+   `__init__.py`'s own module symbol (when one exists) would misreport that
+   file's own line range as if it were the whole package's, and silently
+   break for namespace packages that have no `__init__.py` at all. `full`
+   therefore has no effect at package granularity (there is no
+   confidence/provenance to reveal), the same no-op status decision 3 gives
+   edges at file granularity.
+10. **An edge whose source and target directory are equal (an import
+    between two files in the same package, including a file importing
+    itself) is dropped, not rendered as a self-loop** -- this is decision
+    4's own-file exclusion (`candidate_path != module.path`), generalized
+    one level: the rollup already merged those files into one node, so an
+    edge between them would be a self-loop carrying no information.
+11. **`node_cap` truncates the *directory* count, not the underlying file
+    count** -- two files sharing one directory are one node against the
+    cap, matching decision 6's "capping the node list caps the whole
+    computation" for this shape's actual unit of aggregation. Directories
+    are sorted lexicographically and the first `node_cap` are kept
+    (`truncated=True` iff the full in-scope directory count exceeds it).
+    Files whose directory was truncated out of view are excluded from
+    *every* downstream computation for the directories that remain in
+    view: an import into a truncated-away directory produces no edge and
+    does not increment the source directory's `external_dependency_count`
+    -- it resolved in-repo, it's just outside this capped view, the exact
+    same reasoning as decision 4's root-scope exclusion, now extended to
+    the node_cap boundary too (a single "is the target directory in view"
+    check serves both cases uniformly).
 """
 
 from acie.module_paths import path_to_dotted
@@ -155,11 +201,7 @@ def architecture(
     node_cap: int = _DEFAULT_NODE_CAP,
     full: bool = False,
 ) -> dict:
-    if granularity == "package":
-        raise InvalidArgumentError(
-            "granularity 'package' is not yet supported (v1 slice C3, wayfinder ticket 47d8cd0d)"
-        )
-    if granularity != "file":
+    if granularity not in ("file", "package"):
         raise InvalidArgumentError(f"granularity must be one of ['file', 'package'], got {granularity!r}")
     # Same non-positive-cap guard as graph.py/impact_analysis.py/
     # affected_tests.py (LIVE_MCP_QUALIFICATION_REPORT.md, 2026-09-01).
@@ -171,6 +213,24 @@ def architecture(
 
     all_modules = symbol_store.search(qualname_substring="", kind="module")
     in_scope = [module for module in all_modules if _in_scope(module.path, root)]
+
+    if granularity == "file":
+        nodes, edges, truncated = _file_granularity(in_scope, relation_store, dotted_name_index, node_cap, full)
+    else:
+        nodes, edges, truncated = _package_granularity(in_scope, relation_store, dotted_name_index, node_cap)
+
+    return {
+        "index_generation": index_generation,
+        "root": root,
+        "granularity": granularity,
+        "nodes": nodes,
+        "edges": edges,
+        "node_cap": node_cap,
+        "truncated": truncated,
+    }
+
+
+def _file_granularity(in_scope, relation_store, dotted_name_index, node_cap, full):
     truncated = len(in_scope) > node_cap
     scoped_modules = in_scope[:node_cap]
     node_paths = {module.path for module in scoped_modules}
@@ -195,15 +255,45 @@ def architecture(
         item["external_dependency_count"] = external_dependency_count[module.path]
         nodes.append(item)
 
-    return {
-        "index_generation": index_generation,
-        "root": root,
-        "granularity": granularity,
-        "nodes": nodes,
-        "edges": [{"source": source, "target": target} for source, target in sorted(edges)],
-        "node_cap": node_cap,
-        "truncated": truncated,
-    }
+    return nodes, [{"source": s, "target": t} for s, t in sorted(edges)], truncated
+
+
+def _package_granularity(in_scope, relation_store, dotted_name_index, node_cap):
+    module_dir = {module.path: _package_dir(module.path) for module in in_scope}
+    all_dirs = sorted(set(module_dir.values()))
+    truncated = len(all_dirs) > node_cap
+    scoped_dirs = set(all_dirs[:node_cap])
+    scoped_modules = [module for module in in_scope if module_dir[module.path] in scoped_dirs]
+
+    edges: set[tuple[str, str]] = set()
+    external_dependency_count: dict[str, int] = {d: 0 for d in scoped_dirs}
+    for module in scoped_modules:
+        source_dir = module_dir[module.path]
+        for relation in relation_store.list_by_source(module.id, predicates={"imports"}):
+            candidates = _resolve_import_target(relation.target, dotted_name_index)
+            if not candidates:
+                external_dependency_count[source_dir] += 1
+                continue
+            for candidate_path in candidates:
+                candidate_dir = _package_dir(candidate_path)
+                if candidate_dir != source_dir and candidate_dir in scoped_dirs:
+                    edges.add((source_dir, candidate_dir))
+
+    nodes = [
+        {"path": d, "kind": "package", "external_dependency_count": external_dependency_count[d]}
+        for d in sorted(scoped_dirs)
+    ]
+    return nodes, [{"source": s, "target": t} for s, t in sorted(edges)], truncated
+
+
+def _package_dir(path: str) -> str:
+    """A file's package for granularity="package" rollup: its own immediate
+    containing directory (`pkg/sub/mod.py` -> `pkg/sub`), not every
+    ancestor up to `root` and not a search for the nearest `__init__.py`
+    (see architecture()'s module docstring, C3 decision 8). A repo-root
+    file with no directory component rolls up to `""`.
+    """
+    return path.rsplit("/", 1)[0] if "/" in path else ""
 
 
 def _in_scope(path: str, root: str | None) -> bool:
