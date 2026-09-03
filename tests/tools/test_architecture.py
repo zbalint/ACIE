@@ -230,6 +230,22 @@ def test_multiple_imports_of_the_same_target_file_collapse_to_one_edge():
     assert result["edges"] == [{"source": "pkg/bar.py", "target": "pkg/foo.py"}]
 
 
+def test_a_file_importing_from_itself_produces_a_self_loop_edge():
+    # Review finding (P1, commit 260caec): an earlier `candidate_path !=
+    # module.path` guard silently dropped this edge instead of rendering
+    # it. A module's own `imports` relation resolving back to its own file
+    # is real data -- keep it as a genuine source == target self-loop.
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/foo.py",
+        "from pkg.foo import helper\n\n\ndef helper():\n    pass\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["edges"] == [{"source": "pkg/foo.py", "target": "pkg/foo.py"}]
+
+
 def test_an_unresolvable_import_increments_external_dependency_count_and_adds_no_node():
     symbol_store, relation_store, index_meta_store = _stores()
     _index(symbol_store, relation_store, index_meta_store, "pkg/mod.py", "import os\n")

@@ -60,10 +60,17 @@ Seam decisions:
    statement.** This is the "aggregation" the ticket names: two separate
    `from pkg.foo import a, b` names (two symbol-level `imports` relations)
    between the same two files collapse to one `{source, target}` edge.
-   `full` has no effect on edges -- there is no per-edge confidence to
-   reveal (aggregation already discarded the individual site info; adding
-   it back would reopen the one-edge-per-statement question decision 3
-   just closed).
+   This includes the degenerate case of a file importing from (a name
+   defined in) itself: `source == target` is a real self-loop edge, kept
+   rather than suppressed -- an earlier draft silently dropped it via a
+   `candidate_path != module.path` guard with no recorded rationale for
+   the exclusion (caught by review on commit 260caec); self-imports are
+   rare but real, and dropping them would misrepresent this file-to-file
+   aggregation view and hide a genuine one-node cycle from C6's future
+   cycle detection. `full` has no effect on edges -- there is no per-edge
+   confidence to reveal (aggregation already discarded the individual site
+   info; adding it back would reopen the one-edge-per-statement question
+   decision 3 just closed).
 4. **An import resolving to a file outside the current `root`/`node_cap`
    scope produces no edge, and does NOT count toward
    `external_dependency_count`.** It genuinely resolved within the repo --
@@ -124,12 +131,18 @@ just another path prefix").
    therefore has no effect at package granularity (there is no
    confidence/provenance to reveal), the same no-op status decision 3 gives
    edges at file granularity.
-10. **An edge whose source and target directory are equal (an import
-    between two files in the same package, including a file importing
-    itself) is dropped, not rendered as a self-loop** -- this is decision
-    4's own-file exclusion (`candidate_path != module.path`), generalized
-    one level: the rollup already merged those files into one node, so an
-    edge between them would be a self-loop carrying no information.
+10. **An edge whose source and target directory are equal (any import
+    between two files that roll up to the same package node -- including a
+    single file importing itself) is dropped at package granularity, not
+    rendered as a self-loop.** Unlike file granularity (decision 3), which
+    keeps a genuine same-file self-import as a real `source == target`
+    edge, package granularity's rollup has already merged every file under
+    that directory into one node -- an edge between two files it just
+    fused together would be a self-loop carrying no information at *this*
+    granularity, even though the same underlying relation is informative
+    one level down. A deliberately different answer per granularity, not
+    an inconsistency: what counts as real information depends on what the
+    node represents.
 11. **`node_cap` truncates the *directory* count, not the underlying file
     count** -- two files sharing one directory are one node against the
     cap, matching decision 6's "capping the node list caps the whole
@@ -245,7 +258,7 @@ def _file_granularity(in_scope, relation_store, dotted_name_index, node_cap, ful
                 count += 1
                 continue
             for candidate_path in candidates:
-                if candidate_path != module.path and candidate_path in node_paths:
+                if candidate_path in node_paths:
                     edges.add((module.path, candidate_path))
         external_dependency_count[module.path] = count
 
