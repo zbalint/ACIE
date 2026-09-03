@@ -1,9 +1,11 @@
 """architecture: module/package-aggregation MCP tool (v1 capability C,
 wayfinder ticket 47d8cd0d).
 
-**Slices C1-C3 only** -- `.acie/config.json` layering rules (C4/C5) and
-cycle detection (C6) are not yet built (see wayfinder map 5d8fa498's
-"Decisions so far" / memory 3627eece for the full C1-C6 breakdown).
+**Slices C1-C3 only** -- `.acie/config.json`'s schema+loader now exists
+(`acie.layer_config`, slice C4) but this tool does not yet consume it:
+layering-violation detection (C5) and cycle detection (C6) are not yet
+built (see wayfinder map 5d8fa498's "Decisions so far" / memory 3627eece
+for the full C1-C6 breakdown).
 
 ## The gap C1 closes
 
