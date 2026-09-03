@@ -33,7 +33,7 @@ from acie.daemon.protocol import (
 from acie.daemon.sockets import recv_exact
 
 # `method: "shutdown"` is a transport-level control message, not one of the
-# 9 tools in dispatch.py's DISPATCH_TABLE -- DAEMON.md's "Shutdown / Stop
+# 10 tools in dispatch.py's DISPATCH_TABLE -- DAEMON.md's "Shutdown / Stop
 # Semantics" names it as an RPC over the already-locked envelope, so it's
 # intercepted here before ever reaching the injected `dispatch` callable.
 _SHUTDOWN_METHOD = "shutdown"

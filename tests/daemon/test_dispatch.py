@@ -34,10 +34,11 @@ def _index_one_file(repo_path, base_dir, path="pkg/mod.py", source_text="def foo
     return db_path
 
 
-def test_dispatch_table_has_exactly_the_9_locked_tool_names():
+def test_dispatch_table_has_exactly_the_10_locked_tool_names():
     assert set(DISPATCH_TABLE) == {
         "find_symbol", "get_definition", "find_references", "list_imports",
         "structural_search", "graph", "impact_analysis", "explain", "affected_tests",
+        "architecture",
     }
     assert all(callable(fn) for fn in DISPATCH_TABLE.values())
 

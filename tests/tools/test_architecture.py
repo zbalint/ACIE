@@ -1,10 +1,18 @@
-"""Tests for acie.tools.architecture -- v1 slice C1 (wayfinder ticket
-47d8cd0d): the one-time dotted-name -> file_path(s) index the eventual
-`architecture` MCP tool (C2, not yet built) will use to classify each
-`imports` edge's raw dotted-name target as internal (resolves to a real
-file in this repo) or external (doesn't resolve). See
+"""Tests for acie.tools.architecture.
+
+v1 slice C1 (wayfinder ticket 47d8cd0d) built `build_dotted_name_index`,
+the one-time dotted-name -> file_path(s) index the `architecture` MCP tool
+uses to classify each `imports` edge's raw dotted-name target as internal
+(resolves to a real file in this repo) or external (doesn't resolve). See
 acie.tools.architecture's module docstring and acie.module_paths for the
 suffix-tolerant derivation this index is built from.
+
+v1 slice C2 adds the `architecture(root, granularity, node_cap, full)` MCP
+tool itself, **file granularity only** -- package granularity is C3, not
+yet built. See architecture()'s own docstring for the seam decisions
+(root's path-prefix-scope semantics confirmed via AskUserQuestion; the
+rest decided locally following graph.py/impact_analysis.py/affected_tests.py
+precedent).
 """
 
 from acie.indexer import index_file
@@ -12,9 +20,11 @@ from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
-from acie.tools.architecture import build_dotted_name_index
+from acie.tools.architecture import architecture, build_dotted_name_index
+from acie.tools.errors import InvalidArgumentError
 
 _PROVENANCE = Provenance(provider="tree-sitter", version="0.25.0", observed_at="2026-09-03T00:00:00Z")
+_OBSERVED_AT = "2026-09-03T00:00:00Z"
 
 
 def _module_symbol(path):
@@ -139,3 +149,251 @@ def test_index_built_from_a_real_indexed_src_layout_repo():
 
     assert index["mypackage.foo"] == ["src/mypackage/foo.py"]
     assert index["mypackage.bar"] == ["src/mypackage/bar.py"]
+
+
+# ---------------------------------------------------------------------------
+# architecture() -- v1 slice C2, file granularity only.
+# ---------------------------------------------------------------------------
+
+
+def _stores():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    return symbol_store, relation_store, index_meta_store
+
+
+def _index(symbol_store, relation_store, index_meta_store, path, source_text):
+    index_file(
+        path=path, source_text=source_text, observed_at=_OBSERVED_AT,
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+    )
+
+
+def test_empty_repo_produces_no_nodes_or_edges():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["nodes"] == []
+    assert result["edges"] == []
+    assert result["truncated"] is False
+
+
+def test_a_single_file_with_no_imports_is_one_node_with_zero_external_dependencies():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/mod.py", "def helper():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert len(result["nodes"]) == 1
+    assert result["nodes"][0]["path"] == "pkg/mod.py"
+    assert result["nodes"][0]["kind"] == "module"
+    assert result["nodes"][0]["external_dependency_count"] == 0
+    assert result["edges"] == []
+
+
+def test_a_resolvable_import_between_two_files_produces_one_edge():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/foo.py", "def helper():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/bar.py",
+        "from pkg.foo import helper\n\n\nhelper()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    paths = {node["path"] for node in result["nodes"]}
+    assert paths == {"pkg/foo.py", "pkg/bar.py"}
+    assert result["edges"] == [{"source": "pkg/bar.py", "target": "pkg/foo.py"}]
+    bar_node = next(node for node in result["nodes"] if node["path"] == "pkg/bar.py")
+    assert bar_node["external_dependency_count"] == 0
+
+
+def test_multiple_imports_of_the_same_target_file_collapse_to_one_edge():
+    # pkg/bar.py imports two distinct names from pkg/foo.py -- two `imports`
+    # relations at the symbol level, but only one file-level edge once
+    # rolled up (the whole point of an "aggregation view").
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/foo.py",
+        "def helper():\n    pass\n\n\ndef other():\n    pass\n",
+    )
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/bar.py",
+        "from pkg.foo import helper, other\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["edges"] == [{"source": "pkg/bar.py", "target": "pkg/foo.py"}]
+
+
+def test_an_unresolvable_import_increments_external_dependency_count_and_adds_no_node():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/mod.py", "import os\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert len(result["nodes"]) == 1
+    assert result["nodes"][0]["path"] == "pkg/mod.py"
+    assert result["nodes"][0]["external_dependency_count"] == 1
+    assert result["edges"] == []
+    assert all(node["path"] != "os" for node in result["nodes"])
+
+
+def test_root_scopes_nodes_to_files_under_that_path_prefix():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/sub/a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/subx/b.py", "def b():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/other/c.py", "def c():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, root="pkg/sub")
+
+    # "pkg/subx/b.py" must NOT match root="pkg/sub" (prefix boundary, not a
+    # bare string.startswith on the unnormalized root).
+    assert {node["path"] for node in result["nodes"]} == {"pkg/sub/a.py"}
+
+
+def test_root_none_includes_every_file_in_the_repo():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "b/c.py", "def c():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, root=None)
+
+    assert {node["path"] for node in result["nodes"]} == {"a.py", "b/c.py"}
+
+
+def test_root_matching_no_files_returns_an_empty_view_not_an_error():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "a.py", "def a():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, root="nowhere")
+
+    assert result["nodes"] == []
+    assert result["edges"] == []
+
+
+def test_an_import_resolving_outside_the_scoped_root_produces_no_edge_and_is_not_external():
+    # pkg/sub/a.py imports pkg/other/c.py -- resolves internally, but
+    # pkg/other/c.py is out of root="pkg/sub" scope, so no edge is rendered
+    # for it and it is NOT counted as an external dependency either (it did
+    # resolve within the repo -- it's just outside this view).
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/other/c.py", "def c():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/sub/a.py",
+        "from pkg.other.c import c\n\n\nc()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, root="pkg/sub")
+
+    assert len(result["nodes"]) == 1
+    assert result["nodes"][0]["path"] == "pkg/sub/a.py"
+    assert result["nodes"][0]["external_dependency_count"] == 0
+    assert result["edges"] == []
+
+
+def test_an_ambiguously_resolving_import_produces_an_edge_to_each_candidate():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "vendor_a/pkg/other.py", "def x():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "vendor_b/pkg/other.py", "def x():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "main.py",
+        "from pkg.other import x\n\n\nx()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["edges"] == [
+        {"source": "main.py", "target": "vendor_a/pkg/other.py"},
+        {"source": "main.py", "target": "vendor_b/pkg/other.py"},
+    ]
+
+
+def test_node_cap_truncates_the_node_list_and_sets_truncated_true():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "b.py", "def b():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, node_cap=1)
+
+    assert len(result["nodes"]) == 1
+    assert result["truncated"] is True
+
+
+def test_node_cap_not_exceeded_reports_truncated_false():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "a.py", "def a():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, node_cap=100)
+
+    assert result["truncated"] is False
+
+
+def test_non_positive_node_cap_raises_invalid_argument_error():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    try:
+        architecture(symbol_store, relation_store, index_meta_store, node_cap=0)
+        assert False, "expected InvalidArgumentError"
+    except InvalidArgumentError:
+        pass
+
+
+def test_unrecognized_granularity_raises_invalid_argument_error():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    try:
+        architecture(symbol_store, relation_store, index_meta_store, granularity="symbol")
+        assert False, "expected InvalidArgumentError"
+    except InvalidArgumentError:
+        pass
+
+
+def test_package_granularity_raises_invalid_argument_error_as_not_yet_supported():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    try:
+        architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+        assert False, "expected InvalidArgumentError"
+    except InvalidArgumentError as exc:
+        assert "package" in str(exc)
+
+
+def test_full_false_omits_confidence_and_provenance_on_nodes():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "a.py", "def a():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, full=False)
+
+    assert "confidence" not in result["nodes"][0]
+    assert "provenance" not in result["nodes"][0]
+
+
+def test_full_true_reveals_confidence_and_provenance_on_nodes():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "a.py", "def a():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, full=True)
+
+    assert result["nodes"][0]["confidence"] == "EXTRACTED"
+    assert result["nodes"][0]["provenance"]["provider"] == "tree-sitter"
+
+
+def test_index_generation_is_included_in_the_envelope():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["index_generation"] == index_meta_store.current_generation()
+
+
+def test_root_and_node_cap_are_echoed_in_the_envelope():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    result = architecture(symbol_store, relation_store, index_meta_store, root="pkg", node_cap=42)
+
+    assert result["root"] == "pkg"
+    assert result["node_cap"] == 42

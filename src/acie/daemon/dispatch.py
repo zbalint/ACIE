@@ -1,4 +1,4 @@
-"""RPC dispatch: wires the 9 pure-function MCP tools to incoming requests.
+"""RPC dispatch: wires the 10 pure-function MCP tools to incoming requests.
 
 See DAEMON.md "RPC Dispatch". Still no real socket/thread I/O in this
 slice -- the daemon server's accept-loop/threading is a later slice.
@@ -22,6 +22,7 @@ from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
 from acie.tools.affected_tests import affected_tests
+from acie.tools.architecture import architecture
 from acie.tools.errors import AcieToolError
 from acie.tools.explain import explain
 from acie.tools.find_references import find_references
@@ -43,6 +44,7 @@ DISPATCH_TABLE: dict[str, Callable[..., dict]] = {
     "impact_analysis": impact_analysis,
     "explain": explain,
     "affected_tests": affected_tests,
+    "architecture": architecture,
 }
 
 # Extensions/dirs skipped when structural_search's disk-I/O seam walks a

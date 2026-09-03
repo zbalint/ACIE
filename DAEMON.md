@@ -45,17 +45,17 @@ Loopback TCP, `127.0.0.1:<port>` — the port read from the discovery file each 
 
 ## RPC Dispatch
 
-The daemon wires the 9 already-implemented pure functions (`src/acie/tools/*.py`) to incoming requests via a `DISPATCH_TABLE: dict[str, Callable]`, keyed verbatim on the 9 locked tool names — `method` equals the key exactly, with no namespacing:
+The daemon wires the 10 already-implemented pure functions (`src/acie/tools/*.py`) to incoming requests via a `DISPATCH_TABLE: dict[str, Callable]`, keyed verbatim on the 10 locked tool names — `method` equals the key exactly, with no namespacing:
 
 ```
 find_symbol | get_definition | find_references | list_imports
-structural_search | graph | impact_analysis | explain | affected_tests
+structural_search | graph | impact_analysis | explain | affected_tests | architecture
 ```
 
 Adapted from SALTMDB's `daemon/dispatch.py`, simplified for ACIE's shape:
 
 - **No per-tool kwarg-coercion wrapper** — ACIE's tool functions already validate their own inputs.
-- **No mutating/coordinator-submit split** — all 9 tools are read-only (per `ARCHITECTURE.md`'s MCP tool-annotation rule), so none of them touch the write queue described below.
+- **No mutating/coordinator-submit split** — all 10 tools are read-only (per `ARCHITECTURE.md`'s MCP tool-annotation rule), so none of them touch the write queue described below.
 - **`repo_path` is a new top-level envelope field**, sibling to `id`/`token`/`method`/`params`. The connect-per-call model has no session to carry repo identity forward implicitly, so dispatch resolves `repo_path` to store instances on every call.
 
 **Store lifecycle: fresh-per-call.** New `SymbolStore`/`RelationStore`/`IndexMetaStore` instances (and their SQLite connections) are constructed on every RPC and never cached. This is the deliberately simpler default: `sqlite3` connections aren't thread-safe by default, and request threads run genuinely concurrently (see "Write-Queue Concurrency"), so a shared cache would need its own concurrency story with no measured need yet to justify that complexity. Revisit only if profiling demands it.
