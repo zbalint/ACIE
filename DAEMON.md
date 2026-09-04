@@ -129,6 +129,8 @@ When `extract_staleness_target` returns a path, `ensure_fresh` submits `make_rei
 
 This idle-timeout teardown is intentionally distinct from the `WriteQueue` shortcut above: write-queue threads still have no idle teardown, and this subsystem does not alter that decision.
 
+**Resolved during implementation** (`src/acie/daemon/lsp_protocol.py`, `src/acie/daemon/lsp_client.py`): `LspClient` layers the external LSP Content-Length JSON-RPC conversation over D1's already-live child pipes without taking process-lifecycle ownership. It performs the required `initialize`/`initialized` handshake, serializes concurrent writes, hands request results back through `Future` instances, replies safely to unsolicited server requests, and resolves pending requests when stdout closes; `close()` attempts only the LSP `shutdown`/`exit` exchange and never terminates D1's `Popen`. This remains standalone infrastructure: no runtime, dispatch, or MCP-tool wiring occurs until later D3/D6 slices.
+
 ## Auth Token Stance
 
 **No enforcement in v0.** ACIE holds no sensitive data and is a single-machine, single-user local dev tool binding only to `127.0.0.1` — SALTMDB's token-in-discovery-file precedent (defending against another local process connecting to the wrong daemon) was judged unwarranted here.
