@@ -196,6 +196,32 @@ def test_concurrent_registers_from_multiple_threads_only_walk_once(tmp_path):
     write_queue.close()
 
 
+def test_migration_check_does_not_raise_unhandled_when_the_write_queue_is_already_closed(tmp_path):
+    # Adjacent to SALTMDB bf5a5a98's write_queue.close() ordering fix: once
+    # that fix makes a submit() landing after close() *reliably* raise
+    # instead of the old code's alternative -- a job silently left
+    # hanging forever on a Future nothing ever resolves -- this call
+    # site's missing try/except turned that new reliability into an
+    # uncaught exception in a background daemon thread (surfaced as
+    # pytest's PytestUnhandledThreadExceptionWarning once close() started
+    # reliably rejecting the race in test_concurrent_registers_from_
+    # multiple_threads_only_walk_once). Match the walk-failure branch's
+    # own best-effort handling a few lines below: discard from
+    # _migration_checked so a later register() can retry, don't crash the
+    # thread.
+    coordinator, write_queue, db_path_for = _make_coordinator(tmp_path, files_by_repo={})
+    sqlite3.connect(db_path_for("repo-a")).close()  # already-ready: pre-existing index.sqlite
+    write_queue.close()
+
+    with coordinator._lock:
+        coordinator._migration_checked.add("repo-a")
+
+    coordinator._run_cross_file_migration_if_needed("repo-a", "repo-a")  # must not raise
+
+    with coordinator._lock:
+        assert "repo-a" not in coordinator._migration_checked, "should be retryable, not permanently marked checked"
+
+
 def test_register_still_becomes_ready_when_every_files_write_queue_submission_fails(tmp_path):
     # Regression: WriteQueue.submit() returns an already-failed Future
     # without ever invoking the job closure when writer startup itself

@@ -221,6 +221,108 @@ def test_close_is_bounded_and_warns_when_a_writer_thread_is_stuck(caplog):
     release.set()  # let the stuck job/writer thread actually finish, no leak past this test
 
 
+def test_close_does_not_drop_a_job_submitted_by_an_in_flight_completion_callback():
+    # SALTMDB bf5a5a98: a Future's done-callbacks run synchronously on
+    # whichever thread calls set_result() -- for a write-queue job, that's
+    # the repo's own writer thread, still inside _run()'s loop, *before* it
+    # loops back to fetch its next item. A caller that infers "the queue is
+    # done" from the first job's own effect and immediately calls close()
+    # (BootstrapCoordinator's on_job_done -> _mark_ready/
+    # _mark_cross_file_migration_done -> write_queue.submit() is exactly
+    # this shape) can race close()'s STOP-sentinel enqueue against that
+    # callback's own submit() for the very same worker's queue. If STOP
+    # lands first, the writer dequeues it and returns before the
+    # callback's follow-up job is ever processed -- silently dropped, not
+    # errored, not logged.
+    #
+    # This test doesn't rely on timing luck to reproduce that: it forces
+    # the worst-case ordering explicitly (close() call started and given a
+    # head start before the completion callback is allowed to submit) so
+    # only a real ordering guarantee -- not chance -- can make the
+    # assertion below pass.
+    #
+    # first_job_may_finish also removes a *second*, independent race that
+    # isn't this test's target: concurrent.futures.Future.add_done_callback
+    # on an ALREADY-done future runs the callback immediately, synchronously,
+    # on whichever thread calls add_done_callback -- not the writer thread --
+    # per CPython's own Future implementation. For a trivial job (like a
+    # bare `lambda conn: None`), the writer thread can finish it before this
+    # test's main thread even reaches `.add_done_callback()`, which would
+    # make on_first_job_done run on the wrong thread and turn this into a
+    # test of a different (much narrower -- real index_file() work is never
+    # this fast) race than the one this test documents. Blocking first_job
+    # until add_done_callback is confirmed attached pins the callback to the
+    # writer thread, as SALTMDB bf5a5a98's reproduction actually observed.
+    wq = WriteQueue(db_path_for=lambda repo_key: ":memory:")
+    callback_may_submit = threading.Event()
+    follow_up_ran = threading.Event()
+    first_job_may_finish = threading.Event()
+
+    def first_job(conn):
+        first_job_may_finish.wait(timeout=5)
+        return None
+
+    def on_first_job_done(_future):
+        # Runs synchronously on the writer thread (Future contract).
+        callback_may_submit.wait(timeout=5)
+        wq.submit("repo-a", lambda conn: follow_up_ran.set())
+
+    wq.submit("repo-a", first_job).add_done_callback(on_first_job_done)
+    first_job_may_finish.set()
+
+    close_thread = threading.Thread(target=wq.close, daemon=True)
+    close_thread.start()
+    time.sleep(0.05)  # give close() every chance to enqueue STOP first
+    callback_may_submit.set()
+    close_thread.join(timeout=5)
+
+    assert not close_thread.is_alive(), "close() never returned"
+    assert follow_up_ran.wait(timeout=1), "completion callback's own submit() was silently dropped"
+
+
+def test_close_racing_immediately_after_submit_still_waits_for_that_jobs_own_follow_up():
+    # A first fix attempt for bf5a5a98 held a per-worker lock only *during*
+    # a job's execution (fn(conn) through future.set_result()) -- that
+    # closes the narrower window the test above targets, but not this
+    # wider one: close() can also race in and enqueue _STOP the instant a
+    # job is accepted, *before the writer thread has even dequeued it*
+    # (verified failing >50% of the time under stress once instrumented,
+    # 2026-09-04). The fix that actually holds is _RepoWriter._in_flight,
+    # incremented atomically with the enqueue at submit() time rather than
+    # at dequeue/execution time -- this test pins that earlier race point
+    # directly by starting close() as early as physically possible, right
+    # after the very first submit(), with no artificial head start needed.
+    #
+    # first_job_may_finish blocks the job itself (same technique as the
+    # test above, same reason: add_done_callback on an already-done future
+    # runs the callback on whichever thread calls add_done_callback, not
+    # necessarily the writer thread -- irrelevant to *this* test's target
+    # race, so it's pinned out rather than left to chance).
+    wq = WriteQueue(db_path_for=lambda repo_key: ":memory:")
+    callback_may_submit = threading.Event()
+    follow_up_ran = threading.Event()
+    first_job_may_finish = threading.Event()
+
+    def first_job(conn):
+        first_job_may_finish.wait(timeout=5)
+        return None
+
+    def on_first_job_done(_future):
+        callback_may_submit.wait(timeout=5)
+        wq.submit("repo-a", lambda conn: follow_up_ran.set())
+
+    first_future = wq.submit("repo-a", first_job)
+    close_thread = threading.Thread(target=wq.close, daemon=True)
+    close_thread.start()  # started immediately -- no window for the writer to even begin the first job
+    first_future.add_done_callback(on_first_job_done)
+    first_job_may_finish.set()
+    callback_may_submit.set()
+    close_thread.join(timeout=5)
+
+    assert not close_thread.is_alive(), "close() never returned"
+    assert follow_up_ran.wait(timeout=1), "completion callback's own submit() was silently dropped"
+
+
 def test_submit_after_close_fails_fast_instead_of_enqueueing_into_a_dead_worker():
     # codex review, 2026-09-02: _workers' entries are never removed by
     # close(), so a submit() landing after a repo's writer thread has

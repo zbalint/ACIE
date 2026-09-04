@@ -177,7 +177,20 @@ class BootstrapCoordinator:
         def check_job(conn) -> bool:
             return IndexMetaStore(conn=conn).cross_file_pass_done()
 
-        already_done = self._write_queue.submit(repo_id, check_job).result()
+        try:
+            already_done = self._write_queue.submit(repo_id, check_job).result()
+        except BaseException:
+            # Best-effort catch-up, same as the walk-failure handling
+            # below: repo_ready() was already true before this ran, so a
+            # submit failure here (most commonly the write queue already
+            # closing -- SALTMDB bf5a5a98's fix made that race reliably
+            # raise instead of silently hanging this thread's .result()
+            # forever) must not affect it, and there is no INDEX_NOT_READY
+            # state to fall back into. Discard so a later register() call
+            # can retry.
+            with self._lock:
+                self._migration_checked.discard(repo_id)
+            return
         if already_done:
             return
 
