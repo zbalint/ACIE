@@ -865,3 +865,218 @@ def test_malformed_acie_config_raises_invalid_config_error(tmp_path):
         assert False, "expected InvalidConfigError"
     except InvalidConfigError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# architecture() -- v1 slice C6, cycle detection.
+# ---------------------------------------------------------------------------
+
+
+def test_no_cycles_produces_an_empty_cycles_list():
+    # `cycles` is unconditional: an acyclic graph reports its absence as []
+    # rather than omitting the field.
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "def a():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["cycles"] == []
+
+
+def test_two_files_importing_each_other_produce_a_two_node_cycle():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "from pkg.b import b\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "from pkg.a import a\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["cycles"] == [{"nodes": ["pkg/a.py", "pkg/b.py"]}]
+
+
+def test_three_files_in_a_directed_ring_are_reported_as_one_cycle():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "from pkg.b import b\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "from pkg.c import c\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/c.py", "from pkg.a import a\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["cycles"] == [{"nodes": ["pkg/a.py", "pkg/b.py", "pkg/c.py"]}]
+
+
+def test_a_file_importing_itself_is_reported_as_a_one_node_cycle():
+    # Same fixture shape as the C2 self-loop edge test: a real same-file
+    # import is the one allowed singleton SCC.
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/foo.py",
+        "from pkg.foo import helper\n\n\ndef helper():\n    pass\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["cycles"] == [{"nodes": ["pkg/foo.py"]}]
+
+
+def test_a_file_with_no_self_loop_and_no_incoming_edge_is_not_a_cycle():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "def a():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["cycles"] == []
+
+
+def test_a_diamond_import_shape_produces_no_cycle():
+    # A -> B, A -> C, B -> D, C -> D has shared endpoints but no return
+    # path; SCC membership must not mistake it for a loop.
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "from pkg.b import b\nfrom pkg.c import c\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "from pkg.d import d\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/c.py", "from pkg.d import d\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/d.py", "def d():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["cycles"] == []
+
+
+def test_two_independent_cycles_are_both_reported():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "from pkg.b import b\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "from pkg.a import a\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/x.py", "from pkg.y import y\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/y.py", "from pkg.x import x\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["cycles"] == [
+        {"nodes": ["pkg/a.py", "pkg/b.py"]},
+        {"nodes": ["pkg/x.py", "pkg/y.py"]},
+    ]
+
+
+def test_a_larger_strongly_connected_component_is_reported_with_all_members():
+    # This SCC contains more than one simple cycle; report its complete
+    # membership instead of selecting an arbitrary cycle path.
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "from pkg.b import b\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "from pkg.c import c\nfrom pkg.d import d\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/c.py", "from pkg.d import d\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/d.py", "from pkg.a import a\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["cycles"] == [{"nodes": ["pkg/a.py", "pkg/b.py", "pkg/c.py", "pkg/d.py"]}]
+
+
+def test_cycle_nodes_are_sorted_alphabetically_within_each_cycle():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/z.py", "from pkg.a import a\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "from pkg.z import z\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["cycles"] == [{"nodes": ["pkg/a.py", "pkg/z.py"]}]
+
+
+def test_cycles_list_is_sorted_by_first_member_for_determinism():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/y.py", "from pkg.z import z\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/z.py", "from pkg.y import y\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "from pkg.c import c\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/c.py", "from pkg.b import b\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["cycles"] == [
+        {"nodes": ["pkg/b.py", "pkg/c.py"]},
+        {"nodes": ["pkg/y.py", "pkg/z.py"]},
+    ]
+
+
+def test_cycles_are_computed_at_file_granularity_even_when_package_granularity_is_requested():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg_a/a.py", "from pkg_b.b import b\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg_b/b.py", "from pkg_a.a import a\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, granularity="package")
+
+    assert result["cycles"] == [{"nodes": ["pkg_a/a.py", "pkg_b/b.py"]}]
+
+
+def test_cycles_are_not_scoped_by_node_cap():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "from pkg.z import z\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/z.py", "from pkg.a import a\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, node_cap=1)
+
+    assert result["cycles"] == [{"nodes": ["pkg/a.py", "pkg/z.py"]}]
+
+
+def test_cycles_respect_root_scope():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "outside/a.py", "from outside.b import b\n")
+    _index(symbol_store, relation_store, index_meta_store, "outside/b.py", "from outside.a import a\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/only.py", "def only():\n    pass\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, root="pkg")
+
+    assert result["cycles"] == []
+
+
+def test_a_cycle_broken_by_root_scope_is_not_reported():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "from outside.b import b\n")
+    _index(symbol_store, relation_store, index_meta_store, "outside/b.py", "from pkg.a import a\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store, root="pkg")
+
+    assert result["cycles"] == []
+
+
+def test_cycles_present_even_with_no_acie_config():
+    # Layering is disabled without `repo_root`, but cycle detection is a
+    # property of the indexed import graph and therefore still runs.
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "from pkg.b import b\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "from pkg.a import a\n")
+
+    result = architecture(symbol_store, relation_store, index_meta_store)
+
+    assert result["layering_enabled"] is False
+    assert result["cycles"] == [{"nodes": ["pkg/a.py", "pkg/b.py"]}]
+
+
+def test_full_true_has_no_effect_on_cycle_entries():
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "from pkg.b import b\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/b.py", "from pkg.a import a\n")
+
+    terse = architecture(symbol_store, relation_store, index_meta_store, full=False)
+    full = architecture(symbol_store, relation_store, index_meta_store, full=True)
+
+    assert full["cycles"] == terse["cycles"] == [{"nodes": ["pkg/a.py", "pkg/b.py"]}]
+
+
+def test_layer_violations_still_correct_after_the_file_edges_hoist(tmp_path):
+    _write_layer_config(
+        tmp_path,
+        {
+            "layers": {"api": ["pkg/api/*"], "core": ["pkg/core/*"]},
+            "allowed_dependencies": {"api": ["core"]},
+        },
+    )
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/api/a.py", "def a():\n    pass\n")
+    _index(
+        symbol_store, relation_store, index_meta_store, "pkg/core/b.py",
+        "from pkg.api.a import a\n\n\na()\n",
+    )
+
+    result = architecture(symbol_store, relation_store, index_meta_store, repo_root=str(tmp_path))
+
+    assert result["layer_violations"] == [
+        {"source": "pkg/core/b.py", "target": "pkg/api/a.py", "from_layer": "core", "to_layer": "api"}
+    ]

@@ -1,9 +1,8 @@
 """architecture: module/package-aggregation MCP tool (v1 capability C,
 wayfinder ticket 47d8cd0d).
 
-**Slices C1-C5** -- cycle detection (C6, a `cycles` field) is not yet
-built (see wayfinder map 5d8fa498's "Decisions so far" / memory 3627eece
-for the full C1-C6 breakdown).
+**Slices C1-C6** -- Capability C is complete: C6 adds the unconditional
+`cycles` field (file-granularity iterative Tarjan SCC detection).
 
 ## The gap C1 closes
 
@@ -101,9 +100,10 @@ Seam decisions:
    non-traversal shape allows.
 7. **`root` and `granularity` are echoed in the envelope** (`{
    index_generation, root, granularity, nodes, edges, node_cap,
-   truncated, layering_enabled, layer_violations}` as of C5, below --
+   truncated, layering_enabled, layer_violations, cycles}` as of C6 --
    nodes/edges/truncated are C2/C3's own; layering_enabled/layer_violations
-   are C5's) -- same rationale as `affected_tests` echoing `root`: unlike
+   are C5's; cycles is C6's) -- same rationale as `affected_tests` echoing
+   `root`: unlike
    `graph`'s symbol-id root (which is directly visible as one of the
    returned nodes), a path-prefix `root` is not otherwise recoverable from
    `nodes` alone (an empty-scope result looks identical for any
@@ -225,6 +225,37 @@ predicted this tool would need to decide).
     self-import edge classified into more than one layer, where a
     disallowed combination among that file's own multiple classifications
     is still a real, reportable violation even though `source == target`.
+
+## C6: cycle detection
+
+15. **Cycles always use file-granularity edges**, regardless of the requested
+    node/edge `granularity`. Package rollups can create reciprocal directory
+    edges without any file-level loop, so only file-level SCCs mean a real
+    import cycle.
+16. **`cycles` is unconditional in the response envelope.** It needs no
+    layer configuration; `layering_enabled=False` does not suppress it.
+17. **Cycles ignore `node_cap`** and use the full root-scoped `in_scope`
+    graph. A display cap must not hide a real cycle; root scope still
+    applies because out-of-scope endpoints never enter the edge set.
+18. **Cycle discovery is iterative Tarjan SCC**, O(V+E), rather than a
+    recursive DFS so a long acyclic import chain cannot exceed Python's
+    recursion limit. `_find_cycles` stays local to this module: no second
+    ACIE caller needs general SCC machinery.
+19. **Each entry names complete non-trivial SCC membership.** A component
+    with at least two files is a cycle; a singleton is one only when its
+    file-edge self-loop exists. This reports every member rather than
+    selecting an arbitrary simple-cycle path from a larger SCC.
+20. **Ordering is deterministic:** sort nodes inside each component, then
+    sort cycle entries by their first node path.
+21. **`full` has no effect on cycles:** SCC membership has no confidence or
+    provenance to expose.
+22. **No new errors or inputs** are needed; cycle detection operates solely
+    on data `architecture()` already indexes.
+23. **The full file-edge computation is hoisted into `architecture()` and
+    shared** by C2/C3 rendering, C5 layer-violation detection, and C6 cycle
+    detection. Each consumer filters that one result to its own display or
+    policy scope without revisiting import relations; layering still returns
+    immediately without iterating edges when it is not configured.
 """
 
 from acie.layer_config import LayerConfig, classify_layers, is_dependency_allowed, load_layer_config
@@ -297,14 +328,23 @@ def architecture(
     all_modules = symbol_store.search(qualname_substring="", kind="module")
     in_scope = [module for module in all_modules if _in_scope(module.path, root)]
 
+    file_edges, external_dependency_count = _compute_file_edges(
+        in_scope, relation_store, dotted_name_index,
+    )
+    node_paths = {module.path for module in in_scope}
+
     if granularity == "file":
-        nodes, edges, truncated = _file_granularity(in_scope, relation_store, dotted_name_index, node_cap, full)
+        nodes, edges, truncated = _file_granularity(
+            in_scope, file_edges, external_dependency_count, node_cap, full,
+        )
     else:
-        nodes, edges, truncated = _package_granularity(in_scope, relation_store, dotted_name_index, node_cap)
+        nodes, edges, truncated = _package_granularity(
+            in_scope, file_edges, external_dependency_count, node_cap,
+        )
 
     layer_config = _load_layer_config_or_raise(repo_root)
-    layer_violations = _detect_layer_violations(in_scope, relation_store, dotted_name_index, layer_config)
-
+    layer_violations = _detect_layer_violations(file_edges, layer_config)
+    cycles = _find_cycles(file_edges, node_paths)
     return {
         "index_generation": index_generation,
         "root": root,
@@ -315,19 +355,16 @@ def architecture(
         "truncated": truncated,
         "layering_enabled": layer_config is not None,
         "layer_violations": layer_violations,
+        "cycles": [{"nodes": cycle} for cycle in cycles],
     }
 
 
 def _compute_file_edges(scoped_modules, relation_store, dotted_name_index):
-    """The file-to-file edge computation shared by `_file_granularity`
-    (C2's own node/edge rendering) and `_detect_layer_violations` (C5):
-    walking `scoped_modules`' `imports` relations and resolving each
-    target via C1's dotted-name index. Extracted so C5 can get the same
-    always-file-level edge set `_file_granularity` already computes
-    without copy-pasting the relation-walk loop -- see `_detect_layer_
-    violations`'s docstring for why layering-violation detection always
-    calls this directly, regardless of which `granularity` the caller
-    requested for nodes/edges.
+    """Compute full root-scoped file edges and external-import counts once.
+
+    C2/C3 rendering, C5 layer-violation detection, and C6 cycle detection
+    all consume this result; the renderers filter it to their capped display
+    views without revisiting `RelationStore`.
     """
     node_paths = {module.path for module in scoped_modules}
     edges: set[tuple[str, str]] = set()
@@ -346,10 +383,75 @@ def _compute_file_edges(scoped_modules, relation_store, dotted_name_index):
     return edges, external_dependency_count
 
 
-def _file_granularity(in_scope, relation_store, dotted_name_index, node_cap, full):
+def _find_cycles(file_edges: set[tuple[str, str]], node_paths: set[str]) -> list[list[str]]:
+    """Return sorted membership lists for every non-trivial file SCC.
+
+    Iterative Tarjan DFS avoids recursion-depth failures on long import
+    chains. Initializing every `node_paths` member makes the explicit
+    singleton-exclusion check below cover isolated files too.
+    """
+    adjacency: dict[str, list[str]] = {path: [] for path in node_paths}
+    for source, target in file_edges:
+        adjacency[source].append(target)
+
+    indices: dict[str, int] = {}
+    lowlinks: dict[str, int] = {}
+    active: set[str] = set()
+    component_stack: list[str] = []
+    cycles: list[list[str]] = []
+    next_index = 0
+
+    for start in adjacency:
+        if start in indices:
+            continue
+        indices[start] = lowlinks[start] = next_index
+        next_index += 1
+        active.add(start)
+        component_stack.append(start)
+        dfs_stack = [(start, iter(adjacency[start]))]
+
+        while dfs_stack:
+            node, neighbors = dfs_stack[-1]
+            try:
+                neighbor = next(neighbors)
+            except StopIteration:
+                dfs_stack.pop()
+                if lowlinks[node] == indices[node]:
+                    component = []
+                    while True:
+                        member = component_stack.pop()
+                        active.remove(member)
+                        component.append(member)
+                        if member == node:
+                            break
+                    if len(component) > 1 or (node, node) in file_edges:
+                        cycles.append(sorted(component))
+                if dfs_stack and node in active:
+                    parent, _ = dfs_stack[-1]
+                    lowlinks[parent] = min(lowlinks[parent], lowlinks[node])
+                continue
+
+            if neighbor not in indices:
+                indices[neighbor] = lowlinks[neighbor] = next_index
+                next_index += 1
+                active.add(neighbor)
+                component_stack.append(neighbor)
+                dfs_stack.append((neighbor, iter(adjacency[neighbor])))
+            elif neighbor in active:
+                lowlinks[node] = min(lowlinks[node], indices[neighbor])
+
+    return sorted(cycles, key=lambda cycle: cycle[0])
+
+
+def _file_granularity(in_scope, file_edges, external_dependency_count, node_cap, full):
     truncated = len(in_scope) > node_cap
     scoped_modules = in_scope[:node_cap]
-    edges, external_dependency_count = _compute_file_edges(scoped_modules, relation_store, dotted_name_index)
+    scoped_paths = {module.path for module in scoped_modules}
+    edges = {
+        (source, target)
+        for source, target in file_edges
+        if source in scoped_paths and target in scoped_paths
+    }
 
     nodes = []
     for module in scoped_modules:
@@ -360,32 +462,30 @@ def _file_granularity(in_scope, relation_store, dotted_name_index, node_cap, ful
     return nodes, [{"source": s, "target": t} for s, t in sorted(edges)], truncated
 
 
-def _package_granularity(in_scope, relation_store, dotted_name_index, node_cap):
+def _package_granularity(in_scope, file_edges, file_external_dependency_count, node_cap):
     module_dir = {module.path: _package_dir(module.path) for module in in_scope}
     all_dirs = sorted(set(module_dir.values()))
     truncated = len(all_dirs) > node_cap
     scoped_dirs = set(all_dirs[:node_cap])
-    scoped_modules = [module for module in in_scope if module_dir[module.path] in scoped_dirs]
 
-    edges: set[tuple[str, str]] = set()
-    external_dependency_count: dict[str, int] = {d: 0 for d in scoped_dirs}
-    for module in scoped_modules:
+    external_dependency_count: dict[str, int] = {directory: 0 for directory in scoped_dirs}
+    for module in in_scope:
         source_dir = module_dir[module.path]
-        for relation in relation_store.list_by_source(module.id, predicates={"imports"}):
-            candidates = _resolve_import_target(relation.target, dotted_name_index)
-            if not candidates:
-                external_dependency_count[source_dir] += 1
-                continue
-            for candidate_path in candidates:
-                candidate_dir = _package_dir(candidate_path)
-                if candidate_dir != source_dir and candidate_dir in scoped_dirs:
-                    edges.add((source_dir, candidate_dir))
+        if source_dir in scoped_dirs:
+            external_dependency_count[source_dir] += file_external_dependency_count[module.path]
 
+    edges = {
+        (module_dir[source], module_dir[target])
+        for source, target in file_edges
+        if module_dir[source] in scoped_dirs
+        and module_dir[target] in scoped_dirs
+        and module_dir[source] != module_dir[target]
+    }
     nodes = [
-        {"path": d, "kind": "package", "external_dependency_count": external_dependency_count[d]}
-        for d in sorted(scoped_dirs)
+        {"path": directory, "kind": "package", "external_dependency_count": external_dependency_count[directory]}
+        for directory in sorted(scoped_dirs)
     ]
-    return nodes, [{"source": s, "target": t} for s, t in sorted(edges)], truncated
+    return nodes, [{"source": source, "target": target} for source, target in sorted(edges)], truncated
 
 
 def _package_dir(path: str) -> str:
@@ -461,10 +561,10 @@ def _load_layer_config_or_raise(repo_root: str | None) -> LayerConfig | None:
         raise InvalidConfigError(str(exc)) from exc
 
 
-def _detect_layer_violations(in_scope, relation_store, dotted_name_index, layer_config):
-    """Layering-violation detection (C5), always over `in_scope`'s full
-    file-granularity edge set, regardless of the `granularity` the caller
-    requested for `nodes`/`edges` and regardless of `node_cap`:
+def _detect_layer_violations(file_edges, layer_config):
+    """Layering-violation detection (C5), always over the supplied full
+    root-scoped file-granularity edge set, regardless of the caller's
+    `granularity` or `node_cap`:
 
     - **Always file granularity, never package.** Memory `b75c92b3`: a
       naturally-authored layer glob like `"pkg/api/*"` matches every file
@@ -473,20 +573,10 @@ def _detect_layer_violations(in_scope, relation_store, dotted_name_index, layer_
       needs something after it). `classify_layers` was only ever validated
       against file-shaped paths, so calling it with a package-granularity
       directory path would silently fail to classify most real configs.
-      Recomputing file-level edges here (via `_compute_file_edges`, shared
-      with `_file_granularity`) sidesteps the gap entirely rather than
-      teaching `classify_layers` a second path shape it was never designed
-      for -- also the only level at which a violation can cite the actual
-      offending file (memory `95ced07b`'s other concern: a package-level
-      violation can't name a file, since package nodes carry no file
-      list).
-    - **Ignores `node_cap`.** `node_cap` bounds response size for
-      *rendered* nodes/edges, a display concern; a layering policy check
-      silently missing a real violation because the caller asked for a
-      small page of nodes would be a worse failure mode than the extra
-      work of walking the full (still `root`-scoped) `in_scope` set. Costs
-      nothing when `layer_config` is `None` -- this function isn't called
-      with a `None` config in that case (see `architecture()`).
+      The shared full edge walk now happens unconditionally in
+      `architecture()` for C6 cycle detection; when `layer_config` is
+      `None`, this function still skips all violation-detection work and
+      returns `[]` without iterating `file_edges`.
     - **Still respects `root`.** `in_scope` is already root-filtered by
       the time this runs (`architecture()` computes it once for both
       granularities); an edge with either endpoint outside `root`'s scope
@@ -510,7 +600,6 @@ def _detect_layer_violations(in_scope, relation_store, dotted_name_index, layer_
     """
     if layer_config is None:
         return []
-    file_edges, _ = _compute_file_edges(in_scope, relation_store, dotted_name_index)
 
     violations = []
     for source, target in sorted(file_edges):
