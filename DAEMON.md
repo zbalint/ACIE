@@ -135,6 +135,17 @@ This idle-timeout teardown is intentionally distinct from the `WriteQueue` short
 
 **Resolved during implementation** (`src/acie/daemon/merge_policy.py`): `apply_enrichment_write()` enforces D4's write-time merge rule inside the queue job, refusing an enrichment write that would regress a more-certain existing relation such as `EXTRACTED`, then writing the winner before retiring same-source, same-site, different-target `AMBIGUOUS` sibling rows. Cross-pass `INFERRED` reconciliation, transaction wrapping across the write and retire calls, and trigger cadence remain outside this slice.
 
+## Scan CLI (Pre-Warming Convenience)
+
+`acie scan [path]` is a blocking, foreground convenience command for pre-warming a repository after cloning or before a CI/tooling step. It is never load-bearing: the daemon's own on-demand `BootstrapCoordinator` path remains fully sufficient, and no daemon, socket, RPC, discovery file, or MCP surface is involved.
+
+The command resolves the repository, walks its `.gitignore`-aware Python source files, submits every file through the per-repo write queue for two complete indexing passes, then runs one opportunistic pyright enrichment pass. The second indexing pass matches daemon bootstrap's cross-file resolution discipline, so arbitrary walk order does not leave resolvable calls, inherits, or overrides incomplete.
+
+After the second pass, the scan writes the existing `index_meta` cross-file-pass migration marker through the same write queue. A later daemon touch therefore sees both a ready `index.sqlite` and a completed current cross-file pass, performing zero redundant bootstrap migration work.
+
+This slice promotes `make_index_job()` in `daemon/bootstrap.py` so foreground callers can observe `IndexResult` values, and promotes the `.gitignore`-aware `walk_repo()` composition into `daemon/dispatch.py` so the daemon and scan share exactly the same source scope. Enrichment remains opportunistic: if pyright is unavailable, indexing still completes successfully with zero enriched relations.
+
+
 ## Auth Token Stance
 
 **No enforcement in v0.** ACIE holds no sensitive data and is a single-machine, single-user local dev tool binding only to `127.0.0.1` — SALTMDB's token-in-discovery-file precedent (defending against another local process connecting to the wrong daemon) was judged unwarranted here.
@@ -164,6 +175,7 @@ Stdlib `argparse` — no new dependency. Entry-point wiring: `src/acie/cli.py` +
 | `acie daemon start` | Backgrounds by default via the same internal spawn target the auto-spawn path uses (`subprocess.Popen([sys.executable, "-m", "acie.daemon.server"], start_new_session=True, ...)`). `--foreground` runs that module's main loop directly in the current process — the shape needed for `systemd`/container supervision. |
 | `acie daemon stop` | Triggers the graceful shutdown RPC described above. |
 | `acie daemon status` | Plain-text by default; `--json` for machine-readable output. |
+| `acie scan [path]` | Blocking foreground full-pipeline convenience; pre-warms the repository's index and pyright enrichment without involving the daemon. |
 | `acie daemon restart` | **Does not exist** — use `stop`, then let the next `acie serve-mcp` auto-spawn a fresh daemon. |
 
 **Resolved during implementation** (2026-09-02, fixing SALTMDB `4083924d-ed96-4356-8002-c3ce224daeb5`'s two observability gaps): `acie daemon status` reports one of three states, not two — `running`, `shutting_down` (the daemon is mid-drain: still holding its port/PID, but answering everything except `shutdown` with `DAEMON_SHUTTING_DOWN`), or `stopped` (unreachable). `--json` emits `{"running": bool, "status": "..."}`, `running` being `true` only for the `running` state. `acie daemon stop`'s own `shutdown` RPC uses a client-side timeout of `_SHUTDOWN_DRAIN_TIMEOUT_SECONDS + 1.0` (currently 11s) rather than the transport's 2.0s default, since the RPC only responds once the server's whole drain has completed — a shorter client timeout made `stop`'s exit code meaningless for any drain slower than 2s.

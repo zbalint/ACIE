@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Callable, Iterable
 
 from acie.daemon.write_queue import WriteQueue
-from acie.indexer import index_file
+from acie.indexer import IndexResult, index_file
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
@@ -243,7 +243,7 @@ class BootstrapCoordinator:
                 on_pass_done()
 
         for path, source_text in files:
-            self._write_queue.submit(repo_id, _make_index_job(path, source_text)).add_done_callback(on_job_done)
+            self._write_queue.submit(repo_id, make_index_job(path, source_text)).add_done_callback(on_job_done)
 
     def _mark_ready(self, repo_id: str) -> None:
         with self._lock:
@@ -257,9 +257,9 @@ class BootstrapCoordinator:
         self._write_queue.submit(repo_id, mark_job)
 
 
-def _make_index_job(path: str, source_text: str):
-    def job(conn):
-        index_file(
+def make_index_job(path: str, source_text: str):
+    def job(conn) -> IndexResult:
+        return index_file(
             path=path, source_text=source_text,
             observed_at=datetime.now(timezone.utc).isoformat(),
             symbol_store=SymbolStore(conn=conn),

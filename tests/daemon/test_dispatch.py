@@ -1,6 +1,6 @@
 import subprocess
 
-from acie.daemon.dispatch import DISPATCH_TABLE, _read_source_files, dispatch_request
+from acie.daemon.dispatch import DISPATCH_TABLE, _read_source_files, dispatch_request, walk_repo
 from acie.daemon.protocol import build_request
 from acie.indexer import index_file
 from acie.repo_id import resolve_index_db_path
@@ -351,3 +351,15 @@ def test_dispatch_request_fills_architecture_repo_root_and_flags_a_real_layering
     assert response["result"]["layer_violations"] == [
         {"source": "pkg/core/b.py", "target": "pkg/api/a.py", "from_layer": "core", "to_layer": "api"}
     ]
+
+
+def test_walk_repo_returns_gitignore_aware_source_files(tmp_path):
+    repo = _git_repo(tmp_path)
+    (repo / "kept.py").write_text("def kept():\n    pass\n")
+    (repo / "generated.py").write_text("def generated():\n    pass\n")
+    ignored_dir = repo / "generated"
+    ignored_dir.mkdir()
+    (ignored_dir / "nested.py").write_text("def nested():\n    pass\n")
+    (repo / ".gitignore").write_text("generated.py\ngenerated/\n")
+
+    assert dict(walk_repo(str(repo))) == {"kept.py": "def kept():\n    pass\n"}

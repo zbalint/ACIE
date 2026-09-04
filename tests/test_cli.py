@@ -14,6 +14,7 @@ from acie.daemon.client import daemon_is_running
 from acie.daemon.discovery import read_discovery_file, write_discovery_file
 from acie.daemon.protocol import build_error_response, build_success_response
 from acie.daemon.server import DaemonServer
+from acie.scan import ScanResult
 
 
 def test_daemon_status_json_reports_stopped_when_no_discovery_file_exists(
@@ -266,3 +267,78 @@ def test_notify_hook_sends_the_agent_and_stdin_payload_to_the_daemon(monkeypatch
     assert received[0]["params"]["agent"] == "claude-code"
     assert received[0]["params"]["payload"] == '{"tool_input": {"file_path": "x.py"}}'
     assert received[0]["repo_path"] == str(tmp_path)
+
+
+def test_scan_cli_passes_path_and_prints_json_result(monkeypatch, capsys):
+    result = ScanResult(
+        repo_id="repo-id",
+        repo_root="/repo",
+        files_scanned=3,
+        files_failed=0,
+        symbols_upserted=4,
+        relations_upserted=5,
+        relations_enriched=2,
+        elapsed_seconds=1.25,
+    )
+    received = []
+    monkeypatch.setattr(acie.cli.scan, "run_scan", lambda path: received.append(path) or result)
+
+    assert main(["scan", "custom-repo", "--json"]) == 0
+
+    assert received == ["custom-repo"]
+    assert json.loads(capsys.readouterr().out) == {
+        "repo_id": "repo-id",
+        "repo_root": "/repo",
+        "files_scanned": 3,
+        "files_failed": 0,
+        "symbols_upserted": 4,
+        "relations_upserted": 5,
+        "relations_enriched": 2,
+        "elapsed_seconds": 1.25,
+    }
+
+
+def test_scan_cli_defaults_path_and_prints_human_summary(monkeypatch, capsys):
+    result = ScanResult("repo-id", "/repo", 3, 1, 4, 5, 2, 1.25)
+    received = []
+    monkeypatch.setattr(acie.cli.scan, "run_scan", lambda path: received.append(path) or result)
+
+    assert main(["scan"]) == 0
+
+    assert received == ["."]
+    assert capsys.readouterr().out == (
+        "Scanned /repo (repo-id): 3 files, 4 symbols, 5 relations indexed, "
+        "2 relations enriched via pyright, 1 failed. (1.2s)\n"
+    )
+
+
+def test_scan_cli_reports_scan_error_on_stderr(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(
+        acie.cli.scan,
+        "run_scan",
+        lambda path: (_ for _ in ()).throw(acie.cli.scan.ScanError("not a repository")),
+    )
+
+    assert main(["scan", str(tmp_path)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: not a repository\n"
+
+
+def test_scan_cli_configures_warning_logging(monkeypatch):
+    configured = []
+    monkeypatch.setattr(acie.cli.logging, "basicConfig", lambda **kwargs: configured.append(kwargs))
+    monkeypatch.setattr(acie.cli.scan, "run_scan", lambda path: ScanResult("id", "/repo", 0, 0, 0, 0, 0, 0.0))
+
+    assert main(["scan"]) == 0
+
+    assert configured == [{"level": acie.cli.logging.WARNING}]
+
+
+def test_scan_cli_reports_a_real_non_git_repository(tmp_path, capsys):
+    assert main(["scan", str(tmp_path)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"error: '{tmp_path}' is not inside a git repository\n"

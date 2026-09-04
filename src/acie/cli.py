@@ -1,7 +1,9 @@
 """Command-line entry point for ACIE's daemon lifecycle."""
 
 import argparse
+import dataclasses
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -11,6 +13,7 @@ from collections.abc import Sequence
 
 from acie.daemon.client import daemon_is_running, probe_daemon_status, request_daemon
 from acie.daemon.server import main as run_daemon_foreground
+from acie import scan
 from acie.mcp_server import run_stdio_server
 
 _STARTUP_ATTEMPTS = 25
@@ -32,6 +35,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     subcommands = parser.add_subparsers(dest="command", required=True)
     serve_mcp = subcommands.add_parser("serve-mcp")
     serve_mcp.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    scan = subcommands.add_parser("scan")
+    scan.add_argument("path", nargs="?", default=".")
+    scan.add_argument("--json", action="store_true")
     daemon = subcommands.add_parser("daemon")
     daemon_commands = daemon.add_subparsers(dest="daemon_command", required=True)
     start = daemon_commands.add_parser("start")
@@ -54,6 +60,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _daemon_status(as_json=args.json)
     if args.command == "notify-hook":
         return _notify_hook(agent=args.agent)
+    if args.command == "scan":
+        return _scan(path=args.path, as_json=args.json)
     parser.error("unsupported command")
 
 
@@ -71,6 +79,25 @@ def _serve_mcp(*, log_level: str) -> int:
     if not _ensure_daemon():
         return 1
     run_stdio_server(discovery_path=_discovery_path(), log_level=log_level)
+    return 0
+
+
+def _scan(*, path: str, as_json: bool) -> int:
+    logging.basicConfig(level=logging.WARNING)
+    try:
+        result = scan.run_scan(path)
+    except scan.ScanError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(dataclasses.asdict(result)))
+    else:
+        print(
+            f"Scanned {result.repo_root} ({result.repo_id}): {result.files_scanned} files, "
+            f"{result.symbols_upserted} symbols, {result.relations_upserted} relations indexed, "
+            f"{result.relations_enriched} relations enriched via pyright, "
+            f"{result.files_failed} failed. ({result.elapsed_seconds:.1f}s)"
+        )
     return 0
 
 

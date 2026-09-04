@@ -9,9 +9,8 @@ import logging
 import os
 import time
 
-from acie.daemon import ignore
 from acie.daemon.bootstrap import BootstrapCoordinator
-from acie.daemon.dispatch import _read_source_files, dispatch_request
+from acie.daemon.dispatch import dispatch_request, walk_repo
 from acie.daemon.notify_hook import handle_notify_hook
 from acie.daemon.protocol import build_error_response, build_success_response
 from acie.daemon.server import DaemonServer
@@ -104,9 +103,6 @@ def create_daemon(
         os.makedirs(repo_dir, exist_ok=True)
         return os.path.join(repo_dir, "index.sqlite")
 
-    def walk_repo(repo_root: str):
-        is_ignored = ignore.get_ignore_matcher(repo_root).matches
-        return _read_source_files(repo_root, path_glob=None, is_ignored=is_ignored).items()
 
     write_queue = WriteQueue(db_path_for=db_path_for)
     bootstrap = BootstrapCoordinator(

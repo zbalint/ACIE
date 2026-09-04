@@ -14,8 +14,9 @@ import fnmatch
 import inspect
 import os
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Callable, Iterable
 
+from acie.daemon import ignore
 from acie.daemon.protocol import build_error_response, build_success_response
 from acie.repo_id import resolve_index_db_path, resolve_repo_root
 from acie.storage.index_meta_store import IndexMetaStore
@@ -188,3 +189,8 @@ def _read_source_files(
             except (UnicodeDecodeError, OSError):
                 continue
     return files
+
+
+def walk_repo(repo_root: str) -> Iterable[tuple[str, str]]:
+    is_ignored = ignore.get_ignore_matcher(repo_root).matches
+    return _read_source_files(repo_root, path_glob=None, is_ignored=is_ignored).items()
