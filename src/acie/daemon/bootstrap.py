@@ -136,6 +136,29 @@ class BootstrapCoordinator:
             # treatment below -- mark the migration flag done too, so a
             # later daemon restart's register() call never redundantly
             # re-walks this repo a third time via _maybe_schedule_cross_file_migration.
+            #
+            # shortcut: _mark_ready() above flips repo_ready() to True
+            # synchronously, but _mark_cross_file_migration_done()'s DB
+            # write is fire-and-forget (no .result() wait) -- a concurrent
+            # register() for this same repo_id landing in that narrow,
+            # same-thread, no-yield gap could see repo_ready()==True, read
+            # a stale (not-yet-persisted) cross_file_pass_done() False, and
+            # re-run migration catch-up, firing on_indexed/trigger_enrichment
+            # a second time for this repo. Not closed here: reserving
+            # _migration_checked atomically with readiness was tried and
+            # reverted (it violated D6's locked no-extra-bootstrap-
+            # bookkeeping scope and incorrectly touched the empty-repo
+            # path too). Accepted as-is because the window requires an
+            # external register() call to win a race against the very next
+            # statement on this same thread, and the worst case is a
+            # harmless duplicate enrichment pass (independent threads,
+            # neither reentrant against the writer thread -- no deadlock,
+            # no corruption), not a correctness-destroying outcome.
+            # Upgrade trigger: an observed real repo where this actually
+            # double-fires -- at which point make
+            # _mark_cross_file_migration_done's DB write synchronous
+            # (submit(...).result()) before _mark_ready flips readiness,
+            # rather than reintroducing in-memory bookkeeping.
             self._mark_cross_file_migration_done(repo_id)
             self._on_indexed(repo_id, repo_root)
         # Second pass: os.walk's file-discovery order (this class's own
