@@ -82,6 +82,7 @@ class DaemonServer:
         discovery_path: str | None = None,
         auth_token: str | None = None,
         on_shutdown: Callable[[], None] | None = None,
+        exit_process: Callable[[], None] | None = None,
     ) -> None:
         self._dispatch = dispatch
         self._host = host
@@ -90,6 +91,14 @@ class DaemonServer:
         self._discovery_path = discovery_path
         self._auth_token = auth_token
         self._on_shutdown = on_shutdown
+        # Defaults to None (a no-op) so every existing in-process test that
+        # constructs a DaemonServer directly and sends it a real `shutdown`
+        # RPC keeps running inside the *test's own* process afterward, not
+        # dying with it -- only the real daemon subprocess entrypoint
+        # (runtime.py::create_daemon) opts into an actual os._exit(). See
+        # _exit_process's docstring for why forcing the exit is needed at
+        # all.
+        self._exit_process_fn = exit_process
 
         self._election_sock: socket.socket | None = None
         self._server_sock: socket.socket | None = None
@@ -192,6 +201,30 @@ class DaemonServer:
         if self._election_sock is not None:
             self._election_sock.close()
 
+    def _exit_process(self) -> None:
+        """Force the daemon's OS process to exit immediately, if configured to.
+
+        Closing self._server_sock (above) is meant to unblock the
+        accept-loop thread's socket.accept() call so serve_forever()'s
+        join() on it returns and main() reaches its normal exit -- but on
+        Linux, closing a socket from a different thread than the one
+        blocked inside accept() on it does not reliably wake that call.
+        Left alone, the process would then never exit on its own and would
+        need `kill -9` (live-reproduced; root cause and the SaltMDB daemon's
+        prior fix for the same class of bug are recorded in SALTMDB memory
+        2ff82fd1). Rather than reworking the accept loop to be
+        interruptible, bypass the hang entirely: os._exit() terminates the
+        process outright regardless of what any other thread -- including a
+        permanently wedged accept-loop thread -- is doing.
+
+        A no-op unless exit_process was supplied at construction time (only
+        runtime.py::create_daemon's real daemon-subprocess wiring does) --
+        otherwise every in-process test that sends this server a real
+        `shutdown` RPC would take the whole test process down with it.
+        """
+        if self._exit_process_fn is not None:
+            self._exit_process_fn()
+
     def _accept_loop(self) -> None:
         while True:
             try:
@@ -201,6 +234,7 @@ class DaemonServer:
             threading.Thread(target=self._handle_connection, args=(conn,), daemon=True).start()
 
     def _handle_connection(self, conn: socket.socket) -> None:
+        request = None
         try:
             request = self._read_request(conn)
             if request is None:
@@ -221,6 +255,15 @@ class DaemonServer:
             pass
         finally:
             conn.close()
+        if request is not None and request.get("method") == _SHUTDOWN_METHOD:
+            # self.shutdown() (inside _dispatch_one, above) has already closed
+            # self._server_sock -- but on Linux that does not reliably wake the
+            # accept-loop thread if it's already blocked inside a plain
+            # socket.accept() call on it, so serve_forever()'s join() on that
+            # thread can hang forever and the process never reaches its normal
+            # exit path. Force it here, now that the RPC response has been sent
+            # (or its send was attempted) -- see _exit_process's docstring.
+            self._exit_process()
 
     def _read_request(self, conn: socket.socket) -> dict | None:
         prefix = recv_exact(conn, LENGTH_PREFIX_SIZE)
@@ -264,6 +307,11 @@ def install_signal_handlers(server: DaemonServer) -> None:
 
     def _handler(signum, frame):  # noqa: ARG001 -- signal.signal's required handler shape.
         server.shutdown()
+        # No RPC connection to reply on here (unlike the shutdown-RPC path in
+        # _handle_connection), so there's nothing to wait for -- force the
+        # exit immediately. See _exit_process's docstring for why this is
+        # necessary at all.
+        server._exit_process()  # noqa: SLF001 -- same class/module boundary in spirit
 
     signal.signal(signal.SIGTERM, _handler)
     signal.signal(signal.SIGINT, _handler)

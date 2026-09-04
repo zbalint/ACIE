@@ -1,13 +1,17 @@
 import io
 import json
+import os
+import signal
 import threading
 import time
+
+import pytest
 
 import acie.cli
 import acie.daemon.runtime
 from acie.cli import main
 from acie.daemon.client import daemon_is_running
-from acie.daemon.discovery import write_discovery_file
+from acie.daemon.discovery import read_discovery_file, write_discovery_file
 from acie.daemon.protocol import build_error_response, build_success_response
 from acie.daemon.server import DaemonServer
 
@@ -125,6 +129,42 @@ def test_daemon_start_spawns_a_daemon_and_stop_shuts_it_down(monkeypatch, tmp_pa
         assert not daemon_is_running(discovery_path)
     finally:
         main(["daemon", "stop"])
+
+
+def test_daemon_stop_actually_terminates_the_os_process(monkeypatch, tmp_path):
+    # Regression: `daemon stop`'s exit code and daemon_is_running() both only
+    # ever check the discovery file, which shutdown() deletes *before* it
+    # closes the listening socket -- so both can report "stopped" while the
+    # real OS process is still alive, wedged forever inside a raw blocking
+    # accept() that a same-process close() from a different thread never
+    # wakes on Linux (live-reproduced; see SALTMDB memory 2ff82fd1). This
+    # test asserts the actual OS process exits, not just the discovery-file
+    # view of liveness.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    discovery_path = str(tmp_path / ".acie" / "daemon.json")
+    daemon_pid = None
+
+    try:
+        assert main(["daemon", "start"]) == 0
+        daemon_pid = read_discovery_file(discovery_path)["daemon_pid"]
+
+        assert main(["daemon", "stop"]) == 0
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                os.kill(daemon_pid, 0)
+            except ProcessLookupError:
+                return  # process actually exited -- test passes
+            time.sleep(0.05)
+        pytest.fail(f"daemon process {daemon_pid} still alive 5s after `daemon stop` returned 0")
+    finally:
+        main(["daemon", "stop"])
+        if daemon_pid is not None:
+            try:
+                os.kill(daemon_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_daemon_stop_uses_a_client_timeout_that_covers_the_servers_real_drain_budget(

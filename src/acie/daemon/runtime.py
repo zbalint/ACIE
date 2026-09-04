@@ -236,4 +236,10 @@ def create_daemon(
         discovery_path=os.path.join(state_dir, "daemon.json"),
         auth_token=None,
         on_shutdown=on_shutdown,
+        # Real daemon-subprocess wiring only: forces the process to actually
+        # exit after a `shutdown` RPC/SIGTERM/SIGINT, since a plain blocking
+        # accept() elsewhere in this process won't reliably notice its
+        # socket got closed from another thread. See
+        # DaemonServer._exit_process's docstring.
+        exit_process=lambda: os._exit(0),
     )
