@@ -1,5 +1,7 @@
 import sqlite3
 
+from acie.storage.connection import open_connection
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS index_meta (
     id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -67,7 +69,7 @@ class IndexMetaStore:
 
     def __init__(self, db_path: str = ":memory:", *, conn: sqlite3.Connection | None = None) -> None:
         # See SymbolStore.__init__ for why an already-open conn is accepted.
-        self._conn = conn if conn is not None else sqlite3.connect(db_path)
+        self._conn = conn if conn is not None else open_connection(db_path)
         self._conn.executescript(_SCHEMA)
         self._migrate_add_head_sha_column_if_missing()
         self._migrate_add_cross_file_pass_version_column_if_missing()

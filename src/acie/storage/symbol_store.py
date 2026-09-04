@@ -1,6 +1,7 @@
 import sqlite3
 
 from acie.ir.symbol import Confidence, Provenance, Symbol
+from acie.storage.connection import open_connection
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS symbols_live (
@@ -44,7 +45,7 @@ class SymbolStore:
         # daemon/write_queue.py) opens exactly one connection per repo at
         # thread creation and passes it to every store a queued job
         # constructs, rather than each store opening its own.
-        self._conn = conn if conn is not None else sqlite3.connect(db_path)
+        self._conn = conn if conn is not None else open_connection(db_path)
         self._conn.executescript(_SCHEMA)
         # SQLite's LIKE is case-insensitive for ASCII by default -- Python
         # identifiers are case-sensitive, so search() (qualname substring

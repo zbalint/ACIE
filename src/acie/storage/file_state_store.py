@@ -1,6 +1,8 @@
 import sqlite3
 from dataclasses import dataclass
 
+from acie.storage.connection import open_connection
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS file_state (
     path TEXT PRIMARY KEY,
@@ -29,7 +31,7 @@ class FileStateStore:
     """
 
     def __init__(self, db_path: str = ":memory:", *, conn: sqlite3.Connection | None = None) -> None:
-        self._conn = conn if conn is not None else sqlite3.connect(db_path)
+        self._conn = conn if conn is not None else open_connection(db_path)
         self._conn.executescript(_SCHEMA)
 
     def get(self, path: str) -> FileState | None:

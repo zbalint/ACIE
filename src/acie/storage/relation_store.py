@@ -2,6 +2,7 @@ import sqlite3
 
 from acie.ir.relation import Relation
 from acie.ir.symbol import Confidence, Provenance
+from acie.storage.connection import open_connection
 
 # Shared between _SCHEMA (fresh install) and the overrides-predicate
 # migration below (rebuilding an existing relations_live table) so the
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS relations_history (
 class RelationStore:
     def __init__(self, db_path: str = ":memory:", *, conn: sqlite3.Connection | None = None) -> None:
         # See SymbolStore.__init__ for why an already-open conn is accepted.
-        self._conn = conn if conn is not None else sqlite3.connect(db_path)
+        self._conn = conn if conn is not None else open_connection(db_path)
         self._conn.executescript(_SCHEMA)
         self._migrate_add_overrides_predicate_if_missing()
 

@@ -22,6 +22,8 @@ import time
 from concurrent.futures import Future
 from typing import Callable, TypeVar
 
+from acie.storage.connection import open_connection
+
 T = TypeVar("T")
 _logger = logging.getLogger(__name__)
 
@@ -173,7 +175,7 @@ class _RepoWriter:
         # repo ever submits -- the deliberate contrast with dispatch.py's
         # fresh-per-call read-path stores (see this module's docstring).
         try:
-            conn = sqlite3.connect(db_path)
+            conn = open_connection(db_path)
         except BaseException as exc:  # noqa: BLE001 -- returned via submit's Future, never stranded in this thread.
             self._startup_error = exc
             self._started.set()
