@@ -19,6 +19,9 @@ dependencies = [
     "tree-sitter-python>=0.25.0",
     "pathspec>=0.12.0",
     "watchdog>=4.0.0",
+    # shortcut: no minimum basedpyright version verified against this integration;
+    # add a floor if a real incompatibility with an old install surfaces.
+    "basedpyright",
 ]
 
 [project.scripts]
