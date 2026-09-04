@@ -19,6 +19,12 @@ class IndexResult:
     relations_tombstoned: int
 
 
+
+@dataclass(frozen=True)
+class UnresolvedSites:
+    calls: list[DeferredImportCall]
+    inherits: list[DeferredImportInherit]
+
 def index_file(
     path: str,
     source_text: str,
@@ -100,6 +106,28 @@ def index_file(
     )
 
 
+def _candidates_for(
+    item: DeferredImportCall | DeferredImportInherit, symbol_store: SymbolStore, *, kind: str
+):
+    return [
+        symbol
+        for symbol in symbol_store.find_by_qualname_and_kind(qualname=item.name, kind=kind)
+        if module_path_matches(symbol.path, item.module_path)
+    ]
+
+
+def unresolved_deferred_sites(
+    deferred_calls: list[DeferredImportCall],
+    deferred_inherits: list[DeferredImportInherit],
+    symbol_store: SymbolStore,
+) -> UnresolvedSites:
+    """Deferred calls/inherits with no current repo-index candidate."""
+    return UnresolvedSites(
+        calls=[item for item in deferred_calls if not _candidates_for(item, symbol_store, kind="function")],
+        inherits=[item for item in deferred_inherits if not _candidates_for(item, symbol_store, kind="class")],
+    )
+
+
 def _resolve_deferred(
     deferred_items: list[DeferredImportCall] | list[DeferredImportInherit],
     symbol_store: SymbolStore,
@@ -107,44 +135,10 @@ def _resolve_deferred(
     kind: str,
     predicate: str,
 ) -> list[Relation]:
-    """Resolves each DeferredImportCall/DeferredImportInherit (a bare call or
-    a base-class identifier that's `from`-imported but which extract_relations
-    couldn't itself resolve, single-file-scoped as it is) against the
-    repo-wide symbol index. Shared by both predicates (slice A2 generalized
-    this out of what was originally calls-only `_resolve_deferred_calls`,
-    since the two are identical apart from which symbol `kind` to look up
-    and which `predicate` to stamp the resulting Relation with) -- not
-    tested directly (both call sites are private), only via index_file's own
-    integration tests.
-
-    No module-path-to-file-path mapping exists or can be assumed for an
-    arbitrary target repo (no PYTHONPATH/package-root config, see the
-    cross-file-resolution plan) -- so a candidate is instead found by
-    reversing the *file path* into its own dotted form (slashes to dots,
-    trailing .py/__init__.py stripped) and checking whether the imported
-    dotted module_path is that reversed path or one of its dotted
-    suffixes. This lets `from acie.daemon.discovery import x` resolve
-    against a candidate at `src/acie/daemon/discovery.py` without ACIE ever
-    knowing "src/" is a source root -- it's the same suffix-tolerant
-    matching already used for redefinition collisions elsewhere in this
-    codebase, just applied to paths instead of qualnames.
-
-    Zero matches leaves the item unresolved (identical to today's silent
-    miss on a genuinely undefined name) -- most commonly because the
-    target file hasn't been indexed yet; bootstrap.py's second pass and the
-    filesystem watcher's natural reindex-on-edit are what eventually close
-    that gap, not this function retrying anything. One matching candidate
-    is EXTRACTED; more than one (e.g. two same-named modules at different
-    paths) is AMBIGUOUS per candidate, mirroring extract_relations's own
-    collision handling.
-    """
+    """Resolves deferred imports against current repo-wide symbols."""
     relations: list[Relation] = []
     for item in deferred_items:
-        candidates = [
-            symbol
-            for symbol in symbol_store.find_by_qualname_and_kind(qualname=item.name, kind=kind)
-            if module_path_matches(symbol.path, item.module_path)
-        ]
+        candidates = _candidates_for(item, symbol_store, kind=kind)
         if not candidates:
             continue
         confidence = Confidence.EXTRACTED if len(candidates) == 1 else Confidence.AMBIGUOUS

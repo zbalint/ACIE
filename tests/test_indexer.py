@@ -1,6 +1,7 @@
 import subprocess
 
-from acie.indexer import index_file
+from acie.adapters.python.extract_relations import extract_relations_with_deferred_edges
+from acie.indexer import index_file, unresolved_deferred_sites
 from acie.ir.symbol import Confidence
 from acie.repo_id import resolve_index_db_path
 from acie.storage.index_meta_store import IndexMetaStore
@@ -812,3 +813,47 @@ def test_indexing_a_real_test_file_produces_the_fixture_di_calls_edge():
     assert fixture_di_edge is not None
     assert fixture_di_edge.confidence == Confidence.AMBIGUOUS
     assert fixture_di_edge.provenance.provider == "pytest-fixture-heuristic"
+
+
+def test_unresolved_deferred_sites_returns_only_zero_candidate_calls_and_inherits():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    observed_at = "2026-09-04T00:00:00Z"
+    index_file(
+        path="pkg/known.py",
+        source_text="def helper():\n    pass\n",
+        observed_at=observed_at,
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    source = (
+        "from pkg.known import helper\n"
+        "from external import missing_call, MissingBase\n\n"
+        "helper()\n"
+        "missing_call()\n\n"
+        "class Child(MissingBase):\n"
+        "    pass\n"
+    )
+    _, deferred_calls, deferred_inherits, _ = extract_relations_with_deferred_edges(
+        "pkg/mod.py", source, observed_at
+    )
+
+    unresolved = unresolved_deferred_sites(deferred_calls, deferred_inherits, symbol_store)
+
+    assert [item.name for item in unresolved.calls] == ["missing_call"]
+    assert [item.name for item in unresolved.inherits] == ["MissingBase"]
+
+    index_file(
+        path="pkg/mod.py",
+        source_text=source,
+        observed_at=observed_at,
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert [(relation.target, relation.confidence) for relation in calls] == [
+        ("pkg/known.py:helper#function", Confidence.EXTRACTED)
+    ]

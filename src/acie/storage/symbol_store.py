@@ -212,6 +212,25 @@ class SymbolStore:
             return None
         return _row_to_symbol(row)
 
+    def at_position(self, *, path: str, line: int, col: int) -> Symbol | None:
+        """The smallest live symbol span containing (path, line, col), or None."""
+        row = self._conn.execute(
+            """
+            SELECT id, path, qualname, kind, start_line, start_col, end_line, end_col,
+                   confidence, provenance_provider, provenance_version, observed_at
+            FROM symbols_live
+            WHERE path = ?
+              AND (start_line, start_col) <= (?, ?)
+              AND (end_line, end_col) >= (?, ?)
+            ORDER BY end_line - start_line ASC, end_col - start_col ASC, id ASC
+            LIMIT 1
+            """,
+            (path, line, col, line, col),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_symbol(row)
+
     def is_tombstoned(self, symbol_id: str) -> bool:
         row = self._conn.execute(
             """

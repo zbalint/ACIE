@@ -194,3 +194,59 @@ def test_at_start_returns_none_when_no_symbol_starts_at_that_exact_position():
     store.upsert(make_symbol())
 
     assert store.at_start(path="pkg/mod.py", line=999, col=0) is None
+
+def test_at_position_returns_a_single_symbol_at_its_exact_start():
+    store = SymbolStore(":memory:")
+    symbol = make_symbol()
+    store.upsert(symbol)
+
+    assert store.at_position(path=symbol.path, line=symbol.start_line, col=symbol.start_col) == symbol
+
+
+def test_at_position_returns_the_smallest_symbol_containing_the_position():
+    store = SymbolStore(":memory:")
+    outer = make_symbol(
+        id="pkg/mod.py:Outer#class",
+        qualname="Outer",
+        kind="class",
+        start_line=1,
+        start_col=0,
+        end_line=20,
+        end_col=0,
+    )
+    method = make_symbol(
+        id="pkg/mod.py:Outer.method#method",
+        qualname="Outer.method",
+        kind="method",
+        start_line=5,
+        start_col=4,
+        end_line=10,
+        end_col=0,
+    )
+    store.upsert(outer)
+    store.upsert(method)
+
+    assert store.at_position(path="pkg/mod.py", line=6, col=8) == method
+
+
+def test_at_position_falls_back_to_the_module_when_no_definition_contains_the_position():
+    store = SymbolStore(":memory:")
+    module = make_symbol(
+        id="pkg/mod.py:#module",
+        qualname="",
+        kind="module",
+        start_line=1,
+        start_col=0,
+        end_line=100,
+        end_col=0,
+    )
+    store.upsert(module)
+
+    assert store.at_position(path="pkg/mod.py", line=50, col=0) == module
+
+
+def test_at_position_returns_none_for_a_different_path_or_outside_every_span():
+    store = SymbolStore(":memory:")
+    store.upsert(make_symbol())
+
+    assert store.at_position(path="pkg/other.py", line=10, col=4) is None
