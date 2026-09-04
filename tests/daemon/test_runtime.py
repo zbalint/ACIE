@@ -1,8 +1,12 @@
 import os
+import shutil
 import subprocess
 import threading
 import time
 
+import pytest
+
+from acie.daemon import runtime
 from acie.daemon.protocol import build_request
 from acie.daemon.runtime import create_daemon, ensure_fresh
 from acie.daemon.write_queue import WriteQueue
@@ -371,5 +375,232 @@ def test_runtime_list_imports_with_a_traversal_file_param_never_reads_outside_th
         untouched = send_request(server.port, build_request("find_symbol", str(repo), {"name": "shutil"}))
         assert untouched["ok"] is True
         assert untouched["result"]["results"] == []
+    finally:
+        server.shutdown()
+
+
+def test_trigger_enrichment_offloads_reentrant_write_queue_follow_up(tmp_path, monkeypatch):
+    repo_id = "repo-a"
+    db_path = str(tmp_path / "index.sqlite")
+    write_queue = WriteQueue(db_path_for=lambda _repo_id: db_path)
+    follow_up_ran = threading.Event()
+    worker_finished = threading.Event()
+
+    def fake_run_enrichment_pass(**kwargs):
+        try:
+            follow_up = kwargs["write_queue"].submit(repo_id, lambda conn: follow_up_ran.set())
+            follow_up.result(timeout=5.0)
+        finally:
+            worker_finished.set()
+
+    monkeypatch.setattr(runtime, "run_enrichment_pass", fake_run_enrichment_pass, raising=False)
+    try:
+        outer = write_queue.submit(
+            repo_id,
+            lambda conn: runtime.trigger_enrichment(
+                object(),
+                write_queue,
+                lambda _repo_id: db_path,
+                repo_id,
+                str(tmp_path),
+            ),
+        )
+        outer.result(timeout=5.0)
+        assert follow_up_ran.wait(timeout=5.0), "triggered enrichment follow-up never ran"
+        assert worker_finished.wait(timeout=5.0), "enrichment worker did not finish"
+    finally:
+        worker_finished.wait(timeout=5.0)
+        write_queue.close(timeout=5.0)
+
+
+def test_trigger_enrichment_returns_before_a_slow_process_registry_finishes(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class SlowProcessRegistry:
+        def ensure_process(self, repo_root):
+            started.set()
+            release.wait(timeout=2.0)
+            finished.set()
+            return None
+
+    start = time.monotonic()
+    try:
+        runtime.trigger_enrichment(
+            SlowProcessRegistry(),
+            object(),
+            lambda repo_id: str(tmp_path / "index.sqlite"),
+            "repo-a",
+            str(tmp_path),
+        )
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, "trigger_enrichment waited for the enrichment pass"
+        assert started.wait(timeout=1.0), "enrichment thread never started"
+    finally:
+        release.set()
+
+    assert finished.wait(timeout=2.0), "enrichment thread did not finish after release"
+
+
+def test_trigger_enrichment_logs_and_swallows_background_setup_errors(tmp_path, monkeypatch):
+    warning_called = threading.Event()
+    messages = []
+
+    def warning(message, *args, **kwargs):
+        messages.append(message)
+        warning_called.set()
+
+    monkeypatch.setattr(runtime._logger, "warning", warning)
+
+    def db_path_for(repo_id):
+        raise RuntimeError("index path unavailable")
+
+    runtime.trigger_enrichment(object(), object(), db_path_for, "repo-a", str(tmp_path))
+
+    assert warning_called.wait(timeout=2.0), "background setup error was not logged"
+    assert "could not open index" in messages[0]
+
+
+def test_create_daemon_shares_one_process_registry_across_indexed_callbacks_and_closes_it(
+    tmp_path, monkeypatch
+):
+    registries = []
+    close_timeouts = []
+    indexed_callbacks = []
+    trigger_registries = []
+
+    class FakeProcessRegistry:
+        def __init__(self):
+            registries.append(self)
+
+        def close(self, timeout=None):
+            close_timeouts.append(timeout)
+
+    class FakeBootstrapCoordinator:
+        def __init__(self, **kwargs):
+            indexed_callbacks.append(kwargs["on_indexed"])
+
+        def repo_ready(self, repo_id):
+            return False
+
+        def register(self, repo_id, repo_root):
+            pass
+
+    def fake_trigger_enrichment(process_registry, *args, **kwargs):
+        trigger_registries.append(process_registry)
+
+    monkeypatch.setattr(runtime, "PyrightProcessRegistry", FakeProcessRegistry)
+    monkeypatch.setattr(runtime, "BootstrapCoordinator", FakeBootstrapCoordinator)
+    monkeypatch.setattr(runtime, "trigger_enrichment", fake_trigger_enrichment)
+
+    server = create_daemon(state_dir=str(tmp_path / "state"), port=0)
+    try:
+        indexed_callbacks[0]("repo-a", "/repo-a")
+        indexed_callbacks[0]("repo-b", "/repo-b")
+    finally:
+        server.shutdown()
+
+    assert len(registries) == 1
+    assert trigger_registries == [registries[0], registries[0]]
+    assert len(close_timeouts) == 1
+    assert 0.0 <= close_timeouts[0] <= runtime._SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+
+
+def test_runtime_bootstrap_triggers_enrichment_for_an_ambiguous_cross_file_call(tmp_path):
+    if shutil.which("basedpyright-langserver") is None:
+        pytest.skip("basedpyright-langserver is not installed")
+
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "vendor" / "pkg").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "pkg" / "mod.py").write_text(
+        "from pkg.other import helper\n\n\ndef caller():\n    helper()\n",
+        encoding="utf-8",
+    )
+    (repo / "pkg" / "other.py").write_text("def helper():\n    pass\n", encoding="utf-8")
+    (repo / "vendor" / "pkg" / "other.py").write_text("def helper():\n    pass\n", encoding="utf-8")
+
+    server = create_daemon(state_dir=str(tmp_path / "state"), port=0)
+    server.start()
+    try:
+        ready_request = build_request("find_symbol", str(repo), {"name": "caller"})
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            ready_response = send_request(server.port, ready_request)
+            if ready_response["ok"]:
+                break
+            assert ready_response["error"]["code"] == "INDEX_NOT_READY"
+            time.sleep(0.01)
+        else:
+            raise AssertionError("repo did not finish bootstrap indexing")
+
+        graph_request = build_request(
+            "graph",
+            str(repo),
+            {
+                "root": "pkg/mod.py:caller#function",
+                "graph_type": "call",
+                "direction": "downstream",
+                "full": True,
+            },
+        )
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            graph_response = send_request(server.port, graph_request)
+            if graph_response["ok"]:
+                inferred = [
+                    edge
+                    for edge in graph_response["result"]["edges"]
+                    if edge.get("confidence") == "INFERRED"
+                ]
+                if inferred:
+                    break
+            else:
+                assert graph_response["error"]["code"] == "INDEX_NOT_READY"
+            time.sleep(0.1)
+        else:
+            raise AssertionError("daemon enrichment never inferred the ambiguous call")
+
+        assert inferred[0]["target"] == "pkg/other.py:helper#function"
+    finally:
+        server.shutdown()
+
+
+def test_runtime_bootstrap_triggers_enrichment_without_a_pyright_binary(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "module.py").write_text("def target():\n    pass\n", encoding="utf-8")
+    (repo / "other.py").write_text("def other():\n    pass\n", encoding="utf-8")
+
+    triggered = threading.Event()
+    calls = []
+
+    def fake_run_enrichment_pass(**kwargs):
+        calls.append((kwargs["repo_id"], kwargs["repo_root"]))
+        triggered.set()
+        return []
+
+    monkeypatch.setattr(runtime, "run_enrichment_pass", fake_run_enrichment_pass)
+
+    server = create_daemon(state_dir=str(tmp_path / "state"), port=0)
+    server.start()
+    try:
+        request = build_request("find_symbol", str(repo), {"name": "target"})
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            response = send_request(server.port, request)
+            if response["ok"]:
+                break
+            assert response["error"]["code"] == "INDEX_NOT_READY"
+            time.sleep(0.01)
+        else:
+            raise AssertionError("repo did not finish bootstrap indexing")
+
+        assert triggered.wait(timeout=2.0), "bootstrap never triggered the enrichment pass"
+        assert len(calls) == 1
+        assert calls[0][1] == str(repo)
     finally:
         server.shutdown()

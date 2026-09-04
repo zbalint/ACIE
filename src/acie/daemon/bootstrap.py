@@ -41,10 +41,13 @@ class BootstrapCoordinator:
         write_queue: WriteQueue,
         db_path_for: Callable[[str], str],
         walk_repo: Callable[[str], Iterable[tuple[str, str]]],
+        *,
+        on_indexed: Callable[[str, str], None] = lambda repo_id, repo_root: None,
     ) -> None:
         self._write_queue = write_queue
         self._db_path_for = db_path_for
         self._walk_repo = walk_repo
+        self._on_indexed = on_indexed
         self._lock = threading.Lock()
         self._ready: set[str] = set()
         self._in_progress: set[str] = set()
@@ -134,7 +137,7 @@ class BootstrapCoordinator:
             # later daemon restart's register() call never redundantly
             # re-walks this repo a third time via _maybe_schedule_cross_file_migration.
             self._mark_cross_file_migration_done(repo_id)
-
+            self._on_indexed(repo_id, repo_root)
         # Second pass: os.walk's file-discovery order (this class's own
         # `_walk_repo` contract) is arbitrary, not dependency-ordered, so a
         # file indexed before something it cross-file-calls/inherits/overrides
@@ -211,7 +214,12 @@ class BootstrapCoordinator:
         if not files:
             self._mark_cross_file_migration_done(repo_id)
             return
-        self._run_indexing_pass(repo_id, files, on_pass_done=lambda: self._mark_cross_file_migration_done(repo_id))
+
+        def _finish_migration() -> None:
+            self._mark_cross_file_migration_done(repo_id)
+            self._on_indexed(repo_id, repo_root)
+
+        self._run_indexing_pass(repo_id, files, on_pass_done=_finish_migration)
 
     def _run_indexing_pass(
         self, repo_id: str, files: list[tuple[str, str]], *, on_pass_done: Callable[[], None]

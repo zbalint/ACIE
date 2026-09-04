@@ -28,18 +28,21 @@ def _wait_until(predicate, timeout=2.0):
     return predicate()
 
 
-def _make_coordinator(tmp_path, files_by_repo, db_paths=None):
+def _make_coordinator(tmp_path, files_by_repo, db_paths=None, on_indexed=None):
     db_paths = db_paths if db_paths is not None else {}
 
     def db_path_for(repo_id):
         return db_paths.setdefault(repo_id, str(tmp_path / f"{repo_id}.sqlite"))
 
     write_queue = WriteQueue(db_path_for=db_path_for)
-    coordinator = BootstrapCoordinator(
-        write_queue=write_queue,
-        db_path_for=db_path_for,
-        walk_repo=lambda repo_root: files_by_repo.get(repo_root, []),
-    )
+    coordinator_kwargs = {
+        "write_queue": write_queue,
+        "db_path_for": db_path_for,
+        "walk_repo": lambda repo_root: files_by_repo.get(repo_root, []),
+    }
+    if on_indexed is not None:
+        coordinator_kwargs["on_indexed"] = on_indexed
+    coordinator = BootstrapCoordinator(**coordinator_kwargs)
     return coordinator, write_queue, db_path_for
 
 
@@ -506,4 +509,96 @@ def test_register_keys_readiness_on_repo_id_but_walks_the_given_repo_root(tmp_pa
 
     assert _wait_until(lambda: coordinator.repo_ready("shared-repo-id"))
     assert seen_roots == ["/worktrees/a"]
+    write_queue.close()
+
+
+def test_register_calls_on_indexed_once_after_nonempty_bootstrap_passes(tmp_path):
+    calls = []
+    coordinator = None
+
+    def on_indexed(repo_id, repo_root):
+        calls.append((repo_id, repo_root, coordinator.repo_ready(repo_id)))
+
+    coordinator, write_queue, _ = _make_coordinator(
+        tmp_path,
+        files_by_repo={"repo-a": [("pkg/mod.py", "def foo():\n    pass\n")]},
+        on_indexed=on_indexed,
+    )
+    coordinator.register("repo-a", "repo-a")
+
+    assert _wait_until(lambda: len(calls) == 1), "on_indexed never fired"
+    assert calls == [("repo-a", "repo-a", True)]
+    write_queue.close()
+
+
+def test_register_does_not_call_on_indexed_for_an_empty_bootstrap(tmp_path):
+    calls = []
+    coordinator, write_queue, _ = _make_coordinator(
+        tmp_path,
+        files_by_repo={"repo-a": []},
+        on_indexed=lambda repo_id, repo_root: calls.append((repo_id, repo_root)),
+    )
+
+    coordinator.register("repo-a", "repo-a")
+
+    assert _wait_until(lambda: coordinator.repo_ready("repo-a"))
+    assert calls == []
+    write_queue.close()
+
+
+def test_register_calls_on_indexed_after_nonempty_cross_file_migration_catchup(tmp_path):
+    files = {
+        "repo-a": [
+            ("pkg/mod.py", "from pkg.other import helper\n\n\nhelper()\n"),
+            ("pkg/other.py", "def helper():\n    pass\n"),
+        ]
+    }
+    calls = []
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path,
+        files_by_repo=files,
+        on_indexed=lambda repo_id, repo_root: calls.append((repo_id, repo_root)),
+    )
+    _index_files_once_directly(db_path_for("repo-a"), files["repo-a"])
+
+    coordinator.register("repo-a", "repo-a")
+
+    assert _wait_until(lambda: len(calls) == 1), "migration on_indexed never fired"
+    assert calls == [("repo-a", "repo-a")]
+    write_queue.close()
+
+
+def test_register_does_not_call_on_indexed_for_an_empty_migration_catchup(tmp_path):
+    calls = []
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path,
+        files_by_repo={"repo-a": []},
+        on_indexed=lambda repo_id, repo_root: calls.append((repo_id, repo_root)),
+    )
+    sqlite3.connect(db_path_for("repo-a")).close()
+
+    coordinator.register("repo-a", "repo-a")
+
+    assert _wait_until(lambda: IndexMetaStore(db_path_for("repo-a")).cross_file_pass_done())
+    assert calls == []
+    write_queue.close()
+
+
+def test_register_does_not_trigger_indexed_twice_after_bootstrap_and_migration_are_done(tmp_path):
+    calls = []
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path,
+        files_by_repo={"repo-a": [("pkg/mod.py", "def foo():\n    pass\n")]},
+        on_indexed=lambda repo_id, repo_root: calls.append((repo_id, repo_root)),
+    )
+
+    coordinator.register("repo-a", "repo-a")
+    assert _wait_until(lambda: len(calls) == 1), "initial on_indexed never fired"
+    assert _wait_until(lambda: IndexMetaStore(db_path_for("repo-a")).cross_file_pass_done())
+
+    coordinator.register("repo-a", "repo-a")
+    coordinator.register("repo-a", "repo-a")
+    time.sleep(0.1)
+
+    assert calls == [("repo-a", "repo-a")]
     write_queue.close()

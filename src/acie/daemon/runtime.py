@@ -7,17 +7,24 @@ client concerns intentionally remain outside this module.
 
 import logging
 import os
+import threading
 import time
+from typing import Callable, Iterable
 
 from acie.daemon.bootstrap import BootstrapCoordinator
 from acie.daemon.dispatch import dispatch_request, walk_repo
+from acie.daemon.lsp_enrichment import run_enrichment_pass
 from acie.daemon.notify_hook import handle_notify_hook
 from acie.daemon.protocol import build_error_response, build_success_response
+from acie.daemon.pyright_process import PyrightProcessRegistry
 from acie.daemon.server import DaemonServer
 from acie.daemon.staleness import extract_staleness_target
 from acie.daemon.watcher import WatcherRegistry, make_reindex_job
 from acie.daemon.write_queue import WriteQueue
 from acie.repo_id import resolve_repo_id, resolve_repo_root
+from acie.storage.connection import open_connection
+from acie.storage.relation_store import RelationStore
+from acie.storage.symbol_store import SymbolStore
 
 _logger = logging.getLogger(__name__)
 
@@ -59,6 +66,62 @@ def ensure_fresh(
             "or failed -- proceeding with whatever the index currently has.",
             rel_path, repo_id, timeout,
         )
+
+
+def trigger_enrichment(
+    process_registry: PyrightProcessRegistry,
+    write_queue: WriteQueue,
+    db_path_for: Callable[[str], str],
+    repo_id: str,
+    repo_root: str,
+    *,
+    walk_repo: Callable[[str], Iterable[tuple[str, str]]] = walk_repo,
+) -> None:
+    """D6: fires an opportunistic enrichment pass after BootstrapCoordinator
+    finishes indexing repo_id for the first time (or completes its one-time
+    cross-file-pass migration catch-up). Always hands off to a fresh thread
+    and returns immediately -- see this spec's finding 2 for why calling
+    run_enrichment_pass inline here would deadlock repo_id's own writer
+    thread (this function is itself invoked from on_indexed, which fires
+    synchronously on that writer thread).
+    """
+    # shortcut: no per-site mtime/content-hash freshness check against
+    # BootstrapCoordinator's walk snapshot; upgrade to pass that snapshot
+    # through if a real repo shows a visibly wrong INFERRED fact in this race.
+    threading.Thread(
+        target=_run_triggered_enrichment,
+        args=(process_registry, write_queue, db_path_for, repo_id, repo_root, walk_repo),
+        daemon=True,
+    ).start()
+
+
+def _run_triggered_enrichment(
+    process_registry: PyrightProcessRegistry,
+    write_queue: WriteQueue,
+    db_path_for: Callable[[str], str],
+    repo_id: str,
+    repo_root: str,
+    walk_repo: Callable[[str], Iterable[tuple[str, str]]],
+) -> None:
+    try:
+        conn = open_connection(db_path_for(repo_id))
+    except Exception:  # noqa: BLE001 -- opportunistic, never load-bearing (D1/D3's own principle).
+        _logger.warning("D6 enrichment trigger: could not open index for repo %r", repo_id, exc_info=True)
+        return
+    try:
+        run_enrichment_pass(
+            repo_root=repo_root,
+            repo_id=repo_id,
+            process_registry=process_registry,
+            write_queue=write_queue,
+            walk_repo=walk_repo,
+            symbol_store=SymbolStore(conn=conn),
+            relation_store=RelationStore(conn=conn),
+        )
+    except Exception:  # noqa: BLE001 -- same "never break anything else" principle; logged, not raised.
+        _logger.warning("D6 enrichment trigger: enrichment pass failed for repo %r", repo_id, exc_info=True)
+    finally:
+        conn.close()
 
 
 # Overall budget for on_shutdown()'s whole drain (watchers.close() AND
@@ -105,10 +168,18 @@ def create_daemon(
 
 
     write_queue = WriteQueue(db_path_for=db_path_for)
+    process_registry = PyrightProcessRegistry()
+
+    def _on_indexed(repo_id: str, repo_root: str) -> None:
+        trigger_enrichment(
+            process_registry, write_queue, db_path_for, repo_id, repo_root, walk_repo=walk_repo
+        )
+
     bootstrap = BootstrapCoordinator(
         write_queue=write_queue,
         db_path_for=db_path_for,
         walk_repo=walk_repo,
+        on_indexed=_on_indexed,
     )
     watchers = WatcherRegistry(write_queue)
 
@@ -222,6 +293,9 @@ def create_daemon(
         # _SHUTDOWN_DRAIN_TIMEOUT_SECONDS overall, not 2x it.
         deadline = time.monotonic() + _SHUTDOWN_DRAIN_TIMEOUT_SECONDS
         watchers.close(timeout=max(0.0, deadline - time.monotonic()))
+        # shortcut: a daemon thread is not joined or cancelled during shutdown;
+        # upgrade if shutdown followed by a fresh spawn races it with new state.
+        process_registry.close(timeout=max(0.0, deadline - time.monotonic()))
         write_queue.close(timeout=max(0.0, deadline - time.monotonic()))
 
     return DaemonServer(
