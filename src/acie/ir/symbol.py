@@ -12,6 +12,19 @@ class Confidence(str, Enum):
     INFERRED = "INFERRED"
     AMBIGUOUS = "AMBIGUOUS"
 
+_CONFIDENCE_RANK = {Confidence.EXTRACTED: 0, Confidence.INFERRED: 1, Confidence.AMBIGUOUS: 2}
+
+
+def confidence_rank(confidence: Confidence) -> int:
+    """Returns the shared filter/merge rank for a Confidence.
+
+    This ordering serves `tools.confidence.py`'s min-confidence filter and
+    `daemon.merge_policy.py`'s regression guard. It is a filter/merge
+    ordering only, not a reinterpretation of ARCHITECTURE.md's explicitly
+    non-ordinal confidence taxonomy.
+    """
+    return _CONFIDENCE_RANK[confidence]
+
 
 @dataclass(frozen=True)
 class Provenance:

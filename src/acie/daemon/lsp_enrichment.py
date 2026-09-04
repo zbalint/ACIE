@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 from acie.adapters.python.extract_relations import extract_relations_with_deferred_edges
+from acie.daemon import merge_policy
 from acie.daemon.lsp_client import LspClient, LspError
 from acie.ir.relation import Relation
 from acie.ir.symbol import Confidence, Provenance, Symbol
@@ -105,7 +106,7 @@ def run_enrichment_pass(
                 confidence=Confidence.INFERRED,
                 provenance=Provenance(provider=provider, version=version, observed_at=observed_at_fn()),
             )
-            submitted.append(write_queue.submit(repo_id, _make_upsert_job(relation)))
+            submitted.append(write_queue.submit(repo_id, _make_merge_job(relation)))
             resolved.append(relation)
 
         if submitted:
@@ -168,8 +169,8 @@ def _relative_path_from_uri(uri: str, repo_root: str) -> str | None:
         return None
 
 
-def _make_upsert_job(relation: Relation):
-    def job(conn) -> None:
-        RelationStore(conn=conn).upsert(relation)
+def _make_merge_job(relation: Relation):
+    def job(conn) -> merge_policy.MergeOutcome:
+        return merge_policy.apply_enrichment_write(RelationStore(conn=conn), relation)
 
     return job

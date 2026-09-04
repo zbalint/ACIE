@@ -17,15 +17,11 @@ until v1's LSP layer.
 
 from typing import Callable, TypeVar
 
-from acie.ir.symbol import Confidence
+from acie.ir.symbol import Confidence, confidence_rank
 from acie.tools.errors import InvalidArgumentError
 
 T = TypeVar("T")
 
-# Index = certainty rank, most certain first -- filter-only ordering, see
-# module docstring for why this doesn't reopen the ordinal-taxonomy
-# question ARCHITECTURE.md already settled against.
-_RANK = {Confidence.EXTRACTED: 0, Confidence.INFERRED: 1, Confidence.AMBIGUOUS: 2}
 
 
 def filter_by_min_confidence(
@@ -48,5 +44,5 @@ def filter_by_min_confidence(
             raise InvalidArgumentError(f"min_confidence must be one of {[c.value for c in Confidence]}, got {min_confidence!r}")
 
     get_confidence = key if key is not None else (lambda item: item.confidence)
-    floor_rank = _RANK[floor]
-    return [item for item in items if _RANK[get_confidence(item)] <= floor_rank]
+    floor_rank = confidence_rank(floor)
+    return [item for item in items if confidence_rank(get_confidence(item)) <= floor_rank]

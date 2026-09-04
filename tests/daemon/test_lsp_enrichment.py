@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from acie.daemon import lsp_enrichment
+from acie.daemon.write_queue import WriteQueue
 from acie.ir.relation import Relation
 from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.storage.relation_store import RelationStore
@@ -201,3 +202,45 @@ def test_connection_error_stops_the_pass_after_prior_resolutions(monkeypatch, tm
     assert len(queue.submissions) == 1
     assert len(client.requests) == 2
     assert [method for method, _ in client.notifications] == ["textDocument/didOpen"]
+
+
+def test_merge_job_runs_policy_against_real_queue_connection_and_preserves_extracted_fact(tmp_path):
+    db_path = str(tmp_path / "index.sqlite")
+    store = RelationStore(db_path)
+    extracted = Relation(
+        source="pkg/caller.py:#module",
+        target="pkg/target.py:target#function",
+        predicate="calls",
+        site_file="pkg/caller.py",
+        site_line=2,
+        site_col=0,
+        confidence=Confidence.EXTRACTED,
+        provenance=Provenance("tree-sitter", "1", "2026-09-04T00:00:00Z"),
+    )
+    inferred = Relation(
+        source=extracted.source,
+        target=extracted.target,
+        predicate=extracted.predicate,
+        site_file=extracted.site_file,
+        site_line=extracted.site_line,
+        site_col=extracted.site_col,
+        confidence=Confidence.INFERRED,
+        provenance=Provenance("basedpyright", "9.9.9", "2026-09-04T12:00:00Z"),
+    )
+    store.upsert(extracted)
+    queue = WriteQueue(db_path_for=lambda repo_id: db_path)
+    try:
+        outcome = queue.submit("repo-id", lsp_enrichment._make_merge_job(inferred)).result(timeout=1)
+    finally:
+        queue.close(timeout=1)
+
+    assert outcome.applied is False
+    assert outcome.reason == "would_regress_existing_confidence"
+    assert RelationStore(db_path).get(
+        source=extracted.source,
+        target=extracted.target,
+        predicate=extracted.predicate,
+        site_file=extracted.site_file,
+        site_line=extracted.site_line,
+        site_col=extracted.site_col,
+    ) == extracted
