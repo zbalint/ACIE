@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from acie.adapters.python.extract_relations import extract_relations_with_deferred_edges
 from acie.adapters.python.extract_symbols import extract_symbols, has_syntax_error
 from acie.ir.relation import DeferredImportCall, DeferredImportInherit, DeferredImportOverride, Relation
-from acie.ir.symbol import Confidence
+from acie.ir.symbol import Confidence, Symbol
 from acie.module_paths import module_path_matches
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
@@ -46,8 +46,13 @@ def index_file(
     new_relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
         path=path, source_text=source_text, observed_at=observed_at
     )
+    plain_deferred_calls = [c for c in deferred_calls if c.attribute is None]
+    attribute_deferred_calls = [c for c in deferred_calls if c.attribute is not None]
     new_relations = new_relations + _resolve_deferred(
-        deferred_calls, symbol_store, kind="function", predicate="calls"
+        plain_deferred_calls, symbol_store, kind="function", predicate="calls"
+    )
+    new_relations = new_relations + _resolve_deferred_attribute_calls(
+        attribute_deferred_calls, symbol_store
     )
     new_relations = new_relations + _resolve_deferred(
         deferred_inherits, symbol_store, kind="class", predicate="inherits"
@@ -116,14 +121,32 @@ def _candidates_for(
     ]
 
 
+def _attribute_call_candidates(item: DeferredImportCall, symbol_store: SymbolStore) -> list[Symbol]:
+    """Shared by resolution and unresolved-site detection (finding 4) --
+    mirrors _candidates_for's role for the plain-name case. `item.attribute`
+    must be non-None; the submodule dotted path is module_path + "." + name.
+    """
+    submodule_dotted = f"{item.module_path}.{item.name}"
+    return [
+        symbol
+        for symbol in symbol_store.find_by_qualname_and_kind(qualname=item.attribute, kind="function")
+        if module_path_matches(symbol.path, submodule_dotted)
+    ]
+
+
 def unresolved_deferred_sites(
     deferred_calls: list[DeferredImportCall],
     deferred_inherits: list[DeferredImportInherit],
     symbol_store: SymbolStore,
 ) -> UnresolvedSites:
     """Deferred calls/inherits with no current repo-index candidate."""
+    plain_calls = [c for c in deferred_calls if c.attribute is None]
+    attribute_calls = [c for c in deferred_calls if c.attribute is not None]
     return UnresolvedSites(
-        calls=[item for item in deferred_calls if not _candidates_for(item, symbol_store, kind="function")],
+        calls=(
+            [item for item in plain_calls if not _candidates_for(item, symbol_store, kind="function")]
+            + [item for item in attribute_calls if not _attribute_call_candidates(item, symbol_store)]
+        ),
         inherits=[item for item in deferred_inherits if not _candidates_for(item, symbol_store, kind="class")],
     )
 
@@ -153,6 +176,26 @@ def _resolve_deferred(
                     site_col=item.site_col,
                     confidence=confidence,
                     provenance=item.provenance,
+                )
+            )
+    return relations
+
+
+def _resolve_deferred_attribute_calls(
+    deferred_items: list[DeferredImportCall], symbol_store: SymbolStore
+) -> list[Relation]:
+    relations: list[Relation] = []
+    for item in deferred_items:
+        candidates = _attribute_call_candidates(item, symbol_store)
+        if not candidates:
+            continue
+        confidence = Confidence.EXTRACTED if len(candidates) == 1 else Confidence.AMBIGUOUS
+        for candidate in candidates:
+            relations.append(
+                Relation(
+                    source=item.source, target=candidate.id, predicate="calls",
+                    site_file=item.site_file, site_line=item.site_line, site_col=item.site_col,
+                    confidence=confidence, provenance=item.provenance,
                 )
             )
     return relations

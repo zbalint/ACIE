@@ -520,10 +520,40 @@ def test_call_to_a_name_imported_from_another_module_is_deferred_not_dropped():
     assert deferred_call.provenance.provider == "tree-sitter"
 
 
+def test_attribute_call_to_a_submodule_imported_from_another_module_is_deferred_not_dropped():
+    source = "from acie import scan\n\n\nscan.run_scan(path)\n"
+
+    relations, deferred, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
+        path="src/acie/cli.py", source_text=source, observed_at="2026-09-05T00:00:00Z"
+    )
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+    assert deferred_inherits == []
+    assert deferred_overrides == []
+    assert len(deferred) == 1
+    deferred_call = deferred[0]
+    assert deferred_call.source == "src/acie/cli.py:#module"
+    assert deferred_call.module_path == "acie"
+    assert deferred_call.name == "scan"
+    assert deferred_call.attribute == "run_scan"
+    assert deferred_call.site_file == "src/acie/cli.py"
+    assert deferred_call.site_line == 4
+    assert deferred_call.site_col == 5
+    assert deferred_call.provenance.provider == "tree-sitter"
+
+
 def test_extract_relations_public_function_omits_deferred_calls_entirely():
     source = "from pkg.other import helper\n\n\nhelper()\n"
 
     relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_extract_relations_public_function_omits_deferred_attribute_calls_entirely():
+    source = "from acie import scan\n\n\nscan.run_scan(path)\n"
+
+    relations = extract_relations(path="src/acie/cli.py", source_text=source, observed_at="2026-09-05T00:00:00Z")
 
     assert [r for r in relations if r.predicate == "calls"] == []
 

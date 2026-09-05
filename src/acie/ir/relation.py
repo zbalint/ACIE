@@ -17,14 +17,19 @@ class Relation:
 
 @dataclass(frozen=True)
 class DeferredImportCall:
-    """A bare `name(...)` call whose name resolves to no same-file symbol
-    but *is* imported (`from module_path import name`) in this file --
+    """A bare `name(...)` call, OR a `name.attribute(...)` call where
+    `name` is imported (`from module_path import name`) in this file --
     extract_relations (single-file, pure) can go no further than naming the
-    calling symbol and the imported name/module it came from. Cross-file
-    resolution against the repo-wide symbol index happens in indexer.py,
-    which turns a successfully-resolved one into a normal `calls` Relation;
-    one that stays unresolved (target file not yet indexed, or genuinely
-    external) simply produces no edge, same as an undefined name today.
+    calling symbol and the imported name/module it came from (plus, for the
+    attribute form, the attribute name itself). Cross-file resolution against
+    the repo-wide symbol index happens in indexer.py: `attribute is None`
+    resolves `name` as a symbol imported directly from `module_path`;
+    `attribute is not None` resolves `name` as a SUBMODULE of `module_path`
+    first, then `attribute` as a top-level symbol within that submodule's own
+    file (mirroring DeferredImportOverride's base-class-then-method
+    two-step). One that stays unresolved either way (target file not yet
+    indexed, or genuinely external, or `name` doesn't actually denote a
+    submodule) simply produces no edge, same as an undefined name today.
     """
 
     source: str
@@ -34,6 +39,7 @@ class DeferredImportCall:
     site_line: int
     site_col: int
     provenance: Provenance
+    attribute: str | None = None
 
 
 @dataclass(frozen=True)

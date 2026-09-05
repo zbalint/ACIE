@@ -301,6 +301,139 @@ def test_cross_file_imported_call_stays_unresolved_when_the_callee_is_indexed_fi
     assert calls[0].target == "pkg/other.py:helper#function"
 
 
+def test_cross_file_imported_submodule_attribute_call_resolves_to_a_top_level_function():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/scan.py",
+        source_text="def run_scan(path):\n    pass\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/cli.py",
+        source_text="from pkg import scan\n\n\nscan.run_scan(path)\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    calls = relation_store.list_by_site_file("pkg/cli.py", predicates={"calls"})
+    assert len(calls) == 1
+    assert calls[0].source == "pkg/cli.py:#module"
+    assert calls[0].target == "pkg/scan.py:run_scan#function"
+    assert calls[0].site_file == "pkg/cli.py"
+    assert calls[0].site_line == 4
+    assert calls[0].site_col == 5
+    assert calls[0].confidence == Confidence.EXTRACTED
+
+
+def test_cross_file_imported_submodule_attribute_call_stays_unresolved_when_the_callee_is_indexed_first_the_other_way_around():
+    """Pins the existing caller-first ordering contract for attribute calls:
+    indexing the callee does not retarget a previously missed caller until
+    the caller is reindexed.
+    """
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    caller_source = "from pkg import scan\n\n\nscan.run_scan(path)\n"
+
+    index_file(
+        path="pkg/cli.py",
+        source_text=caller_source,
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert relation_store.list_by_site_file("pkg/cli.py", predicates={"calls"}) == []
+
+    index_file(
+        path="pkg/scan.py",
+        source_text="def run_scan(path):\n    pass\n",
+        observed_at="2026-09-05T00:01:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert relation_store.list_by_site_file("pkg/cli.py", predicates={"calls"}) == []
+
+    index_file(
+        path="pkg/cli.py",
+        source_text=caller_source,
+        observed_at="2026-09-05T00:02:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    calls = relation_store.list_by_site_file("pkg/cli.py", predicates={"calls"})
+    assert len(calls) == 1
+    assert calls[0].target == "pkg/scan.py:run_scan#function"
+    assert calls[0].site_line == 4
+    assert calls[0].site_col == 5
+
+
+def test_attribute_call_on_an_imported_function_does_not_resolve_as_a_submodule():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg.py",
+        source_text="def helper():\n    pass\n\n\ndef something():\n    pass\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text="from pkg import helper\n\n\nhelper.something()\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    assert relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"}) == []
+
+
+def test_unresolved_deferred_sites_tracks_attribute_calls_until_submodule_is_indexed():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    source = "from pkg import scan\n\n\nscan.run_scan(path)\n"
+
+    _, deferred_calls, deferred_inherits, _ = extract_relations_with_deferred_edges(
+        "pkg/cli.py", source, "2026-09-05T00:00:00Z"
+    )
+
+    unresolved = unresolved_deferred_sites(deferred_calls, deferred_inherits, symbol_store)
+
+    assert len(unresolved.calls) == 1
+    assert unresolved.calls[0].name == "scan"
+    assert unresolved.calls[0].attribute == "run_scan"
+    assert unresolved.calls[0].site_line == 4
+    assert unresolved.calls[0].site_col == 5
+
+    index_file(
+        path="pkg/scan.py",
+        source_text="def run_scan(path):\n    pass\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    assert unresolved_deferred_sites(deferred_calls, deferred_inherits, symbol_store).calls == []
+
+
 def test_cross_file_call_matching_two_same_suffix_module_paths_is_ambiguous():
     """Two files whose dotted-path suffix both match the imported module
     path (e.g. two vendored `pkg/other.py` copies under different roots) --

@@ -142,6 +142,29 @@ def test_enrichment_resolves_an_unpersisted_deferred_site_and_normalizes_locatio
     assert len(queue.submissions) == 1
 
 
+def test_enrichment_includes_an_unresolved_attribute_deferred_site(monkeypatch, tmp_path):
+    symbols = SymbolStore(":memory:")
+    relations = RelationStore(":memory:")
+    target = _symbol("pkg/scan.py:run_scan#function", "pkg/scan.py")
+    # Keep a plain-call candidate at the imported module path so the old
+    # unresolved-site check cannot mistake this attribute call for resolved.
+    # The attribute-aware check must look for `run_scan` in `external.scan`.
+    decoy = _symbol("external.py:scan#function", "external.py")
+    symbols.upsert(target)
+    symbols.upsert(decoy)
+    location = {"uri": (tmp_path / "pkg/scan.py").as_uri(), "range": {"start": {"line": 0, "character": 0}}}
+    client = FakeClient([[location]])
+    files = [("pkg/caller.py", "from external import scan\n\n\nscan.run_scan(path)\n")]
+
+    resolved, queue = _run(monkeypatch, tmp_path, client, symbols, relations, files)
+
+    assert [(relation.predicate, relation.target) for relation in resolved] == [("calls", target.id)]
+    assert resolved[0].site_line == 4
+    assert resolved[0].site_col == 5
+    assert client.requests[0][1]["position"] == {"line": 3, "character": 5}
+    assert len(queue.submissions) == 1
+
+
 @pytest.mark.parametrize(
     "definition_result, target_exists",
     [(None, True), ([], True), ([{"uri": "file:///one.py", "range": {"start": {"line": 0, "character": 0}}}] * 2, True), ([{"uri": "file:///outside.py", "range": {"start": {"line": 0, "character": 0}}}], True), ([{"uri": "file:///inside.py", "range": {"start": {"line": 0, "character": 0}}}], False)],

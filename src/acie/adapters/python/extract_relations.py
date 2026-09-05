@@ -129,11 +129,17 @@ def _call_and_reference_relations(
     assignment-RHS references only (this slice's cut). `self.foo()` is
     deterministically resolvable with tree-sitter alone -- `self` always
     names the enclosing class's own instance, no type inference needed --
-    so it's in scope; `obj.attr()`/`ClassName.method()` and any other
-    attribute-access form on something other than literal `self` require
-    real type/reference resolution and stay explicitly deferred. A bare
-    name passed as a call argument or returned is likewise deferred, since
-    only assignment RHS is checked.
+    so it's in scope. An attribute-access call on anything else stays
+    explicitly deferred (a DeferredImportCall with `attribute` set, see F1)
+    only when the base identifier is itself a `from`-imported name
+    (import_alias_map) -- e.g. `scan.run_scan()` where `from acie import
+    scan`. Any other base -- a local variable, a plain `import x` module, a
+    nested attribute chain (`pkg.sub.func()`) -- still requires real
+    type/reference resolution this pure, single-file pass can't do, and is
+    silently dropped, not deferred; `ClassName.method()` through an
+    imported class is the same shape but a distinct, still-unbuilt
+    resolution (F2). A bare name passed as a call argument or returned is
+    likewise deferred, since only assignment RHS is checked.
 
     A bare call whose name matches neither top_level_by_name nor
     methods_by_class, but *is* a `from`-imported name (import_alias_map),
@@ -207,17 +213,26 @@ def _call_and_reference_relations(
             elif function_node is not None and function_node.type == "attribute":
                 object_node = function_node.child_by_field_name("object")
                 attribute_node = function_node.child_by_field_name("attribute")
-                if (
-                    object_node is not None
-                    and object_node.type == "identifier"
-                    and object_node.text == b"self"
-                    and attribute_node is not None
-                    and current_class is not None
-                ):
-                    candidates = methods_by_class.get(current_class.qualname, {}).get(
-                        attribute_node.text.decode("utf-8"), []
-                    )
-                    resolve(attribute_node, source=current_source, candidates=candidates, predicate="calls")
+                if object_node is not None and object_node.type == "identifier" and attribute_node is not None:
+                    object_name = object_node.text.decode("utf-8")
+                    if object_name == "self" and current_class is not None:
+                        candidates = methods_by_class.get(current_class.qualname, {}).get(
+                            attribute_node.text.decode("utf-8"), []
+                        )
+                        resolve(attribute_node, source=current_source, candidates=candidates, predicate="calls")
+                    elif object_name in import_alias_map:
+                        deferred.append(
+                            DeferredImportCall(
+                                source=current_source.id,
+                                module_path=import_alias_map[object_name],
+                                name=object_name,
+                                attribute=attribute_node.text.decode("utf-8"),
+                                site_file=path,
+                                site_line=attribute_node.start_point.row + 1,
+                                site_col=attribute_node.start_point.column,
+                                provenance=provenance,
+                            )
+                        )
         elif node.type == "assignment":
             right_node = node.child_by_field_name("right")
             if right_node is not None and right_node.type == "identifier":
