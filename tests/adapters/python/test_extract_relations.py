@@ -85,8 +85,10 @@ def test_relative_from_import_is_extracted_and_drives_deferred_import_call():
     assert import_rel.site_line == 1
     assert import_rel.confidence == Confidence.EXTRACTED
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+        )
     )
 
     assert [r for r in relations if r.predicate == "calls"] == []
@@ -124,8 +126,10 @@ def test_relative_from_imports_resolve_parent_and_submodule_with_mixed_names():
     assert all(r.site_line == 2 for r in imports if r.target != "pkg.parent")
     assert all(r.confidence == Confidence.EXTRACTED for r in imports)
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+        )
     )
 
     assert [r for r in relations if r.predicate == "calls"] == []
@@ -152,8 +156,10 @@ def test_aliased_from_import_targets_original_name_and_defers_attribute_call():
     assert import_rel.site_line == 1
     assert import_rel.confidence == Confidence.EXTRACTED
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+        )
     )
 
     assert [r for r in relations if r.predicate == "calls"] == []
@@ -184,8 +190,10 @@ def test_plain_aliased_import_targets_original_module_without_alias_map_entry():
     assert import_rel.site_line == 1
     assert import_rel.confidence == Confidence.EXTRACTED
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+        )
     )
 
     assert [r for r in relations if r.predicate == "calls"] == []
@@ -208,8 +216,10 @@ def test_function_local_from_import_is_attributed_to_module_and_drives_deferred_
     assert import_rel.site_line == 2
     assert import_rel.confidence == Confidence.EXTRACTED
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+        )
     )
 
     assert [r for r in relations if r.predicate == "calls"] == []
@@ -234,8 +244,10 @@ def test_relative_import_that_walks_above_top_level_package_is_skipped():
 
     assert [r for r in relations if r.predicate == "imports"] == []
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+        )
     )
 
     assert [r for r in relations if r.predicate == "imports"] == []
@@ -297,8 +309,10 @@ def test_class_inheriting_from_a_name_imported_from_another_module_is_deferred_n
     # silently dropped like a genuinely undefined name would be.
     source = "from pkg.other import Base\n\n\nclass Foo(Base):\n    pass\n"
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+        )
     )
 
     assert [r for r in relations if r.predicate == "inherits"] == []
@@ -320,8 +334,10 @@ def test_class_with_one_same_file_base_and_one_imported_base_defers_only_the_imp
     # the imported one, not treat the whole class as one all-or-nothing case.
     source = "from pkg.other import Imported\n\n\nclass SameFile:\n    pass\n\n\nclass Foo(SameFile, Imported):\n    pass\n"
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+        )
     )
 
     inherits = [r for r in relations if r.predicate == "inherits"]
@@ -342,8 +358,10 @@ def test_class_inheriting_from_a_name_from_a_plain_import_statement_is_not_defer
     # defer cross-module inherits, same as the calls-side equivalent.
     source = "import pkg.other\n\n\nclass Foo(other):\n    pass\n"
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+        )
     )
 
     assert deferred_inherits == []
@@ -456,8 +474,10 @@ def test_override_from_a_base_class_imported_from_another_module_is_deferred_not
     # genuinely undefined name would be.
     source = "from pkg.other import Base\n\n\nclass Foo(Base):\n    def bar(self):\n        pass\n"
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+        )
     )
 
     assert [r for r in relations if r.predicate == "overrides"] == []
@@ -476,8 +496,10 @@ def test_override_from_a_base_class_imported_from_another_module_is_deferred_not
 def test_class_with_no_methods_produces_no_deferred_override_even_with_an_imported_base():
     source = "from pkg.other import Base\n\n\nclass Foo(Base):\n    pass\n"
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+        )
     )
 
     assert deferred_overrides == []
@@ -495,8 +517,10 @@ def test_class_with_one_same_file_base_and_one_imported_base_defers_the_override
         "class Foo(SameFile, Imported):\n    def bar(self):\n        pass\n"
     )
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+        )
     )
 
     overrides = [r for r in relations if r.predicate == "overrides"]
@@ -520,8 +544,10 @@ def test_override_check_against_a_name_from_a_plain_import_statement_is_not_defe
     # equivalents.
     source = "import pkg.other\n\n\nclass Foo(other):\n    def bar(self):\n        pass\n"
 
-    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    relations, deferred_calls, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+        )
     )
 
     assert deferred_overrides == []
@@ -583,6 +609,219 @@ def test_self_method_call_resolves_to_the_method_in_the_same_class():
     assert rel.source == "pkg/mod.py:Foo.caller#method"
     assert rel.target == "pkg/mod.py:Foo.callee#method"
     assert rel.confidence == Confidence.EXTRACTED
+
+
+def test_self_method_call_resolves_to_a_method_defined_on_a_same_file_base_class():
+    source = (
+        "class Base:\n"
+        "    def callee(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class Foo(Base):\n"
+        "    def caller(self):\n"
+        "        self.callee()\n"
+    )
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    rel = calls[0]
+    assert rel.source == "pkg/mod.py:Foo.caller#method"
+    assert rel.target == "pkg/mod.py:Base.callee#method"
+    assert rel.confidence == Confidence.EXTRACTED
+    assert rel.site_line == 8
+
+
+def test_self_method_call_resolves_transitively_through_same_file_base_classes():
+    source = (
+        "class Root:\n"
+        "    def callee(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class Middle(Root):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class Leaf(Middle):\n"
+        "    def caller(self):\n"
+        "        self.callee()\n"
+    )
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    rel = calls[0]
+    assert rel.source == "pkg/mod.py:Leaf.caller#method"
+    assert rel.target == "pkg/mod.py:Root.callee#method"
+    assert rel.confidence == Confidence.EXTRACTED
+    assert rel.site_line == 12
+
+
+def test_self_method_call_stops_each_base_branch_at_its_nearest_method():
+    source = (
+        "class Root:\n"
+        "    def callee(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class Middle(Root):\n"
+        "    def callee(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class Leaf(Middle):\n"
+        "    def caller(self):\n"
+        "        self.callee()\n"
+    )
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    assert calls[0].target == "pkg/mod.py:Middle.callee#method"
+    assert calls[0].confidence == Confidence.EXTRACTED
+
+
+def test_self_method_call_cycle_in_same_file_base_graph_does_not_loop():
+    source = (
+        "class A(B):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class B(A):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class Leaf(A):\n"
+        "    def caller(self):\n"
+        "        self.callee()\n"
+    )
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_self_method_call_through_a_same_file_diamond_is_ambiguous():
+    source = (
+        "class Root:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class Left(Root):\n"
+        "    def callee(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class Right(Root):\n"
+        "    def callee(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class Foo(Left, Right):\n"
+        "    def caller(self):\n"
+        "        self.callee()\n"
+    )
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 2
+    assert {r.target for r in calls} == {
+        "pkg/mod.py:Left.callee#method",
+        "pkg/mod.py:Right.callee#method",
+    }
+    assert all(r.source == "pkg/mod.py:Foo.caller#method" for r in calls)
+    assert all(r.confidence == Confidence.AMBIGUOUS for r in calls)
+    assert all(r.site_line == 17 for r in calls)
+
+
+def test_self_method_call_through_unrelated_mixin_composition_site_stays_unresolved_under_h1():
+    source = (
+        "class EntitiesMixin:\n"
+        "    def caller(self):\n"
+        "        self.send_json()\n"
+        "\n"
+        "\n"
+        "class ViewerHandlerBase:\n"
+        "    def send_json(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class SALTMDBHandler(EntitiesMixin, ViewerHandlerBase):\n"
+        "    pass\n"
+    )
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+
+
+def test_self_method_call_through_an_imported_base_is_deferred_not_dropped():
+    source = (
+        "from pkg.other import Base\n\n\n"
+        "class Foo(Base):\n"
+        "    def caller(self):\n"
+        "        self.callee()\n"
+    )
+
+    relations, deferred_calls, deferred_inherits, deferred_overrides, deferred_self_calls = (
+        extract_relations_with_deferred_edges(
+            path="pkg/mod.py", source_text=source, observed_at="2026-09-05T00:00:00Z"
+        )
+    )
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+    assert deferred_calls == []
+    assert len(deferred_inherits) == 1
+    assert len(deferred_overrides) == 1
+    assert deferred_overrides[0].method_name == "caller"
+    assert len(deferred_self_calls) == 1
+    deferred_self_call = deferred_self_calls[0]
+    assert deferred_self_call.source == "pkg/mod.py:Foo.caller#method"
+    assert deferred_self_call.module_path == "pkg.other"
+    assert deferred_self_call.base_name == "Base"
+    assert deferred_self_call.method_name == "callee"
+    assert deferred_self_call.site_file == "pkg/mod.py"
+    assert deferred_self_call.site_line == 6
+    assert deferred_self_call.site_col == 13
+    assert deferred_self_call.provenance.provider == "tree-sitter"
+
+
+def test_self_method_call_keeps_same_and_cross_file_bases_independent():
+    source = (
+        "from pkg.other import Imported\n\n\n"
+        "class Local:\n"
+        "    def callee(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class Foo(Local, Imported):\n"
+        "    def caller(self):\n"
+        "        self.callee()\n"
+    )
+
+    (
+        relations,
+        _,
+        _,
+        _,
+        deferred_self_calls,
+    ) = extract_relations_with_deferred_edges(
+        path="pkg/mod.py", source_text=source, observed_at="2026-09-05T00:00:00Z"
+    )
+
+    calls = [r for r in relations if r.predicate == "calls"]
+    assert len(calls) == 1
+    assert calls[0].target == "pkg/mod.py:Local.callee#method"
+    assert calls[0].confidence == Confidence.EXTRACTED
+    assert len(deferred_self_calls) == 1
+    assert deferred_self_calls[0].base_name == "Imported"
+
 
 
 def test_self_method_call_to_a_method_on_a_different_class_produces_no_edge():
@@ -685,8 +924,10 @@ def test_reference_to_a_name_not_defined_in_this_file_produces_no_edge():
 def test_call_to_a_name_imported_from_another_module_is_deferred_not_dropped():
     source = "from pkg.other import helper\n\n\nhelper()\n"
 
-    relations, deferred, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    relations, deferred, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+        )
     )
 
     # extract_relations is single-file-scoped and can never resolve this by
@@ -707,8 +948,10 @@ def test_call_to_a_name_imported_from_another_module_is_deferred_not_dropped():
 def test_attribute_call_to_a_submodule_imported_from_another_module_is_deferred_not_dropped():
     source = "from acie import scan\n\n\nscan.run_scan(path)\n"
 
-    relations, deferred, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="src/acie/cli.py", source_text=source, observed_at="2026-09-05T00:00:00Z"
+    relations, deferred, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="src/acie/cli.py", source_text=source, observed_at="2026-09-05T00:00:00Z"
+        )
     )
 
     assert [r for r in relations if r.predicate == "calls"] == []
@@ -748,8 +991,10 @@ def test_call_to_a_name_from_a_plain_import_statement_is_not_deferred():
     # cross-module calls.
     source = "import pkg.other\n\n\nother()\n"
 
-    relations, deferred, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    relations, deferred, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+        )
     )
 
     assert deferred == []
@@ -1176,8 +1421,10 @@ def test_fixture_di_edges_are_included_in_deferred_edges_entry_point_too():
         "    pass\n"
     )
 
-    relations, deferred, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
-        path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+    relations, deferred, deferred_inherits, deferred_overrides, _ = (
+        extract_relations_with_deferred_edges(
+            path="tests/test_mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z"
+        )
     )
 
     calls = [r for r in relations if r.predicate == "calls"]

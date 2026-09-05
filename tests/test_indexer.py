@@ -404,14 +404,55 @@ def test_attribute_call_on_an_imported_function_does_not_resolve_as_a_submodule(
     assert relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"}) == []
 
 
+def test_unresolved_deferred_sites_tracks_self_calls_until_the_base_method_is_indexed():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    source = (
+        "from pkg.other import Base\n\n\n"
+        "class Foo(Base):\n"
+        "    def caller(self):\n"
+        "        self.callee()\n"
+    )
+    (
+        _,
+        deferred_calls,
+        deferred_inherits,
+        _,
+        deferred_self_calls,
+    ) = extract_relations_with_deferred_edges(
+        path="pkg/mod.py", source_text=source, observed_at="2026-09-05T00:00:00Z"
+    )
+
+    unresolved = unresolved_deferred_sites(
+        deferred_calls, deferred_inherits, symbol_store, deferred_self_calls
+    )
+    assert len(unresolved.calls) == 1
+    assert unresolved.calls[0].method_name == "callee"
+
+    index_file(
+        path="pkg/other.py",
+        source_text="class Base:\n    def callee(self):\n        pass\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert unresolved_deferred_sites(
+        deferred_calls, deferred_inherits, symbol_store, deferred_self_calls
+    ).calls == []
+
+
 def test_unresolved_deferred_sites_tracks_attribute_calls_until_submodule_is_indexed():
     symbol_store = SymbolStore(":memory:")
     relation_store = RelationStore(":memory:")
     index_meta_store = IndexMetaStore(":memory:")
     source = "from pkg import scan\n\n\nscan.run_scan(path)\n"
 
-    _, deferred_calls, deferred_inherits, _ = extract_relations_with_deferred_edges(
-        "pkg/cli.py", source, "2026-09-05T00:00:00Z"
+    _, deferred_calls, deferred_inherits, _, _ = (
+        extract_relations_with_deferred_edges(
+            "pkg/cli.py", source, "2026-09-05T00:00:00Z"
+        )
     )
 
     unresolved = unresolved_deferred_sites(deferred_calls, deferred_inherits, symbol_store)
@@ -688,6 +729,244 @@ def test_removing_a_base_class_symbol_tombstones_a_cross_file_inherits_edge_into
     assert symbol_store.get("pkg/other.py:Base#class") is None
     stale_inherits = relation_store.list_by_site_file("pkg/mod.py", predicates={"inherits"})
     assert stale_inherits == []
+    assert result.relations_tombstoned >= 1
+
+
+def test_cross_file_self_method_call_resolves_once_the_base_file_is_indexed():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/other.py",
+        source_text="class Base:\n    def callee(self):\n        pass\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text=(
+            "from pkg.other import Base\n\n\n"
+            "class Foo(Base):\n"
+            "    def caller(self):\n"
+            "        self.callee()\n"
+        ),
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 1
+    assert calls[0].source == "pkg/mod.py:Foo.caller#method"
+    assert calls[0].target == "pkg/other.py:Base.callee#method"
+    assert calls[0].confidence == Confidence.EXTRACTED
+
+
+def test_cross_file_self_method_call_keeps_same_and_cross_file_bases_independent():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/other.py",
+        source_text="class Imported:\n    def callee(self):\n        pass\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text=(
+            "from pkg.other import Imported\n\n\n"
+            "class Local:\n"
+            "    def callee(self):\n"
+            "        pass\n\n\n"
+            "class Foo(Local, Imported):\n"
+            "    def caller(self):\n"
+            "        self.callee()\n"
+        ),
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 2
+    assert {r.target for r in calls} == {
+        "pkg/mod.py:Local.callee#method",
+        "pkg/other.py:Imported.callee#method",
+    }
+    assert all(r.confidence == Confidence.EXTRACTED for r in calls)
+
+
+def test_cross_file_self_method_call_stays_unresolved_until_the_subclass_is_reindexed():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    subclass_source = (
+        "from pkg.other import Base\n\n\n"
+        "class Foo(Base):\n"
+        "    def caller(self):\n"
+        "        self.callee()\n"
+    )
+
+    index_file(
+        path="pkg/mod.py",
+        source_text=subclass_source,
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"}) == []
+
+    index_file(
+        path="pkg/other.py",
+        source_text="class Base:\n    def callee(self):\n        pass\n",
+        observed_at="2026-09-05T00:01:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"}) == []
+
+    index_file(
+        path="pkg/mod.py",
+        source_text=subclass_source,
+        observed_at="2026-09-05T00:02:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 1
+    assert calls[0].target == "pkg/other.py:Base.callee#method"
+
+
+def test_cross_file_self_method_call_matching_two_same_suffix_module_paths_is_ambiguous():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    for path in ("vendor_a/pkg/other.py", "vendor_b/pkg/other.py"):
+        index_file(
+            path=path,
+            source_text="class Base:\n    def callee(self):\n        pass\n",
+            observed_at="2026-09-05T00:00:00Z",
+            symbol_store=symbol_store,
+            relation_store=relation_store,
+            index_meta_store=index_meta_store,
+        )
+    index_file(
+        path="pkg/mod.py",
+        source_text=(
+            "from pkg.other import Base\n\n\n"
+            "class Foo(Base):\n"
+            "    def caller(self):\n"
+            "        self.callee()\n"
+        ),
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 2
+    assert {r.target for r in calls} == {
+        "vendor_a/pkg/other.py:Base.callee#method",
+        "vendor_b/pkg/other.py:Base.callee#method",
+    }
+    assert all(r.confidence == Confidence.AMBIGUOUS for r in calls)
+
+
+def test_cross_file_self_method_call_does_not_leak_an_unrelated_same_named_base():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+
+    index_file(
+        path="pkg/other.py",
+        source_text="class Base:\n    def callee(self):\n        pass\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="unrelated.py",
+        source_text="class Base:\n    def callee(self):\n        pass\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text=(
+            "from pkg.other import Base\n\n\n"
+            "class Foo(Base):\n"
+            "    def caller(self):\n"
+            "        self.callee()\n"
+        ),
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 1
+    assert calls[0].target == "pkg/other.py:Base.callee#method"
+    assert calls[0].confidence == Confidence.EXTRACTED
+
+
+def test_removing_a_cross_file_self_call_base_method_tombstones_the_calls_edge():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    subclass_source = (
+        "from pkg.other import Base\n\n\n"
+        "class Foo(Base):\n"
+        "    def caller(self):\n"
+        "        self.callee()\n"
+    )
+
+    index_file(
+        path="pkg/other.py",
+        source_text="class Base:\n    def callee(self):\n        pass\n",
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/mod.py",
+        source_text=subclass_source,
+        observed_at="2026-09-05T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    assert len(relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})) == 1
+
+    result = index_file(
+        path="pkg/other.py",
+        source_text="class Base:\n    def renamed(self):\n        pass\n",
+        observed_at="2026-09-05T00:01:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    assert symbol_store.get("pkg/other.py:Base.callee#method") is None
+    assert relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"}) == []
     assert result.relations_tombstoned >= 1
 
 
@@ -969,8 +1248,8 @@ def test_unresolved_deferred_sites_returns_only_zero_candidate_calls_and_inherit
         "class Child(MissingBase):\n"
         "    pass\n"
     )
-    _, deferred_calls, deferred_inherits, _ = extract_relations_with_deferred_edges(
-        "pkg/mod.py", source, observed_at
+    _, deferred_calls, deferred_inherits, _, _ = (
+        extract_relations_with_deferred_edges("pkg/mod.py", source, observed_at)
     )
 
     unresolved = unresolved_deferred_sites(deferred_calls, deferred_inherits, symbol_store)

@@ -88,3 +88,22 @@ class DeferredImportOverride:
     site_line: int
     site_col: int
     provenance: Provenance
+
+
+@dataclass(frozen=True)
+class DeferredImportSelfCall:
+    """A `self.method(...)` call whose method may live on an imported base.
+
+    extract_relations can identify the calling method and imported base name,
+    but only indexer.py's repo-wide symbol index can resolve the base class and
+    its same-named method.
+    """
+
+    source: str
+    module_path: str
+    base_name: str
+    method_name: str
+    site_file: str
+    site_line: int
+    site_col: int
+    provenance: Provenance

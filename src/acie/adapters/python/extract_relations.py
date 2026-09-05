@@ -5,7 +5,13 @@ from tree_sitter import Language, Parser
 
 from acie.adapters.python.extract_symbols import extract_symbols
 from acie.module_paths import path_to_dotted
-from acie.ir.relation import DeferredImportCall, DeferredImportInherit, DeferredImportOverride, Relation
+from acie.ir.relation import (
+    DeferredImportCall,
+    DeferredImportInherit,
+    DeferredImportOverride,
+    DeferredImportSelfCall,
+    Relation,
+)
 from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.pytest_conventions import is_test_file_path, is_test_qualname
 
@@ -21,31 +27,43 @@ _FIXTURE_HEURISTIC_VERSION = "1"
 def extract_relations(path: str, source_text: str, observed_at: str) -> list[Relation]:
     """Same-file relations only -- see extract_relations_with_deferred_edges
     for the sibling entry point that also surfaces cross-file-candidate
-    calls/inherits this pure, single-file function cannot itself resolve.
+    calls/inherits/overrides/self-calls this pure, single-file function cannot
+    itself resolve.
     """
-    relations, _deferred_calls, _deferred_inherits, _deferred_overrides = _extract(
-        path=path, source_text=source_text, observed_at=observed_at
-    )
+    (
+        relations,
+        _deferred_calls,
+        _deferred_inherits,
+        _deferred_overrides,
+        _deferred_self_calls,
+    ) = _extract(path=path, source_text=source_text, observed_at=observed_at)
     return relations
 
 
 def extract_relations_with_deferred_edges(
     path: str, source_text: str, observed_at: str
-) -> tuple[list[Relation], list[DeferredImportCall], list[DeferredImportInherit], list[DeferredImportOverride]]:
-    """Like extract_relations, but also returns bare-identifier calls,
-    `class Foo(Base):` base identifiers, and method overrides of such a base
-    whose name resolves to no same-file symbol yet *is* imported in this
-    file -- candidates for cross-file resolution against the repo-wide
-    symbol index, which only indexer.py (not this pure, single-file
-    function) can do. See DeferredImportCall / DeferredImportInherit /
-    DeferredImportOverride.
+) -> tuple[
+    list[Relation],
+    list[DeferredImportCall],
+    list[DeferredImportInherit],
+    list[DeferredImportOverride],
+    list[DeferredImportSelfCall],
+]:
+    """Like extract_relations, but also returns deferred cross-file candidates
+    for calls, inherits, overrides, and self-calls through imported bases.
     """
     return _extract(path=path, source_text=source_text, observed_at=observed_at)
 
 
 def _extract(
     path: str, source_text: str, observed_at: str
-) -> tuple[list[Relation], list[DeferredImportCall], list[DeferredImportInherit], list[DeferredImportOverride]]:
+) -> tuple[
+    list[Relation],
+    list[DeferredImportCall],
+    list[DeferredImportInherit],
+    list[DeferredImportOverride],
+    list[DeferredImportSelfCall],
+]:
     symbols = extract_symbols(path=path, source_text=source_text, observed_at=observed_at)
     provenance = Provenance(
         provider="tree-sitter", version=_PROVENANCE_VERSION, observed_at=observed_at
@@ -57,14 +75,16 @@ def _extract(
 
     top_level_by_name = _index_top_level_symbols(symbols)
     methods_by_class = _index_methods_by_class(symbols)
+    top_level_base_names = _top_level_base_names(tree.root_node)
     import_relations, import_alias_map = _import_relations(
         tree.root_node, module=module, path=path, provenance=provenance
     )
-    call_relations, deferred_calls = _call_and_reference_relations(
+    call_relations, deferred_calls, deferred_self_calls = _call_and_reference_relations(
         tree.root_node,
         symbols,
         top_level_by_name=top_level_by_name,
         methods_by_class=methods_by_class,
+        top_level_base_names=top_level_base_names,
         import_alias_map=import_alias_map,
         module=module,
         path=path,
@@ -75,6 +95,7 @@ def _extract(
         tree.root_node,
         symbols,
         top_level_by_name=top_level_by_name,
+        top_level_base_names=top_level_base_names,
         import_alias_map=import_alias_map,
         path=path,
         provenance=provenance,
@@ -84,10 +105,12 @@ def _extract(
         tree.root_node,
         top_level_by_name=top_level_by_name,
         methods_by_class=methods_by_class,
+        top_level_base_names=top_level_base_names,
         import_alias_map=import_alias_map,
         path=path,
         provenance=provenance,
     )
+
 
     fixture_provenance = Provenance(
         provider="pytest-fixture-heuristic", version=_FIXTURE_HEURISTIC_VERSION, observed_at=observed_at
@@ -112,7 +135,7 @@ def _extract(
     relations.extend(overrides_relations)
     relations.extend(call_relations)
     relations.extend(fixture_relations)
-    return relations, deferred_calls, deferred_inherits, deferred_overrides
+    return relations, deferred_calls, deferred_inherits, deferred_overrides, deferred_self_calls
 
 
 def _call_and_reference_relations(
@@ -121,26 +144,31 @@ def _call_and_reference_relations(
     *,
     top_level_by_name: dict[str, list[Symbol]],
     methods_by_class: dict[str, dict[str, list[Symbol]]],
+    top_level_base_names: dict[str, list[str]],
     import_alias_map: dict[str, str],
     module: Symbol,
     path: str,
     provenance: Provenance,
-) -> tuple[list[Relation], list[DeferredImportCall]]:
+) -> tuple[list[Relation], list[DeferredImportCall], list[DeferredImportSelfCall]]:
     """Unqualified `name(...)` calls, `self.name(...)` calls, and bare-name
-    assignment-RHS references only (this slice's cut). `self.foo()` is
-    deterministically resolvable with tree-sitter alone -- `self` always
-    names the enclosing class's own instance, no type inference needed --
-    so it's in scope. An attribute-access call on anything else stays
-    explicitly deferred (a DeferredImportCall with `attribute` set, see F1)
-    only when the base identifier is itself a `from`-imported name
-    (import_alias_map) -- e.g. `scan.run_scan()` where `from acie import
-    scan`. Any other base -- a local variable, a plain `import x` module, a
-    nested attribute chain (`pkg.sub.func()`) -- still requires real
-    type/reference resolution this pure, single-file pass can't do, and is
-    silently dropped, not deferred; `ClassName.method()` through an
-    imported class is the same shape but a distinct, still-unbuilt
-    resolution (F2). A bare name passed as a call argument or returned is
-    likewise deferred, since only assignment RHS is checked.
+    assignment-RHS references only. `self.foo()` resolves against the
+    enclosing class's own methods first. If that misses, same-file direct and
+    transitive bases are searched; imported bases produce a
+    DeferredImportSelfCall for indexer.py to resolve against the repo-wide
+    symbol index. A composition-site/mixin relationship is intentionally not
+    inferred here (H2).
+
+    An attribute-access call on anything else stays explicitly deferred (a
+    DeferredImportCall with `attribute` set, see F1) only when the base
+    identifier is itself a `from`-imported name (import_alias_map) -- e.g.
+    `scan.run_scan()` where `from acie import scan`. Any other base -- a local
+    variable, a plain `import x` module, a nested attribute chain
+    (`pkg.sub.func()`) -- still requires real type/reference resolution this
+    pure, single-file pass can't do, and is silently dropped, not deferred;
+    `ClassName.method()` through an imported class is the same shape but a
+    distinct, still-unbuilt resolution (F2). A bare name passed as a call
+    argument or returned is likewise deferred, since only assignment RHS is
+    checked.
 
     A bare call whose name matches neither top_level_by_name nor
     methods_by_class, but *is* a `from`-imported name (import_alias_map),
@@ -166,6 +194,54 @@ def _call_and_reference_relations(
     by_position = _symbol_by_position(symbols)
     relations: list[Relation] = []
     deferred: list[DeferredImportCall] = []
+    deferred_self_calls: list[DeferredImportSelfCall] = []
+    class_candidates_by_name = {
+        name: [s for s in candidates if s.kind == "class"]
+        for name, candidates in top_level_by_name.items()
+    }
+
+    def self_base_methods(
+        class_symbol: Symbol, method_name: str, site_node, source: Symbol
+    ) -> list[Symbol]:
+        candidates: list[Symbol] = []
+        pending = list(top_level_base_names.get(_class_position_key(class_symbol), []))
+        # The pre-indexed base graph may contain cycles; avoid revisiting a
+        # class while still allowing each direct branch to contribute.
+        visited_qualnames = {class_symbol.qualname}
+        deferred_base_names: set[tuple[str, str]] = set()
+        for base_name in pending:
+            base_symbols = class_candidates_by_name.get(base_name, [])
+            if not base_symbols:
+                if base_name in import_alias_map:
+                    module_path = import_alias_map[base_name]
+                    if (base_name, module_path) not in deferred_base_names:
+                        deferred_base_names.add((base_name, module_path))
+                        deferred_self_calls.append(
+                            DeferredImportSelfCall(
+                                source=source.id,
+                                module_path=module_path,
+                                base_name=base_name,
+                                method_name=method_name,
+                                site_file=path,
+                                site_line=site_node.start_point.row + 1,
+                                site_col=site_node.start_point.column,
+                                provenance=provenance,
+                            )
+                        )
+                continue
+            for base_symbol in base_symbols:
+                if base_symbol.qualname in visited_qualnames:
+                    continue
+                visited_qualnames.add(base_symbol.qualname)
+                # Stop this branch at its nearest definition; sibling bases
+                # remain independent candidates for ambiguity.
+                base_methods = methods_by_class.get(base_symbol.qualname, {}).get(method_name, [])
+                if base_methods:
+                    candidates.extend(base_methods)
+                    continue
+                pending.extend(top_level_base_names.get(_class_position_key(base_symbol), []))
+        return candidates
+
 
     def resolve(name_node, *, source: Symbol, candidates: list[Symbol], predicate: str) -> None:
         if not candidates:
@@ -217,9 +293,10 @@ def _call_and_reference_relations(
                 if object_node is not None and object_node.type == "identifier" and attribute_node is not None:
                     object_name = object_node.text.decode("utf-8")
                     if object_name == "self" and current_class is not None:
-                        candidates = methods_by_class.get(current_class.qualname, {}).get(
-                            attribute_node.text.decode("utf-8"), []
-                        )
+                        method_name = attribute_node.text.decode("utf-8")
+                        candidates = methods_by_class.get(current_class.qualname, {}).get(method_name, [])
+                        if not candidates:
+                            candidates = self_base_methods(current_class, method_name, attribute_node, current_source)
                         resolve(attribute_node, source=current_source, candidates=candidates, predicate="calls")
                     elif object_name in import_alias_map:
                         deferred.append(
@@ -243,7 +320,7 @@ def _call_and_reference_relations(
             walk(child, current_source, current_class)
 
     walk(root, module, None)
-    return relations, deferred
+    return relations, deferred, deferred_self_calls
 
 
 def _index_methods_by_class(symbols: list[Symbol]) -> dict[str, dict[str, list[Symbol]]]:
@@ -283,6 +360,31 @@ def _symbol_by_position(symbols: list[Symbol]) -> dict[tuple[int, int], Symbol]:
     return {(s.start_line, s.start_col): s for s in symbols}
 
 
+def _class_position_key(value) -> str:
+    if hasattr(value, "start_point"):
+        line, col = value.start_point.row + 1, value.start_point.column
+    else:
+        line, col = value.start_line, value.start_col
+    return f"{line}:{col}"
+
+
+def _top_level_base_names(root) -> dict[str, list[str]]:
+    """Top-level class-definition start position -> direct identifier bases."""
+    base_names: dict[str, list[str]] = {}
+    for child in root.named_children:
+        if child.type != "class_definition":
+            continue
+        superclasses = child.child_by_field_name("superclasses")
+        if superclasses is None:
+            continue
+        base_names[_class_position_key(child)] = [
+            base.text.decode("utf-8")
+            for base in superclasses.named_children
+            if base.type == "identifier"
+        ]
+    return base_names
+
+
 def _within_span(symbol: Symbol, node) -> bool:
     """Whether symbol's start position falls within node's [start, end] span
     (row,col tuple comparison -- same (line, col) ordering _symbol_by_position
@@ -301,6 +403,7 @@ def _inherits_relations(
     symbols: list[Symbol],
     *,
     top_level_by_name: dict[str, list[Symbol]],
+    top_level_base_names: dict[str, list[str]],
     import_alias_map: dict[str, str],
     path: str,
     provenance: Provenance,
@@ -334,10 +437,9 @@ def _inherits_relations(
         superclasses = child.child_by_field_name("superclasses")
         if source_symbol is None or superclasses is None:
             continue
-        for base in superclasses.named_children:
-            if base.type != "identifier":
-                continue
-            base_name = base.text.decode("utf-8")
+        base_nodes = [base for base in superclasses.named_children if base.type == "identifier"]
+        base_names = top_level_base_names.get(_class_position_key(child), [])
+        for base_name, base in zip(base_names, base_nodes):
             candidates = class_candidates_by_name.get(base_name, [])
             if not candidates:
                 if base_name in import_alias_map:
@@ -375,6 +477,7 @@ def _overrides_relations(
     *,
     top_level_by_name: dict[str, list[Symbol]],
     methods_by_class: dict[str, dict[str, list[Symbol]]],
+    top_level_base_names: dict[str, list[str]],
     import_alias_map: dict[str, str],
     path: str,
     provenance: Provenance,
@@ -456,10 +559,7 @@ def _overrides_relations(
 
         base_qualnames: set[str] = set()
         deferred_bases: list[tuple[str, str]] = []  # (base_name, module_path)
-        for base in superclasses.named_children:
-            if base.type != "identifier":
-                continue
-            base_name = base.text.decode("utf-8")
+        for base_name in top_level_base_names.get(_class_position_key(child), []):
             same_file_candidates = class_candidates_by_name.get(base_name, [])
             if same_file_candidates:
                 for candidate in same_file_candidates:

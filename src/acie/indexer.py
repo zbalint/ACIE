@@ -2,7 +2,13 @@ from dataclasses import dataclass
 
 from acie.adapters.python.extract_relations import extract_relations_with_deferred_edges
 from acie.adapters.python.extract_symbols import extract_symbols, has_syntax_error
-from acie.ir.relation import DeferredImportCall, DeferredImportInherit, DeferredImportOverride, Relation
+from acie.ir.relation import (
+    DeferredImportCall,
+    DeferredImportInherit,
+    DeferredImportOverride,
+    DeferredImportSelfCall,
+    Relation,
+)
 from acie.ir.symbol import Confidence, Symbol
 from acie.module_paths import module_path_matches
 from acie.storage.index_meta_store import IndexMetaStore
@@ -19,11 +25,11 @@ class IndexResult:
     relations_tombstoned: int
 
 
-
 @dataclass(frozen=True)
 class UnresolvedSites:
-    calls: list[DeferredImportCall]
+    calls: list[DeferredImportCall | DeferredImportSelfCall]
     inherits: list[DeferredImportInherit]
+
 
 def index_file(
     path: str,
@@ -43,7 +49,13 @@ def index_file(
         )
 
     new_symbols = extract_symbols(path=path, source_text=source_text, observed_at=observed_at)
-    new_relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
+    (
+        new_relations,
+        deferred_calls,
+        deferred_inherits,
+        deferred_overrides,
+        deferred_self_calls,
+    ) = extract_relations_with_deferred_edges(
         path=path, source_text=source_text, observed_at=observed_at
     )
     plain_deferred_calls = [c for c in deferred_calls if c.attribute is None]
@@ -58,6 +70,7 @@ def index_file(
         deferred_inherits, symbol_store, kind="class", predicate="inherits"
     )
     new_relations = new_relations + _resolve_deferred_overrides(deferred_overrides, symbol_store)
+    new_relations = new_relations + _resolve_deferred_self_calls(deferred_self_calls, symbol_store)
 
     prior_symbol_ids = {s.id for s in symbol_store.list_by_path(path)}
     prior_relation_keys = {_relation_key(r) for r in relation_store.list_by_site_file(path)}
@@ -134,18 +147,41 @@ def _attribute_call_candidates(item: DeferredImportCall, symbol_store: SymbolSto
     ]
 
 
+def _imported_base_method_candidates(
+    item: DeferredImportOverride | DeferredImportSelfCall, symbol_store: SymbolStore
+) -> list[Symbol]:
+    base_candidates = [
+        symbol
+        for symbol in symbol_store.find_by_qualname_and_kind(
+            qualname=item.base_name, kind="class"
+        )
+        if module_path_matches(symbol.path, item.module_path)
+    ]
+    return [
+        method
+        for base in base_candidates
+        for method in symbol_store.find_by_qualname_and_kind(
+            qualname=f"{base.qualname}.{item.method_name}", kind="method"
+        )
+        if method.path == base.path
+    ]
+
+
 def unresolved_deferred_sites(
     deferred_calls: list[DeferredImportCall],
     deferred_inherits: list[DeferredImportInherit],
     symbol_store: SymbolStore,
+    deferred_self_calls: list[DeferredImportSelfCall] | None = None,
 ) -> UnresolvedSites:
-    """Deferred calls/inherits with no current repo-index candidate."""
+    """Deferred calls/inherits/self-calls with no current repo-index candidate."""
     plain_calls = [c for c in deferred_calls if c.attribute is None]
     attribute_calls = [c for c in deferred_calls if c.attribute is not None]
+    self_calls = deferred_self_calls or []
     return UnresolvedSites(
         calls=(
             [item for item in plain_calls if not _candidates_for(item, symbol_store, kind="function")]
             + [item for item in attribute_calls if not _attribute_call_candidates(item, symbol_store)]
+            + [item for item in self_calls if not _imported_base_method_candidates(item, symbol_store)]
         ),
         inherits=[item for item in deferred_inherits if not _candidates_for(item, symbol_store, kind="class")],
     )
@@ -232,19 +268,7 @@ def _resolve_deferred_overrides(
     """
     relations: list[Relation] = []
     for item in deferred_items:
-        base_candidates = [
-            symbol
-            for symbol in symbol_store.find_by_qualname_and_kind(qualname=item.base_name, kind="class")
-            if module_path_matches(symbol.path, item.module_path)
-        ]
-        method_candidates = [
-            method
-            for base in base_candidates
-            for method in symbol_store.find_by_qualname_and_kind(
-                qualname=f"{base.qualname}.{item.method_name}", kind="method"
-            )
-            if method.path == base.path
-        ]
+        method_candidates = _imported_base_method_candidates(item, symbol_store)
         if not method_candidates:
             continue
         # shortcut: computed from this deferred item's own cross-file
@@ -258,6 +282,33 @@ def _resolve_deferred_overrides(
                     source=item.source,
                     target=method.id,
                     predicate="overrides",
+                    site_file=item.site_file,
+                    site_line=item.site_line,
+                    site_col=item.site_col,
+                    confidence=confidence,
+                    provenance=item.provenance,
+                )
+            )
+    return relations
+
+
+def _resolve_deferred_self_calls(
+    deferred_items: list[DeferredImportSelfCall],
+    symbol_store: SymbolStore,
+) -> list[Relation]:
+    """Resolve self-calls whose target method belongs to an imported base."""
+    relations: list[Relation] = []
+    for item in deferred_items:
+        method_candidates = _imported_base_method_candidates(item, symbol_store)
+        if not method_candidates:
+            continue
+        confidence = Confidence.EXTRACTED if len(method_candidates) == 1 else Confidence.AMBIGUOUS
+        for method in method_candidates:
+            relations.append(
+                Relation(
+                    source=item.source,
+                    target=method.id,
+                    predicate="calls",
                     site_file=item.site_file,
                     site_line=item.site_line,
                     site_col=item.site_col,

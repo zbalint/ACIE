@@ -124,8 +124,16 @@ def _worklist(
         for relation in relation_store.list_by_site_file(path, predicates={"calls", "inherits"}):
             if relation.confidence == Confidence.AMBIGUOUS:
                 sites.add(_Site(relation.source, relation.site_file, relation.site_line, relation.site_col, relation.predicate))
-        _, deferred_calls, deferred_inherits, _ = extract_relations_with_deferred_edges(path, source_text, observed_at)
-        unresolved = unresolved_deferred_sites(deferred_calls, deferred_inherits, symbol_store)
+        (
+            _,
+            deferred_calls,
+            deferred_inherits,
+            _,
+            deferred_self_calls,
+        ) = extract_relations_with_deferred_edges(path, source_text, observed_at)
+        unresolved = unresolved_deferred_sites(
+            deferred_calls, deferred_inherits, symbol_store, deferred_self_calls
+        )
         sites.update(_Site(item.source, item.site_file, item.site_line, item.site_col, "calls") for item in unresolved.calls)
         sites.update(_Site(item.source, item.site_file, item.site_line, item.site_col, "inherits") for item in unresolved.inherits)
     return sorted(sites)
