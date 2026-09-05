@@ -131,3 +131,20 @@ def test_does_not_retire_cross_pass_inferred_sibling():
 
     assert outcome == MergeOutcome(True, 0)
     assert store.get(**_key(prior_winner)) == prior_winner
+
+
+def test_preserves_ambiguous_siblings_when_incoming_candidate_is_ambiguous():
+    store = RelationStore(":memory:")
+    first = make_relation(target="first", confidence=Confidence.AMBIGUOUS)
+    second = make_relation(target="second", confidence=Confidence.AMBIGUOUS)
+    store.upsert(first)
+
+    outcome = apply_enrichment_write(store, second)
+
+    assert outcome == MergeOutcome(True, 0)
+    assert store.list_by_site(
+        site_file=first.site_file,
+        site_line=first.site_line,
+        site_col=first.site_col,
+        predicates={"calls"},
+    ) == [first, second]

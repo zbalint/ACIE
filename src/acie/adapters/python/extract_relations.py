@@ -50,7 +50,8 @@ def extract_relations_with_deferred_edges(
     list[DeferredImportSelfCall],
 ]:
     """Like extract_relations, but also returns deferred cross-file candidates
-    for calls, inherits, overrides, and self-calls through imported bases.
+    for calls, inherits, overrides, and self-calls, plus H2's in-memory
+    composition-site miss records.
     """
     return _extract(path=path, source_text=source_text, observed_at=observed_at)
 
@@ -155,8 +156,11 @@ def _call_and_reference_relations(
     enclosing class's own methods first. If that misses, same-file direct and
     transitive bases are searched; imported bases produce a
     DeferredImportSelfCall for indexer.py to resolve against the repo-wide
-    symbol index. A composition-site/mixin relationship is intentionally not
-    inferred here (H2).
+    symbol index. A complete H1 miss is retained as a DeferredImportSelfCall
+    for the enrichment pass's H2 composition-site walk.
+
+    A composition-site/mixin relationship is intentionally not inferred here;
+    H2 performs that reverse walk from the in-memory deferred miss.
 
     An attribute-access call on anything else stays explicitly deferred (a
     DeferredImportCall with `attribute` set, see F1) only when the base
@@ -226,6 +230,7 @@ def _call_and_reference_relations(
                                 site_line=site_node.start_point.row + 1,
                                 site_col=site_node.start_point.column,
                                 provenance=provenance,
+                                enclosing_class=class_symbol.id,
                             )
                         )
                 continue
@@ -296,7 +301,22 @@ def _call_and_reference_relations(
                         method_name = attribute_node.text.decode("utf-8")
                         candidates = methods_by_class.get(current_class.qualname, {}).get(method_name, [])
                         if not candidates:
+                            deferred_self_calls_before = len(deferred_self_calls)
                             candidates = self_base_methods(current_class, method_name, attribute_node, current_source)
+                            if not candidates and len(deferred_self_calls) == deferred_self_calls_before:
+                                deferred_self_calls.append(
+                                    DeferredImportSelfCall(
+                                        source=current_source.id,
+                                        module_path=None,
+                                        base_name=None,
+                                        method_name=method_name,
+                                        site_file=path,
+                                        site_line=attribute_node.start_point.row + 1,
+                                        site_col=attribute_node.start_point.column,
+                                        provenance=provenance,
+                                        enclosing_class=current_class.id,
+                                    )
+                                )
                         resolve(attribute_node, source=current_source, candidates=candidates, predicate="calls")
                     elif object_name in import_alias_map:
                         deferred.append(

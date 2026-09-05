@@ -1433,3 +1433,35 @@ def test_fixture_di_edges_are_included_in_deferred_edges_entry_point_too():
     assert deferred == []
     assert deferred_inherits == []
     assert deferred_overrides == []
+
+
+def test_deferred_self_call_preserves_mixin_context_for_h2_after_h1_misses():
+    source = (
+        "class EntitiesMixin:\n"
+        "    def caller(self):\n"
+        "        self.send_json()\n"
+        "\n"
+        "\n"
+        "class ViewerHandlerBase:\n"
+        "    def send_json(self):\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class SALTMDBHandler(EntitiesMixin, ViewerHandlerBase):\n"
+        "    pass\n"
+    )
+
+    _, _, _, _, deferred_self_calls = extract_relations_with_deferred_edges(
+        path="pkg/mod.py", source_text=source, observed_at="2026-09-05T00:00:00Z"
+    )
+
+    assert len(deferred_self_calls) == 1
+    miss = deferred_self_calls[0]
+    assert miss.source == "pkg/mod.py:EntitiesMixin.caller#method"
+    assert miss.enclosing_class == "pkg/mod.py:EntitiesMixin#class"
+    assert miss.method_name == "send_json"
+    assert miss.module_path is None
+    assert miss.base_name is None
+    assert miss.site_file == "pkg/mod.py"
+    assert miss.site_line == 3
+    assert miss.site_col == 13

@@ -5,8 +5,10 @@ import pytest
 
 from acie.daemon import lsp_enrichment
 from acie.daemon.write_queue import WriteQueue
+from acie.indexer import index_file
 from acie.ir.relation import Relation
 from acie.ir.symbol import Confidence, Provenance, Symbol
+from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
 
@@ -75,9 +77,9 @@ def _symbol(symbol_id, path, *, start_line=1, start_col=0, end_line=20, end_col=
     )
 
 
-def _run(monkeypatch, tmp_path, client, symbol_store, relation_store, files):
+def _run(monkeypatch, tmp_path, client, symbol_store, relation_store, files, write_queue=None):
     monkeypatch.setattr(lsp_enrichment, "LspClient", lambda process: client)
-    queue = FakeWriteQueue()
+    queue = write_queue if write_queue is not None else FakeWriteQueue()
     relations = lsp_enrichment.run_enrichment_pass(
         repo_root=str(tmp_path),
         repo_id="repo-id",
@@ -267,3 +269,363 @@ def test_merge_job_runs_policy_against_real_queue_connection_and_preserves_extra
         site_line=extracted.site_line,
         site_col=extracted.site_col,
     ) == extracted
+
+
+def test_enrichment_still_resolves_an_unresolved_inherits_site_with_lsp(monkeypatch, tmp_path):
+    symbols = SymbolStore(":memory:")
+    relations = RelationStore(":memory:")
+    target = Symbol(
+        id="pkg/base.py:Base#class",
+        path="pkg/base.py",
+        qualname="Base",
+        kind="class",
+        start_line=1,
+        start_col=0,
+        end_line=1,
+        end_col=20,
+        confidence=Confidence.EXTRACTED,
+        provenance=Provenance("tree-sitter", "1", "2026-09-04T00:00:00Z"),
+    )
+    symbols.upsert(target)
+    location = {
+        "uri": (tmp_path / target.path).as_uri(),
+        "range": {"start": {"line": 0, "character": 0}},
+    }
+    client = FakeClient([[location]])
+    files = [(
+        "pkg/caller.py",
+        "from external import Base\n\n\nclass Foo(Base):\n    pass\n",
+    )]
+
+    resolved, queue = _run(monkeypatch, tmp_path, client, symbols, relations, files)
+
+    assert [(relation.predicate, relation.target) for relation in resolved] == [
+        ("inherits", target.id)
+    ]
+    assert len(client.requests) == 1
+    assert len(queue.submissions) == 1
+
+
+def test_enrichment_does_not_trigger_h2_when_one_imported_h1_base_resolves(
+    monkeypatch, tmp_path
+):
+    symbols = SymbolStore(":memory:")
+    relations = RelationStore(":memory:")
+    index_meta = IndexMetaStore(":memory:")
+    files = [
+        (
+            "pkg/base_one.py",
+            "class BaseOne:\n"
+            "    def callee(self):\n"
+            "        pass\n",
+        ),
+        ("pkg/base_two.py", "class BaseTwo:\n    pass\n"),
+        (
+            "pkg/mixin.py",
+            "from pkg.base_one import BaseOne\n"
+            "from pkg.base_two import BaseTwo\n\n\n"
+            "class Foo(BaseOne, BaseTwo):\n"
+            "    def caller(self):\n"
+            "        self.callee()\n",
+        ),
+        (
+            "pkg/provider.py",
+            "class Provider:\n"
+            "    def callee(self):\n"
+            "        pass\n",
+        ),
+        (
+            "pkg/composed.py",
+            "from pkg.mixin import Foo\n"
+            "from pkg.provider import Provider\n\n\n"
+            "class Composed(Foo, Provider):\n"
+            "    pass\n",
+        ),
+    ]
+    for path, source in files:
+        index_file(
+            path=path,
+            source_text=source,
+            observed_at="2026-09-05T00:00:00Z",
+            symbol_store=symbols,
+            relation_store=relations,
+            index_meta_store=index_meta,
+        )
+
+    client = FakeClient([])
+    resolved, queue = _run(monkeypatch, tmp_path, client, symbols, relations, files)
+
+    assert resolved == []
+    assert [
+        relation.target
+        for relation in relations.list_by_site_file("pkg/mixin.py", predicates={"calls"})
+    ] == ["pkg/base_one.py:BaseOne.callee#method"]
+    assert queue.submissions == []
+    assert client.requests == []
+
+
+def test_enrichment_resolves_a_mixin_self_call_from_a_new_composition_site_without_lsp(
+    monkeypatch, tmp_path
+):
+    symbols = SymbolStore(":memory:")
+    relations = RelationStore(":memory:")
+    index_meta = IndexMetaStore(":memory:")
+    files = [
+        (
+            "pkg/mixin.py",
+            "class Mixin:\n"
+            "    def caller(self):\n"
+            "        self.provided()\n",
+        ),
+        (
+            "pkg/provider.py",
+            "class Provider:\n"
+            "    def provided(self):\n"
+            "        pass\n",
+        ),
+        (
+            "pkg/composed.py",
+            "from pkg.mixin import Mixin\n"
+            "from pkg.provider import Provider\n\n\n"
+            "class Composed(Mixin, Provider):\n"
+            "    pass\n",
+        ),
+    ]
+    for path, source in files[:2]:
+        index_file(
+            path=path,
+            source_text=source,
+            observed_at="2026-09-05T00:00:00Z",
+            symbol_store=symbols,
+            relation_store=relations,
+            index_meta_store=index_meta,
+        )
+
+    first_pass, first_queue = _run(
+        monkeypatch, tmp_path, FakeClient([]), symbols, relations, files[:2]
+    )
+    assert first_pass == []
+    assert first_queue.submissions == []
+
+    index_file(
+        path=files[2][0],
+        source_text=files[2][1],
+        observed_at="2026-09-05T00:01:00Z",
+        symbol_store=symbols,
+        relation_store=relations,
+        index_meta_store=index_meta,
+    )
+
+    client = FakeClient([])
+    resolved, queue = _run(monkeypatch, tmp_path, client, symbols, relations, files)
+
+    assert [(relation.predicate, relation.target) for relation in resolved] == [
+        ("calls", "pkg/provider.py:Provider.provided#method")
+    ]
+    assert resolved[0].confidence == Confidence.INFERRED
+    assert queue.submissions
+    assert client.requests == []
+
+
+def test_enrichment_persists_all_ambiguous_mixin_composition_candidates(
+    monkeypatch, tmp_path
+):
+    db_path = str(tmp_path / "index.sqlite")
+    symbols = SymbolStore(db_path)
+    relations = RelationStore(db_path)
+    index_meta = IndexMetaStore(db_path)
+    files = [
+        (
+            "pkg/mixin.py",
+            "class Mixin:\n"
+            "    def caller(self):\n"
+            "        self.provided()\n",
+        ),
+        (
+            "pkg/provider_a.py",
+            "class ProviderA:\n"
+            "    def provided(self):\n"
+            "        pass\n",
+        ),
+        (
+            "other/provider_a.py",
+            "class ProviderA:\n"
+            "    def provided(self):\n"
+            "        pass\n",
+        ),
+        (
+            "pkg/provider_b.py",
+            "class ProviderB:\n"
+            "    def provided(self):\n"
+            "        pass\n",
+        ),
+        (
+            "pkg/composed_a.py",
+            "from pkg.mixin import Mixin\n"
+            "from pkg.provider_a import ProviderA\n\n\n"
+            "class ComposedA(Mixin, ProviderA):\n"
+            "    pass\n",
+        ),
+        (
+            "pkg/composed_b.py",
+            "from pkg.mixin import Mixin\n"
+            "from pkg.provider_b import ProviderB\n\n\n"
+            "class ComposedB(Mixin, ProviderB):\n"
+            "    pass\n",
+        ),
+    ]
+    for path, source in files:
+        index_file(
+            path=path,
+            source_text=source,
+            observed_at="2026-09-05T00:00:00Z",
+            symbol_store=symbols,
+            relation_store=relations,
+            index_meta_store=index_meta,
+        )
+
+    client = FakeClient([])
+    write_queue = WriteQueue(lambda _repo_id: db_path)
+    try:
+        resolved, _ = _run(
+            monkeypatch,
+            tmp_path,
+            client,
+            symbols,
+            relations,
+            files,
+            write_queue=write_queue,
+        )
+
+        expected_targets = {
+            "pkg/provider_a.py:ProviderA.provided#method",
+            "pkg/provider_b.py:ProviderB.provided#method",
+        }
+        assert {relation.target for relation in resolved} == expected_targets
+        assert {relation.confidence for relation in resolved} == {Confidence.AMBIGUOUS}
+        live = relations.list_by_site(
+            site_file=resolved[0].site_file,
+            site_line=resolved[0].site_line,
+            site_col=resolved[0].site_col,
+            predicates={"calls"},
+        )
+        assert {relation.target for relation in live} == expected_targets
+        assert client.requests == []
+        second_client = FakeClient([])
+        second_resolved, _ = _run(
+            monkeypatch,
+            tmp_path,
+            second_client,
+            symbols,
+            relations,
+            files,
+            write_queue=write_queue,
+        )
+        assert {relation.target for relation in second_resolved} == expected_targets
+        assert second_client.requests == []
+    finally:
+        write_queue.close(timeout=5)
+
+
+def test_enrichment_keeps_h1_direct_base_resolution_out_of_h2(
+    monkeypatch, tmp_path
+):
+    symbols = SymbolStore(":memory:")
+    relations = RelationStore(":memory:")
+    index_meta = IndexMetaStore(":memory:")
+    files = [
+        (
+            "pkg/mixin.py",
+            "class Base:\n"
+            "    def provided(self):\n"
+            "        pass\n\n\n"
+            "class Mixin(Base):\n"
+            "    def caller(self):\n"
+            "        self.provided()\n",
+        ),
+        (
+            "pkg/provider.py",
+            "class Provider:\n"
+            "    def provided(self):\n"
+            "        pass\n",
+        ),
+        (
+            "pkg/composed.py",
+            "from pkg.mixin import Mixin\n"
+            "from pkg.provider import Provider\n\n\n"
+            "class Composed(Mixin, Provider):\n"
+            "    pass\n",
+        ),
+    ]
+    for path, source in files:
+        index_file(
+            path=path,
+            source_text=source,
+            observed_at="2026-09-05T00:00:00Z",
+            symbol_store=symbols,
+            relation_store=relations,
+            index_meta_store=index_meta,
+        )
+
+    client = FakeClient([])
+    resolved, queue = _run(monkeypatch, tmp_path, client, symbols, relations, files)
+
+    assert resolved == []
+    assert [
+        relation.target
+        for relation in relations.list_by_site_file("pkg/mixin.py", predicates={"calls"})
+    ] == ["pkg/mixin.py:Base.provided#method"]
+    assert queue.submissions == []
+    assert client.requests == []
+
+
+def test_enrichment_triggers_h2_after_h1_deferred_cross_file_miss_at_any_depth(
+    monkeypatch, tmp_path
+):
+    symbols = SymbolStore(":memory:")
+    relations = RelationStore(":memory:")
+    index_meta = IndexMetaStore(":memory:")
+    files = [
+        ("pkg/leaf.py", "class ImportedBase:\n    pass\n"),
+        (
+            "pkg/mixin.py",
+            "from pkg.leaf import ImportedBase\n\n\n"
+            "class LocalBase(ImportedBase):\n"
+            "    pass\n\n\n"
+            "class Mixin(LocalBase):\n"
+            "    def caller(self):\n"
+            "        self.provided()\n",
+        ),
+        (
+            "pkg/provider.py",
+            "class Provider:\n"
+            "    def provided(self):\n"
+            "        pass\n",
+        ),
+        (
+            "pkg/composed.py",
+            "from pkg.mixin import Mixin\n"
+            "from pkg.provider import Provider\n\n\n"
+            "class Composed(Mixin, Provider):\n"
+            "    pass\n",
+        ),
+    ]
+    for path, source in files:
+        index_file(
+            path=path,
+            source_text=source,
+            observed_at="2026-09-05T00:00:00Z",
+            symbol_store=symbols,
+            relation_store=relations,
+            index_meta_store=index_meta,
+        )
+
+    client = FakeClient([])
+    resolved, queue = _run(monkeypatch, tmp_path, client, symbols, relations, files)
+
+    assert [(relation.predicate, relation.target) for relation in resolved] == [
+        ("calls", "pkg/provider.py:Provider.provided#method")
+    ]
+    assert resolved[0].confidence == Confidence.INFERRED
+    assert queue.submissions
+    assert client.requests == []

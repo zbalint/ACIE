@@ -18,7 +18,11 @@ class MergeOutcome:
 
 
 def apply_enrichment_write(relation_store: RelationStore, relation: Relation) -> MergeOutcome:
-    """Apply an enrichment relation without regressing a more-certain fact."""
+    """Apply an enrichment relation without regressing a more-certain fact.
+
+    An incoming AMBIGUOUS relation adds a candidate and must not retire its
+    same-site ambiguous siblings.
+    """
     existing = relation_store.get(
         source=relation.source,
         target=relation.target,
@@ -44,6 +48,8 @@ def apply_enrichment_write(relation_store: RelationStore, relation: Relation) ->
 
 
 def _retire_stale_siblings(relation_store: RelationStore, relation: Relation) -> int:
+    if relation.confidence == Confidence.AMBIGUOUS:
+        return 0
     siblings = relation_store.list_by_site(
         site_file=relation.site_file,
         site_line=relation.site_line,

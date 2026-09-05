@@ -2,7 +2,8 @@
 
 This module deliberately owns neither daemon triggering (D6) nor relation merge
 policy (D4). It rechecks only unresolved or AMBIGUOUS calls/inherits sites,
-then submits each unambiguous LSP definition through the existing WriteQueue.
+then submits LSP definitions and H2 composition inferences through the existing
+WriteQueue.
 """
 
 import logging
@@ -16,7 +17,7 @@ from urllib.request import url2pathname
 from acie.adapters.python.extract_relations import extract_relations_with_deferred_edges
 from acie.daemon import merge_policy
 from acie.daemon.lsp_client import LspClient, LspError
-from acie.ir.relation import Relation
+from acie.ir.relation import DeferredImportSelfCall, Relation
 from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.indexer import unresolved_deferred_sites
 from acie.storage.relation_store import RelationStore
@@ -33,6 +34,17 @@ class _Site:
     site_line: int
     site_col: int
     predicate: str
+
+
+
+@dataclass(frozen=True)
+class _MixinSite:
+    source: str
+    enclosing_class: str
+    method_name: str
+    site_file: str
+    site_line: int
+    site_col: int
 
 
 def run_enrichment_pass(
@@ -73,6 +85,25 @@ def run_enrichment_pass(
         resolved: list[Relation] = []
 
         for site in sites:
+            if isinstance(site, _MixinSite):
+                candidates = _composition_method_candidates(site, relation_store, symbol_store)
+                if not candidates:
+                    continue
+                confidence = Confidence.INFERRED if len(candidates) == 1 else Confidence.AMBIGUOUS
+                for target in candidates:
+                    relation = Relation(
+                        source=site.source,
+                        target=target.id,
+                        predicate="calls",
+                        site_file=site.site_file,
+                        site_line=site.site_line,
+                        site_col=site.site_col,
+                        confidence=confidence,
+                        provenance=Provenance(provider=provider, version=version, observed_at=observed_at_fn()),
+                    )
+                    submitted.append(write_queue.submit(repo_id, _make_merge_job(relation)))
+                    resolved.append(relation)
+                continue
             uri = (Path(repo_root) / site.site_file).resolve().as_uri()
             if uri not in opened_uris:
                 source_text = source_by_path[site.site_file]
@@ -118,14 +149,15 @@ def run_enrichment_pass(
 
 def _worklist(
     files: list[tuple[str, str]], symbol_store: SymbolStore, relation_store: RelationStore, observed_at: str
-) -> list[_Site]:
+) -> list[_Site | _MixinSite]:
     sites: set[_Site] = set()
+    mixin_sites: set[_MixinSite] = set()
     for path, source_text in files:
         for relation in relation_store.list_by_site_file(path, predicates={"calls", "inherits"}):
             if relation.confidence == Confidence.AMBIGUOUS:
                 sites.add(_Site(relation.source, relation.site_file, relation.site_line, relation.site_col, relation.predicate))
         (
-            _,
+            extracted_relations,
             deferred_calls,
             deferred_inherits,
             _,
@@ -134,9 +166,70 @@ def _worklist(
         unresolved = unresolved_deferred_sites(
             deferred_calls, deferred_inherits, symbol_store, deferred_self_calls
         )
-        sites.update(_Site(item.source, item.site_file, item.site_line, item.site_col, "calls") for item in unresolved.calls)
+        extracted_h1_call_sites = {
+            (relation.source, relation.site_file, relation.site_line, relation.site_col)
+            for relation in extracted_relations
+            if relation.predicate == "calls"
+        }
+        unresolved_self_calls = {
+            item for item in unresolved.calls if isinstance(item, DeferredImportSelfCall)
+        }
+        h1_resolved_self_call_sites = {
+            (item.source, item.site_file, item.site_line, item.site_col)
+            for item in deferred_self_calls
+            if item not in unresolved_self_calls
+        }
+        for item in unresolved.calls:
+            site_key = (item.source, item.site_file, item.site_line, item.site_col)
+            if isinstance(item, DeferredImportSelfCall):
+                if (
+                    item.enclosing_class is not None
+                    and site_key not in extracted_h1_call_sites
+                    and site_key not in h1_resolved_self_call_sites
+                ):
+                    mixin_sites.add(
+                        _MixinSite(
+                            source=item.source,
+                            enclosing_class=item.enclosing_class,
+                            method_name=item.method_name,
+                            site_file=item.site_file,
+                            site_line=item.site_line,
+                            site_col=item.site_col,
+                        )
+                    )
+                elif item.enclosing_class is None:
+                    sites.add(_Site(item.source, item.site_file, item.site_line, item.site_col, "calls"))
+            else:
+                sites.add(_Site(item.source, item.site_file, item.site_line, item.site_col, "calls"))
         sites.update(_Site(item.source, item.site_file, item.site_line, item.site_col, "inherits") for item in unresolved.inherits)
-    return sorted(sites)
+    mixin_site_keys = {
+        (site.source, site.site_file, site.site_line, site.site_col) for site in mixin_sites
+    }
+    sites = {
+        site
+        for site in sites
+        if (site.source, site.site_file, site.site_line, site.site_col) not in mixin_site_keys
+    }
+    return sorted(sites) + sorted(mixin_sites, key=lambda site: (site.site_file, site.site_line, site.site_col, site.source))
+
+
+def _composition_method_candidates(
+    site: _MixinSite, relation_store: RelationStore, symbol_store: SymbolStore
+) -> list[Symbol]:
+    candidates: dict[str, Symbol] = {}
+    for composition in relation_store.list_by_target(site.enclosing_class, predicates={"inherits"}):
+        for base_relation in relation_store.list_by_source(composition.source, predicates={"inherits"}):
+            if base_relation.target == site.enclosing_class:
+                continue
+            base = symbol_store.get(base_relation.target)
+            if base is None:
+                continue
+            for method in symbol_store.find_by_qualname_and_kind(
+                f"{base.qualname}.{site.method_name}", kind="method"
+            ):
+                if method.path == base.path:
+                    candidates[method.id] = method
+    return [candidates[target] for target in sorted(candidates)]
 
 
 def _target_for_definition(result, repo_root: str, symbol_store: SymbolStore) -> Symbol | None:

@@ -150,6 +150,8 @@ def _attribute_call_candidates(item: DeferredImportCall, symbol_store: SymbolSto
 def _imported_base_method_candidates(
     item: DeferredImportOverride | DeferredImportSelfCall, symbol_store: SymbolStore
 ) -> list[Symbol]:
+    if item.module_path is None or item.base_name is None:
+        return []
     base_candidates = [
         symbol
         for symbol in symbol_store.find_by_qualname_and_kind(

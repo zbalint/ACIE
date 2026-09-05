@@ -92,18 +92,22 @@ class DeferredImportOverride:
 
 @dataclass(frozen=True)
 class DeferredImportSelfCall:
-    """A `self.method(...)` call whose method may live on an imported base.
+    """A `self.method(...)` call that H1 could not resolve.
 
-    extract_relations can identify the calling method and imported base name,
-    but only indexer.py's repo-wide symbol index can resolve the base class and
-    its same-named method.
+    When the unresolved call reaches an imported base, ``module_path`` and
+    ``base_name`` identify that base for indexer.py's existing cross-file
+    resolver. For a call with no imported base, both are ``None`` so the
+    enrichment pass can try H2's composition-site walk. ``enclosing_class``
+    carries the class id needed by that in-memory H2 path; deferred items are
+    never persisted.
     """
 
     source: str
-    module_path: str
-    base_name: str
+    module_path: str | None
+    base_name: str | None
     method_name: str
     site_file: str
     site_line: int
     site_col: int
     provenance: Provenance
+    enclosing_class: str | None = None
