@@ -1,16 +1,14 @@
 # Capability H, Slice H2 — self.method() Resolution Through Mixin Composition Sites
 
-## Status: design exploration, NOT locked for handoff
+## Status: LOCKED for handoff (grounding + grilling session, 2026-09-05)
 
-Unlike H1 (`H1-SELF-METHOD-DIRECT-BASE-RESOLUTION-SPEC.md`), this spec has a
-real open architectural fork (see "The open decision" below) that needs
-explicit user sign-off before it should be treated as ready for
-implementation. Everything else here is grounded against live source the
-same way H1 and G1 were; the fork is flagged rather than silently resolved,
-per this spec's own standing rule against silently resolving low-confidence
-details.
+The open architectural fork this spec originally carried has been resolved
+with the user (grilling session, memory `f93f67cb` → this update). Three
+decisions were made explicitly, not silently assumed — see "Decisions
+locked this session" below. Ready for TDD implementation, sequenced after
+H1 lands, per the existing workflow constraints at the bottom of this file.
 
-## The bug this closes
+## The bug this closes — and the one it does NOT close
 
 The actual concrete case `febf3e07` (external ground-truth validation,
 `aa8679e0` item 2) documents: SALTMDB's `SALTMDBHandler(EntitiesMixin,
@@ -28,6 +26,23 @@ only at the point where a third class composes both together.
 This is the failure mode that produced the 93% miss rate (`find_references`
 on `ViewerHandlerBase.send_json` found 5 of 61 real call sites) that made
 `febf3e07` worth filing in the first place.
+
+**IMPORTANT — grounded this session (memory `f93f67cb`, Finding 1, and
+"Decisions locked" §1 below): H2 as scoped will NOT close this exact
+example.** SALTMDB's real current source has since grown a
+`TYPE_CHECKING`-gated `Protocol` base on each mixin (`ViewerHandlerProtocol`
+in `_protocol.py`), added for an unrelated mypy fix. H1's own forward walk
+*will* resolve `self.send_json()` inside `EntitiesMixin` to
+`ViewerHandlerProtocol.send_json` — a real stub declaration, not the
+concrete `ViewerHandlerBase.send_json` implementation `febf3e07` actually
+wanted found. Because H2 only ever runs when H1's forward walk finds
+**nothing** (see "Decisions locked" §1), this specific site never reaches
+H2's reverse walk at all. Closing `febf3e07`'s literal motivating example
+is now H3's job (Protocol-to-implementation resolution — see
+`H3-PROTOCOL-TO-IMPLEMENTATION-RESOLUTION-SPEC.md`, filed alongside this
+update, not yet designed in detail). H2 remains worth building for the
+genuinely-still-real case below: a mixin composed by sibling with **zero**
+declared relationship anywhere, Protocol or otherwise.
 
 ## Why this needs a reverse walk, not a bigger forward walk
 
@@ -81,78 +96,94 @@ from scratch:
    union everything found, flag `AMBIGUOUS` if more than one candidate — is
    the same one already established).
 
-## The open decision: when does this actually run?
+## Decisions locked this session (grilling session, memory `f93f67cb` → user sign-off)
 
-This is the part that is NOT mechanically simple, and is why this spec is
-marked design-exploration rather than locked.
+### §1 — Trigger precondition stays exactly as originally spec'd: H1 found nothing
 
-Every existing deferred-resolution kind (`DeferredImportCall`,
-`DeferredImportInherit`, `DeferredImportOverride`, and H1's new
-`DeferredImportSelfCall`) knows its target's module path at extraction
-time and just waits for that one specific file to get indexed, then
-resolves in a single pass. **H2's miss doesn't know which file(s) will
-eventually compose `M`** — `EntitiesMixin` on its own has no way to know
-`SALTMDBHandler` will someday list it as a base. Two real possibilities:
+Considered broadening it (H2 also fires when H1 resolved to an abstract/
+stub target, e.g. a `Protocol` method) so H2 alone could close `febf3e07`'s
+literal motivating example. **Rejected.** Stub-vs-concrete arbitration
+(deciding a concrete implementer should outrank a `Protocol`/`abstractmethod`
+stub H1 already found) is the same "structural conformance" shape as H3's
+whole job, regardless of whether the stub was reached via H1's declared-base
+walk or discovered some other way — building that ranking logic into H2
+*and* H3 would duplicate it for no benefit. H2 stays gated strictly on "H1's
+forward walk (same-file transitive + one-level cross-file) found nothing at
+all" — see the consequence for `febf3e07` called out above.
 
-- If `SALTMDBHandler`'s file is indexed **before** `EntitiesMixin`'s file:
-  by the time `EntitiesMixin` is indexed and hits the self-call miss, the
-  `inherits` edge `SALTMDBHandler → EntitiesMixin` already exists in
-  `relations_live`, so the reverse walk above would find it immediately if
-  run right then.
-- If `SALTMDBHandler`'s file is indexed **after** `EntitiesMixin`'s file
-  (the more common real-world order, if mixins tend to get written/indexed
-  before whatever composes them): the reverse walk finds nothing at
-  `EntitiesMixin`-index-time, because `C`'s `inherits` edge doesn't exist
-  yet. The miss needs to be re-attempted later, once `SALTMDBHandler` is
-  indexed — but nothing currently watches for "a new `inherits` edge just
-  appeared, go re-check old misses that might now resolve."
+### §2 — Mechanism: fold into the existing re-derive-every-pass convention, no new persisted type
 
-Two candidate approaches, not yet chosen:
+Verified live this session (`src/acie/daemon/lsp_enrichment.py`, full read —
+not just the docstring, resolving the spec's own prior TODO to do this
+before committing):
 
-**(a) Piggyback on Capability E's existing repo-level re-enrichment
-trigger.** Verified live (`src/acie/daemon/enrichment_scheduler.py:1-55`):
-a `RepoEnrichmentGuard`-style scheduler already "coalesce[s] every
-enrichment trigger source through one repo guard," firing on
-bootstrap/migration/reconciliation events (`trigger_now`, line 54) — this
-already exists, already runs periodically/on-trigger across the whole
-repo, and was built for a related purpose (re-running pyright-based
-enrichment to upgrade ambiguous edges). H2 would record every unresolved
-self-call miss as a new deferred kind (e.g. `DeferredMixinSelfCall`:
-source symbol id, enclosing class qualname, method name, site info — no
-target module path, since none is known), persisted the same way other
-deferred items are, and have each repo-level re-enrichment pass also sweep
-outstanding `DeferredMixinSelfCall` items against the *current*
-`relations_live` table via the reverse walk above. Advantage: reuses
-existing, already-built, already-scheduled infrastructure instead of
-inventing new invalidation triggers. Needs confirmation: whether E1's
-scheduler's current trigger conditions (bootstrap/migration/reconciliation)
-would actually fire often enough in normal daemon operation to catch a
-newly-discovered composition promptly, or whether a repo-wide `acie scan`
-re-run is the only thing that would currently invoke it — this needs
-reading `enrichment_scheduler.py`/`runtime.py` in full before committing,
-not assumed from the docstring alone.
+- **Trigger frequency is confirmed adequate.** `run_enrichment_pass` is
+  invoked by `EnrichmentScheduler`'s `trigger_now` for bootstrap/migration/
+  reconciliation (each deduped to at most once per repo per daemon
+  lifetime) **and** by `on_watcher_edit`, debounced 30s quiet / 300s max —
+  this is the real steady-state trigger and fires on every filesystem edit,
+  which is prompt enough to catch a newly-indexed composing class without a
+  dedicated new invalidation path.
+- **But `run_enrichment_pass` does NOT persist any deferred item.**
+  `_worklist` (`lsp_enrichment.py:119-131`) recomputes every unresolved
+  `calls`/`inherits` site **from scratch on every pass** — full repo walk,
+  fresh `extract_relations_with_deferred_edges` per file, fresh
+  `unresolved_deferred_sites` call — and separately rechecks existing
+  `AMBIGUOUS` relations via `relation_store.list_by_site_file`. Nothing
+  from one pass survives to seed the next; this is the actual, consistent
+  convention every existing deferred kind (`DeferredImportCall`,
+  `DeferredImportInherit`, `DeferredImportOverride`, and H1's own
+  `DeferredImportSelfCall`) already follows.
 
-**(b) Query-time (on-demand) resolution.** Don't persist anything at
-index time; instead, have `find_references`/`get_definition`/
-`impact_analysis` themselves perform the reverse walk live, on every query
-against a symbol that has zero same-file `calls` edges, as a fallback.
-Advantage: always current, no staleness window, no new deferred-item
-plumbing. Disadvantage: pushes new logic into every query surface instead
-of the storage/indexing layer where every other relation kind is resolved
-once and cached as a live relation — a more invasive change to the MCP
-tool layer, and a query-time cost (extra store queries per miss) on every
-relevant lookup rather than paid once at index time.
+**Locked: approach (a) as originally drafted (new persisted
+`DeferredMixinSelfCall` row, dedicated sweep step) is dropped** — it would
+have been the first persisted deferred type in the codebase, a convention
+break, not a reuse. **Approach (b) (query-time fallback in
+`find_references`/`get_definition`/`impact_analysis`) is also dropped** —
+it would break the "relations are pre-resolved, queries just read them"
+invariant every other capability relies on. **Locked: a variant of (c)** —
+fold H2's misses into `_worklist`'s existing recompute-every-pass
+convention (no new persisted dataclass; H2 items are recomputed fresh from
+source each pass exactly like the other three deferred kinds), but see §3
+for why this still needs new plumbing in `run_enrichment_pass`, not just a
+new entry in the existing uniform loop.
 
-**Recommendation, not yet confirmed:** (a) looks like the better fit —
-it's additive to an existing, working trigger mechanism rather than a new
-architectural layer in the query tools, and keeps the "relations are
-pre-resolved, queries just read them" invariant every other capability in
-this codebase relies on. But this spec does not lock it in; the
-`enrichment_scheduler.py`/`runtime.py` read needed to confirm trigger
-frequency has not been done yet this session (time-boxed out of this
-grounding pass), and the user has not been asked to confirm the approach.
+### §3 — New resolution branch required; the existing pyright-LSP path cannot answer this
 
-## Scope (assuming approach (a) — revisit if (b) is chosen instead)
+Confirmed by reading `run_enrichment_pass`'s full body: every `_Site`
+collected by `_worklist` is resolved identically — one
+`textDocument/definition` LSP request per site, whatever pyright returns
+is taken as the answer. **This cannot work for H2's misses at all**, for
+two independent reasons, both grounded this session:
+
+1. Pyright is a real, static type checker. For a call inside an
+   unannotated mixin with **zero** declared base, pyright resolves `self`'s
+   attributes from that mixin's own declared MRO — it has no way to look
+   ahead to "which other class will someday compose this mixin together
+   with something that defines the method," the exact reverse question
+   this capability exists to answer. It would fail identically to H1,
+   every time, for every H2-scoped site — never worth even trying.
+2. `_Site` itself doesn't carry enough information to do the reverse walk
+   locally either: it has `source, site_file, site_line, site_col,
+   predicate` — sufficient for a pyright request (pyright resolves the
+   identifier from the position), but the reverse walk (`relation_store
+   .list_by_target`/`list_by_source`, per the "Grounded mechanism" section
+   above) needs the **enclosing class's symbol id** and the **called
+   method's name**, neither of which survives into the generic `_Site`
+   shape today.
+
+**Consequence for implementation:** this is not "add one more predicate to
+the existing loop." It needs (a) H2-scoped misses to carry enclosing-class
+id + method name through `_worklist` into `run_enrichment_pass` (e.g. a
+distinct site subtype or a parallel collection alongside `sites`), and (b)
+a new resolution branch in `run_enrichment_pass`'s main loop that, for
+these specific items, performs the reverse walk directly against
+`relation_store` and skips the LSP round-trip entirely (both because it
+cannot help, per point 1, and because skipping it avoids a wasted
+network/subprocess round-trip for a class of site pyright can never
+answer).
+
+## Scope (locked)
 
 ### In scope
 
@@ -164,8 +195,15 @@ grounding pass), and the user has not been asked to confirm the approach.
   dropped.
 - Union-ambiguity across every composing site and every sibling base found,
   per the mechanism above.
-- New `DeferredMixinSelfCall` deferred kind + a new resolution sweep,
-  wired into whatever the confirmed trigger mechanism turns out to be.
+- Strictly gated on H1 finding nothing (§1) — sites where H1 resolved to a
+  stub/Protocol/abstract target are explicitly NOT H2's job (H3's, once
+  designed).
+- A new in-memory (never persisted) representation of an H2-eligible miss —
+  enclosing class id + method name + site info — recomputed fresh every
+  `run_enrichment_pass` invocation, mirroring how `DeferredImportCall`/
+  `Inherit`/`Override`/`SelfCall` already work, plus a new resolution
+  branch in `run_enrichment_pass` that resolves these directly against
+  `relation_store` instead of asking pyright (§3).
 
 ### Out of scope
 
@@ -173,38 +211,52 @@ grounding pass), and the user has not been asked to confirm the approach.
 - Joint ambiguity modeling between H1's same-hierarchy candidates and H2's
   composition-site candidates for the same call site — resolved
   independently, same shortcut precedent `_overrides_relations` and H1
-  both already carry forward.
-- Any change to query-time MCP tool behavior, if approach (a) is confirmed.
+  both already carry forward. Now additionally justified by §1: since H2
+  only ever runs when H1 found nothing, there is no overlapping candidate
+  set to reconcile in the first place.
+- Stub-vs-concrete arbitration when H1 *did* find a Protocol/abstract
+  target — deferred whole to H3 (§1, and the callout under "The bug this
+  closes").
+- Any change to query-time MCP tool behavior (approach (b) was considered
+  and dropped, §2).
+- Persistence of outstanding misses across daemon restarts (approach (a)'s
+  original persisted-dataclass design was considered and dropped, §2) —
+  a miss that isn't resolved this pass just gets recomputed and re-tried
+  next pass, same as every other deferred kind.
 
-## Files likely to touch (approach (a); revisit if (b))
+## Files likely to touch
 
-- `src/acie/adapters/python/extract_relations.py` — self-branch emits
-  `DeferredMixinSelfCall` when both same-file/transitive and one-level
-  cross-file lookups (H1's logic) also miss.
-- `src/acie/ir/relation.py` (confirm exact location) — new
-  `DeferredMixinSelfCall` dataclass.
-- `src/acie/daemon/enrichment_scheduler.py` and/or `runtime.py` — new sweep
-  step reusing `relation_store.list_by_target`/`list_by_source` per the
-  mechanism above, invoked wherever the confirmed trigger fires.
-- Persistence for outstanding `DeferredMixinSelfCall` items across daemon
-  runs — confirm whether existing deferred items are persisted anywhere
-  durable already (SQLite table?) or held in memory only per-process; this
-  materially affects whether H2's items survive a daemon restart, and was
-  not verified this session.
+- `src/acie/adapters/python/extract_relations.py` — self-call branch
+  (shared with H1) needs to surface which self-calls it could NOT resolve
+  even after H1's same-file/transitive + one-level cross-file lookups, in
+  a shape that preserves enclosing-class id + method name (H1's own
+  `DeferredImportSelfCall`, if it already carries this, may be directly
+  reusable here rather than needing a new type — confirm against H1's
+  actual landed implementation before designing a parallel one).
+- `src/acie/daemon/lsp_enrichment.py` — `_worklist` needs to also collect
+  H2-eligible misses (still unresolved `DeferredImportSelfCall` items,
+  filtered to those H1 could not place); `run_enrichment_pass`'s main loop
+  needs a new branch that, for these items only, performs the reverse walk
+  (`relation_store.list_by_target`/`list_by_source`, per "Grounded
+  mechanism" above) instead of sending a `textDocument/definition` request
+  — see §3 for why the pyright path cannot answer these at all.
 - Test files mirroring H1's, plus a repo-wide/daemon-level integration test
   shaped exactly like SALTMDB's `routes/__init__.py` (per `febf3e07`'s own
   original recommendation) — N mixins in N files, composed in a file
   indexed after them, asserting the self-call resolves once the composing
-  file is indexed and the sweep runs.
+  file is indexed and the next enrichment pass runs. Since `febf3e07`'s
+  actual SALTMDB fixture now has a Protocol layer (Finding 1) and would
+  therefore never reach H2's branch, this integration test needs a
+  **synthetic** fixture with zero declared relationship anywhere — the
+  real SALTMDB source no longer exercises H2's exact case.
 
 ## Workflow constraints carried into the spec
 
-- **Do not start implementation from this spec as-is.** Get the open
-  decision (approach (a) vs (b)) confirmed with the user first, and read
-  `enrichment_scheduler.py`/`runtime.py` in full to verify (a)'s trigger
-  frequency before locking it in.
 - Sequence after H1 lands, not concurrently — H2's forward-miss precondition
-  ("H1's logic also found nothing") depends on H1 existing.
+  ("H1's logic also found nothing") is an inherent dependency on H1's
+  outcome, not just a scheduling convenience: H2 has no independent
+  detection of a composition-site miss, it only catches what H1 already
+  tried and failed on (confirmed explicitly this session).
 - Implement with the `tdd` skill once unlocked; one slice per session, stop
   before commit for review (memory `9b020543`).
 - Never change SALTMDB (or any other target codebase) to accommodate an
@@ -214,10 +266,14 @@ grounding pass), and the user has not been asked to confirm the approach.
 
 Grounded live against `src/acie/storage/relation_store.py` (lines 293-345,
 confirming `list_by_target`/`list_by_source` already exist and are already
-used cross-file elsewhere in `indexer.py`) and
-`src/acie/daemon/enrichment_scheduler.py` (line 1's module docstring and
-`trigger_now`, line 54 — read only enough to confirm the mechanism exists,
-NOT read in full; approach (a)'s viability is provisional pending that
-fuller read). All read in git worktree `worktree-spec2-mixin-mro-grounding`
-at commit `59983b6`. SALTMDB memory `f9f7927f` records the grounding
-session both H1 and H2 were drafted from.
+used cross-file elsewhere in `indexer.py`) and, this session,
+`src/acie/daemon/lsp_enrichment.py` in full (`run_enrichment_pass` and
+`_worklist`, resolving the prior TODO to read `enrichment_scheduler.py`/
+`runtime.py`'s trigger-frequency behavior before locking in a mechanism —
+`on_watcher_edit`'s 30s/300s debounce is the real steady-state trigger and
+was confirmed adequate). All read in git worktree
+`worktree-spec2-mixin-mro-grounding` at commit `2035bca` (still based on
+`59983b6`, not yet rebased onto master/G1). SALTMDB memory `f9f7927f`
+records the original grounding session both H1 and H2 were drafted from;
+memory `f93f67cb` records this session's two new findings and the grilling
+round that resolved them.
