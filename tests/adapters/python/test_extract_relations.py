@@ -71,6 +71,190 @@ def test_module_imports_multiple_names_from_a_module():
     assert all(r.confidence == Confidence.EXTRACTED for r in imports)
 
 
+def test_relative_from_import_is_extracted_and_drives_deferred_import_call():
+    source = "from . import lifecycle\n\n\nlifecycle.func()\n"
+    path = "pkg/sub/mod.py"
+
+    relations = extract_relations(path=path, source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    imports = [r for r in relations if r.predicate == "imports"]
+    assert len(imports) == 1
+    import_rel = imports[0]
+    assert import_rel.source == "pkg/sub/mod.py:#module"
+    assert import_rel.target == "pkg.sub.lifecycle"
+    assert import_rel.site_line == 1
+    assert import_rel.confidence == Confidence.EXTRACTED
+
+    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
+        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    )
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+    assert deferred_inherits == []
+    assert deferred_overrides == []
+    assert len(deferred_calls) == 1
+    deferred_call = deferred_calls[0]
+    assert deferred_call.source == "pkg/sub/mod.py:#module"
+    assert deferred_call.module_path == "pkg.sub"
+    assert deferred_call.name == "lifecycle"
+    assert deferred_call.attribute == "func"
+    assert deferred_call.site_col == 10
+    assert deferred_call.site_file == path
+    assert deferred_call.site_line == 4
+
+
+def test_relative_from_imports_resolve_parent_and_submodule_with_mixed_names():
+    source = (
+        "from .. import parent\n"
+        "from .sub import x, y as z\n"
+        "\n"
+        "parent()\n"
+        "x()\n"
+        "z()\n"
+    )
+    path = "pkg/sub/mod.py"
+
+    relations = extract_relations(path=path, source_text=source, observed_at="2026-09-05T00:00:00Z")
+    imports = [r for r in relations if r.predicate == "imports"]
+
+    assert len(imports) == 3
+    assert {r.target for r in imports} == {"pkg.parent", "pkg.sub.sub.x", "pkg.sub.sub.y"}
+    assert all(r.source == "pkg/sub/mod.py:#module" for r in imports)
+    assert next(r for r in imports if r.target == "pkg.parent").site_line == 1
+    assert all(r.site_line == 2 for r in imports if r.target != "pkg.parent")
+    assert all(r.confidence == Confidence.EXTRACTED for r in imports)
+
+    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
+        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    )
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+    assert deferred_inherits == []
+    assert deferred_overrides == []
+    assert {(call.module_path, call.name) for call in deferred_calls} == {
+        ("pkg", "parent"),
+        ("pkg.sub.sub", "x"),
+        ("pkg.sub.sub", "z"),
+    }
+
+
+def test_aliased_from_import_targets_original_name_and_defers_attribute_call():
+    source = "from pkg import mod as alias\n\n\nalias.func()\n"
+    path = "pkg/consumer.py"
+
+    relations = extract_relations(path=path, source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    imports = [r for r in relations if r.predicate == "imports"]
+    assert len(imports) == 1
+    import_rel = imports[0]
+    assert import_rel.source == "pkg/consumer.py:#module"
+    assert import_rel.target == "pkg.mod"
+    assert import_rel.site_line == 1
+    assert import_rel.confidence == Confidence.EXTRACTED
+
+    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
+        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    )
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+    assert deferred_inherits == []
+    assert deferred_overrides == []
+    assert len(deferred_calls) == 1
+    deferred_call = deferred_calls[0]
+    assert deferred_call.source == "pkg/consumer.py:#module"
+    assert deferred_call.module_path == "pkg"
+    assert deferred_call.name == "alias"
+    assert deferred_call.attribute == "func"
+    assert deferred_call.site_file == path
+    assert deferred_call.site_line == 4
+    assert deferred_call.site_col == 6
+
+
+def test_plain_aliased_import_targets_original_module_without_alias_map_entry():
+    source = "import pkg as alias\n\n\nalias.func()\n"
+    path = "pkg/consumer.py"
+
+    relations = extract_relations(path=path, source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    imports = [r for r in relations if r.predicate == "imports"]
+    assert len(imports) == 1
+    import_rel = imports[0]
+    assert import_rel.source == "pkg/consumer.py:#module"
+    assert import_rel.target == "pkg"
+    assert import_rel.site_line == 1
+    assert import_rel.confidence == Confidence.EXTRACTED
+
+    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
+        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    )
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+    assert deferred_calls == []
+    assert deferred_inherits == []
+    assert deferred_overrides == []
+
+
+def test_function_local_from_import_is_attributed_to_module_and_drives_deferred_call():
+    source = "def caller():\n    from pkg import helper\n    helper.func()\n"
+    path = "pkg/consumer.py"
+
+    relations = extract_relations(path=path, source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    imports = [r for r in relations if r.predicate == "imports"]
+    assert len(imports) == 1
+    import_rel = imports[0]
+    assert import_rel.source == "pkg/consumer.py:#module"
+    assert import_rel.target == "pkg.helper"
+    assert import_rel.site_line == 2
+    assert import_rel.confidence == Confidence.EXTRACTED
+
+    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
+        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    )
+
+    assert [r for r in relations if r.predicate == "calls"] == []
+    assert deferred_inherits == []
+    assert deferred_overrides == []
+    assert len(deferred_calls) == 1
+    deferred_call = deferred_calls[0]
+    assert deferred_call.source == "pkg/consumer.py:caller#function"
+    assert deferred_call.module_path == "pkg"
+    assert deferred_call.name == "helper"
+    assert deferred_call.attribute == "func"
+    assert deferred_call.site_file == path
+    assert deferred_call.site_line == 3
+    assert deferred_call.site_col == 11
+
+
+def test_relative_import_that_walks_above_top_level_package_is_skipped():
+    source = "from .. import missing\n\n\nmissing()\n"
+    path = "pkg/mod.py"
+
+    relations = extract_relations(path=path, source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    assert [r for r in relations if r.predicate == "imports"] == []
+
+    relations, deferred_calls, deferred_inherits, deferred_overrides = extract_relations_with_deferred_edges(
+        path=path, source_text=source, observed_at="2026-09-05T00:00:00Z"
+    )
+
+    assert [r for r in relations if r.predicate == "imports"] == []
+    assert deferred_calls == []
+    assert deferred_inherits == []
+    assert deferred_overrides == []
+
+
+def test_relative_import_at_a_bare_root_level_init_file_resolves_without_the_filename_leaking_in():
+    source = "from . import x\n"
+    path = "__init__.py"
+
+    relations = extract_relations(path=path, source_text=source, observed_at="2026-09-05T00:00:00Z")
+
+    imports = [r for r in relations if r.predicate == "imports"]
+    assert len(imports) == 1
+    assert imports[0].target == "x"
+
+
 def test_class_inherits_a_base_class_defined_in_the_same_file():
     source = "class Base:\n    pass\n\n\nclass Foo(Base):\n    pass\n"
 

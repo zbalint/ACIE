@@ -4,6 +4,7 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 
 from acie.adapters.python.extract_symbols import extract_symbols
+from acie.module_paths import path_to_dotted
 from acie.ir.relation import DeferredImportCall, DeferredImportInherit, DeferredImportOverride, Relation
 from acie.ir.symbol import Confidence, Provenance, Symbol
 from acie.pytest_conventions import is_test_file_path, is_test_qualname
@@ -809,61 +810,153 @@ def _param_name_nodes(function_node) -> list:
 def _import_relations(
     root, *, module: Symbol, path: str, provenance: Provenance
 ) -> tuple[list[Relation], dict[str, str]]:
-    """Module-level `import <dotted_name>` and `from <dotted_name> import
-    <dotted_name>[, <dotted_name>, ...]` statements only (this slice's
-    narrow first cut) -- aliased imports (`import x as y`) and relative
-    imports (`from . import x`) are explicitly deferred, see the
-    extract_relations completion memory.
+    """Collect import statements anywhere in the syntax tree.
 
-    A `from x import a, b` statement's grammar exposes every imported name
-    as its own `name`-field child (not a single field) -- `children_by_field_name`
-    must be used instead of `child_by_field_name`, which silently returns
-    only the first, to avoid truncating multi-name imports.
-
-    Also returns an alias map -- {imported_name: dotted_module_path} --
-    covering `from`-imports only (a plain `import module` is called as
-    `module.attr()`, never as a bare identifier, so it never belongs in
-    this map). Consumed by `_call_and_reference_relations` to recognize a
-    bare call to an imported name as a cross-file resolution candidate
-    (DeferredImportCall) rather than a plain undefined-name miss.
+    `import_alias_map` remains a flat file-level map because downstream
+    deferred relation resolution has no scope model.
     """
-    relations = []
+    relations: list[Relation] = []
     alias_map: dict[str, str] = {}
-    for child in root.named_children:
-        if child.type == "import_statement":
-            name_node = child.child_by_field_name("name")
-            if name_node.type != "dotted_name":
+
+    def walk(node) -> None:
+        if node.type == "import_statement":
+            _handle_import_statement(
+                node, module=module, path=path, provenance=provenance, relations=relations
+            )
+        elif node.type == "import_from_statement":
+            _handle_import_from_statement(
+                node,
+                module=module,
+                path=path,
+                provenance=provenance,
+                relations=relations,
+                alias_map=alias_map,
+            )
+        for child in node.named_children:
+            walk(child)
+
+    walk(root)
+    return relations, alias_map
+
+
+def _imports_relation(
+    module: Symbol, target: str, site_node, path: str, provenance: Provenance
+) -> Relation:
+    return Relation(
+        source=module.id,
+        target=target,
+        predicate="imports",
+        site_file=path,
+        site_line=site_node.start_point.row + 1,
+        site_col=site_node.start_point.column,
+        confidence=Confidence.EXTRACTED,
+        provenance=provenance,
+    )
+
+
+def _handle_import_statement(
+    child, *, module: Symbol, path: str, provenance: Provenance, relations: list[Relation]
+) -> None:
+    for name_node in child.children_by_field_name("name"):
+        if name_node.type == "dotted_name":
+            target = name_node.text.decode("utf-8")
+        elif name_node.type == "aliased_import":
+            imported_node = name_node.child_by_field_name("name")
+            if imported_node is None or imported_node.type != "dotted_name":
                 continue
-            targets = [name_node.text.decode("utf-8")]
-        elif child.type == "import_from_statement":
-            module_node = child.child_by_field_name("module_name")
-            if module_node.type != "dotted_name":
-                continue
-            module_dotted = module_node.text.decode("utf-8")
-            imported_names = [
-                name_node.text.decode("utf-8")
-                for name_node in child.children_by_field_name("name")
-                if name_node.type == "dotted_name"
-            ]
-            targets = [f"{module_dotted}.{name}" for name in imported_names]
-            for name in imported_names:
-                alias_map[name] = module_dotted
+            target = imported_node.text.decode("utf-8")
         else:
             continue
-        for target in targets:
-            relations.append(
-                Relation(
-                    source=module.id,
-                    target=target,
-                    predicate="imports",
-                    site_file=path,
-                    site_line=child.start_point.row + 1,
-                    site_col=child.start_point.column,
-                    confidence=Confidence.EXTRACTED,
-                    provenance=provenance,
-                )
-            )
-    return relations, alias_map
+        relations.append(_imports_relation(module, target, child, path, provenance))
+
+
+def _handle_import_from_statement(
+    child,
+    *,
+    module: Symbol,
+    path: str,
+    provenance: Provenance,
+    relations: list[Relation],
+    alias_map: dict[str, str],
+) -> None:
+    module_node = child.child_by_field_name("module_name")
+    if module_node is None:
+        return
+    base = _module_base(module_node, path)
+    if base is None:
+        return
+    for name_node in child.children_by_field_name("name"):
+        if name_node.type == "dotted_name":
+            imported_name = name_node.text.decode("utf-8")
+            bound_name = imported_name
+        elif name_node.type == "aliased_import":
+            imported_node = name_node.child_by_field_name("name")
+            alias_node = name_node.child_by_field_name("alias")
+            if imported_node is None or imported_node.type != "dotted_name" or alias_node is None:
+                continue
+            imported_name = imported_node.text.decode("utf-8")
+            bound_name = alias_node.text.decode("utf-8")
+        else:
+            continue
+        target = f"{base}.{imported_name}" if base else imported_name
+        relations.append(_imports_relation(module, target, child, path, provenance))
+        alias_map[bound_name] = base
+
+
+def _module_base(module_node, path: str) -> str | None:
+    if module_node.type == "dotted_name":
+        return module_node.text.decode("utf-8")
+    if module_node.type != "relative_import":
+        return None
+
+    prefix = next(
+        (child for child in module_node.named_children if child.type == "import_prefix"),
+        None,
+    )
+    if prefix is None:
+        return None
+    level = sum(1 for child in prefix.children if child.type == ".")
+    own_base = _relative_import_base(path, level)
+    if own_base is None:
+        return None
+    submodule_node = next(
+        (child for child in module_node.named_children if child.type == "dotted_name"),
+        None,
+    )
+    if submodule_node is None:
+        return own_base
+    submodule = submodule_node.text.decode("utf-8")
+    return f"{own_base}.{submodule}" if own_base else submodule
+
+
+def _relative_import_base(path: str, level: int) -> str | None:
+    """Resolve a relative import's leading dots against its file path.
+
+    A package's own `__init__.py` treats level 1 (a single dot) as the
+    package itself, so all of its own-name segments -- down to "" for a
+    bare root-level `__init__.py` with no wrapping directory -- are
+    climbable. Any other module treats level 1 as its *enclosing* package,
+    one segment short of its own name, so climbing exhausts one segment
+    sooner (an already-tested boundary: `pkg/mod.py` + `from ..` must stay
+    unresolvable).
+    """
+    is_init = path.endswith("/__init__.py") or path == "__init__.py"
+    dotted = path_to_dotted(path)
+    if is_init:
+        # A bare root `__init__.py` doesn't match path_to_dotted's
+        # "/__init__.py" suffix strip (no leading "/"), so it falls through
+        # to the generic ".py" strip and returns the literal "__init__" --
+        # normalize that back to "no package name" rather than let it leak
+        # into a resolved dotted target.
+        own_package_parts = [] if dotted == "__init__" else dotted.split(".")
+    else:
+        own_package_parts = dotted.split(".")[:-1]
+    pops = level - 1
+    climbable = len(own_package_parts) if is_init else len(own_package_parts) - 1
+    if pops > climbable:
+        return None
+    remaining = own_package_parts[: len(own_package_parts) - pops] if pops else own_package_parts
+    return ".".join(remaining)
 
 
 def _defines_relations(
