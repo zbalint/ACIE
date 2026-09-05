@@ -252,12 +252,18 @@ class RepoWatcher:
     """
 
     def __init__(
-        self, repo_root: str, repo_id: str, write_queue: WriteQueue,
-        *, debounce_seconds: float = _DEBOUNCE_SECONDS,
+        self,
+        repo_root: str,
+        repo_id: str,
+        write_queue: WriteQueue,
+        *,
+        debounce_seconds: float = _DEBOUNCE_SECONDS,
+        on_paths_changed: Callable[[str, str], None] = lambda repo_id, repo_root: None,
     ) -> None:
         self._repo_root = repo_root
         self._repo_id = repo_id
         self._write_queue = write_queue
+        self._on_paths_changed_hook = on_paths_changed
         self._handler = _DebouncedEventHandler(
             repo_root, self._on_paths_changed, debounce_seconds=debounce_seconds
         )
@@ -269,6 +275,7 @@ class RepoWatcher:
     def _on_paths_changed(self, rel_paths: set[str]) -> None:
         for rel_path in rel_paths:
             self._write_queue.submit(self._repo_id, make_reindex_job(self._repo_root, rel_path))
+        self._on_paths_changed_hook(self._repo_id, self._repo_root)
 
     def stop(self, timeout: float | None = None) -> bool:
         """Stops this repo's Observer, bounded by `timeout` seconds overall.
@@ -343,8 +350,14 @@ class WatcherRegistry:
     every worktree's live edits land in the one shared write-queue worker.
     """
 
-    def __init__(self, write_queue: WriteQueue) -> None:
+    def __init__(
+        self,
+        write_queue: WriteQueue,
+        *,
+        on_paths_changed: Callable[[str, str], None] = lambda repo_id, repo_root: None,
+    ) -> None:
         self._write_queue = write_queue
+        self._on_paths_changed = on_paths_changed
         self._lock = threading.Lock()
         self._watchers: dict[str, RepoWatcher] = {}
 
@@ -352,7 +365,12 @@ class WatcherRegistry:
         with self._lock:
             if repo_root in self._watchers:
                 return
-            self._watchers[repo_root] = RepoWatcher(repo_root, repo_id, self._write_queue)
+            self._watchers[repo_root] = RepoWatcher(
+                repo_root,
+                repo_id,
+                self._write_queue,
+                on_paths_changed=self._on_paths_changed,
+            )
 
     def close(self, timeout: float | None = None) -> None:
         """Stops every registered watcher, bounded by `timeout` seconds

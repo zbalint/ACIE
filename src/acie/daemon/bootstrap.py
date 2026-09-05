@@ -6,10 +6,11 @@ Slice 2's tests) and is `WriteQueue`'s first real caller (write_queue.py's
 own docstring named this as deferred to a later slice).
 
 Readiness is a daemon-process-lifetime concept: DAEMON.md's on-disk layout
-names no separate "bootstrap complete" marker, and tiers 1-3 of incremental
-indexing (watcher/git-hooks/agent-hooks) are out of this phase's scope --
-so a repo that already has an index.sqlite from any prior run is trusted as
-ready immediately, and only a repo with no index.sqlite yet gets a walk.
+names no separate "bootstrap complete" marker, so a repo that already has an
+index.sqlite from any prior run is trusted as ready immediately, and only a
+repo with no index.sqlite yet gets a walk. Bootstrap, migration, and startup
+reconciliation completion events share the runtime's enrichment scheduler;
+watcher-triggered enrichment is composed by the daemon runtime.
 """
 
 import os
@@ -18,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Callable, Iterable
 
 from acie.daemon.write_queue import WriteQueue
+from acie.daemon.repo_fingerprint import compute_repo_fingerprint
 from acie.indexer import IndexResult, index_file
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
@@ -52,6 +54,7 @@ class BootstrapCoordinator:
         self._ready: set[str] = set()
         self._in_progress: set[str] = set()
         self._migration_checked: set[str] = set()
+        self._reconciliation_checked: set[str] = set()
 
     def repo_ready(self, repo_id: str) -> bool:
         """The exact `repo_ready` callable dispatch.dispatch_request requires.
@@ -105,6 +108,7 @@ class BootstrapCoordinator:
         """
         if self.repo_ready(repo_id):
             self._maybe_schedule_cross_file_migration(repo_id, repo_root)
+            self._maybe_schedule_reconciliation_check(repo_id, repo_root)
             return
         with self._lock:
             if repo_id in self._in_progress:
@@ -142,9 +146,8 @@ class BootstrapCoordinator:
             # write is fire-and-forget (no .result() wait) -- a concurrent
             # register() for this same repo_id landing in that narrow,
             # same-thread, no-yield gap could see repo_ready()==True, read
-            # a stale (not-yet-persisted) cross_file_pass_done() False, and
-            # re-run migration catch-up, firing on_indexed/trigger_enrichment
-            # a second time for this repo. Not closed here: reserving
+            # re-run migration catch-up, firing on_indexed (and therefore the
+            # scheduler) a second time for this repo. Not closed here: reserving
             # _migration_checked atomically with readiness was tried and
             # reverted (it violated D6's locked no-extra-bootstrap-
             # bookkeeping scope and incorrectly touched the empty-repo
@@ -199,6 +202,16 @@ class BootstrapCoordinator:
             target=self._run_cross_file_migration_if_needed, args=(repo_id, repo_root), daemon=True
         ).start()
 
+    def _maybe_schedule_reconciliation_check(self, repo_id: str, repo_root: str) -> None:
+        """Schedules one startup reconciliation check per repo per process."""
+        with self._lock:
+            if repo_id in self._reconciliation_checked:
+                return
+            self._reconciliation_checked.add(repo_id)
+        threading.Thread(
+            target=self._run_reconciliation_check, args=(repo_id, repo_root), daemon=True
+        ).start()
+
     def _run_cross_file_migration_if_needed(self, repo_id: str, repo_root: str) -> None:
         def check_job(conn) -> bool:
             return IndexMetaStore(conn=conn).cross_file_pass_done()
@@ -243,6 +256,22 @@ class BootstrapCoordinator:
             self._on_indexed(repo_id, repo_root)
 
         self._run_indexing_pass(repo_id, files, on_pass_done=_finish_migration)
+
+    def _run_reconciliation_check(self, repo_id: str, repo_root: str) -> None:
+        def read_stored(conn) -> str | None:
+            return IndexMetaStore(conn=conn).get_last_enrichment_fingerprint()
+
+        try:
+            stored = self._write_queue.submit(repo_id, read_stored).result()
+        except BaseException:
+            with self._lock:
+                self._reconciliation_checked.discard(repo_id)
+            return
+
+        current = compute_repo_fingerprint(repo_root)
+        if current is not None and current == stored:
+            return
+        self._on_indexed(repo_id, repo_root)
 
     def _run_indexing_pass(
         self, repo_id: str, files: list[tuple[str, str]], *, on_pass_done: Callable[[], None]

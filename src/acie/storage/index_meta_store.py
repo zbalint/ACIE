@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS index_meta (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     generation INTEGER NOT NULL,
     head_sha TEXT,
-    cross_file_pass_version INTEGER NOT NULL DEFAULT 0
+    cross_file_pass_version INTEGER NOT NULL DEFAULT 0,
+    last_enrichment_fingerprint TEXT
 );
 """
 
@@ -39,6 +40,11 @@ class IndexMetaStore:
     against this stored value itself. NULL means "never recorded" -- a
     fresh repo with nothing to diff against yet, since bootstrap already
     indexes everything from scratch.
+
+    `last_enrichment_fingerprint` is E1's separate, nullable snapshot of
+    working-tree state after the most recent successful full enrichment
+    pass. NULL means no pass has recorded a comparable snapshot yet; callers
+    must treat that as a reconciliation mismatch rather than as clean.
 
     `cross_file_pass_version`/`cross_file_pass_done()` back a narrow,
     single-purpose migration marker, not a general schema/IR version
@@ -73,8 +79,11 @@ class IndexMetaStore:
         self._conn.executescript(_SCHEMA)
         self._migrate_add_head_sha_column_if_missing()
         self._migrate_add_cross_file_pass_version_column_if_missing()
+        self._migrate_add_last_enrichment_fingerprint_column_if_missing()
         self._conn.execute(
-            "INSERT OR IGNORE INTO index_meta (id, generation, head_sha, cross_file_pass_version) VALUES (0, 0, NULL, 0)"
+            "INSERT OR IGNORE INTO index_meta "
+            "(id, generation, head_sha, cross_file_pass_version, last_enrichment_fingerprint) "
+            "VALUES (0, 0, NULL, 0, NULL)"
         )
         self._conn.commit()
 
@@ -113,6 +122,13 @@ class IndexMetaStore:
                 self._conn.execute("UPDATE index_meta SET cross_file_pass_version = 1 WHERE id = 0")
         self._conn.commit()
 
+    def _migrate_add_last_enrichment_fingerprint_column_if_missing(self) -> None:
+        """Adds E1's nullable reconciliation fingerprint to legacy indexes."""
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(index_meta)")}
+        if "last_enrichment_fingerprint" not in columns:
+            self._conn.execute("ALTER TABLE index_meta ADD COLUMN last_enrichment_fingerprint TEXT")
+            self._conn.commit()
+
     def current_generation(self) -> int:
         row = self._conn.execute(
             "SELECT generation FROM index_meta WHERE id = 0"
@@ -130,6 +146,19 @@ class IndexMetaStore:
 
     def set_last_indexed_head_sha(self, sha: str) -> None:
         self._conn.execute("UPDATE index_meta SET head_sha = ? WHERE id = 0", (sha,))
+        self._conn.commit()
+
+    def get_last_enrichment_fingerprint(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT last_enrichment_fingerprint FROM index_meta WHERE id = 0"
+        ).fetchone()
+        return row[0]
+
+    def set_last_enrichment_fingerprint(self, fingerprint: str) -> None:
+        self._conn.execute(
+            "UPDATE index_meta SET last_enrichment_fingerprint = ? WHERE id = 0",
+            (fingerprint,),
+        )
         self._conn.commit()
 
     def cross_file_pass_done(self) -> bool:

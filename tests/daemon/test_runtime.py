@@ -8,9 +8,21 @@ import pytest
 
 from acie.daemon import runtime
 from acie.daemon.protocol import build_request
+from acie.daemon import repo_fingerprint
+from acie.daemon.repo_fingerprint import compute_repo_fingerprint
 from acie.daemon.runtime import create_daemon, ensure_fresh
 from acie.daemon.write_queue import WriteQueue
+from acie.storage.index_meta_store import IndexMetaStore
 from tests.daemon.rpc import send_request
+
+
+def _wait_until(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
 
 _DEBOUNCE_WAIT = 1.0
 
@@ -462,13 +474,16 @@ def test_trigger_enrichment_logs_and_swallows_background_setup_errors(tmp_path, 
     assert "could not open index" in messages[0]
 
 
-def test_create_daemon_shares_one_process_registry_across_indexed_callbacks_and_closes_it(
+def test_create_daemon_routes_indexed_and_watcher_triggers_through_one_scheduler_and_closes_registry(
     tmp_path, monkeypatch
 ):
     registries = []
+    schedulers = []
     close_timeouts = []
     indexed_callbacks = []
-    trigger_registries = []
+    watcher_callbacks = []
+    indexed_triggers = []
+    watcher_triggers = []
 
     class FakeProcessRegistry:
         def __init__(self):
@@ -476,6 +491,17 @@ def test_create_daemon_shares_one_process_registry_across_indexed_callbacks_and_
 
         def close(self, timeout=None):
             close_timeouts.append(timeout)
+
+    class FakeScheduler:
+        def __init__(self, process_registry, *args, **kwargs):
+            self.process_registry = process_registry
+            schedulers.append(self)
+
+        def trigger_now(self, repo_id, repo_root):
+            indexed_triggers.append((repo_id, repo_root))
+
+        def on_watcher_edit(self, repo_id, repo_root):
+            watcher_triggers.append((repo_id, repo_root))
 
     class FakeBootstrapCoordinator:
         def __init__(self, **kwargs):
@@ -487,24 +513,189 @@ def test_create_daemon_shares_one_process_registry_across_indexed_callbacks_and_
         def register(self, repo_id, repo_root):
             pass
 
-    def fake_trigger_enrichment(process_registry, *args, **kwargs):
-        trigger_registries.append(process_registry)
+    class FakeWatcherRegistry:
+        def __init__(self, write_queue, *, on_paths_changed):
+            watcher_callbacks.append(on_paths_changed)
+
+        def register(self, repo_id, repo_root):
+            pass
+
+        def close(self, timeout=None):
+            pass
 
     monkeypatch.setattr(runtime, "PyrightProcessRegistry", FakeProcessRegistry)
+    monkeypatch.setattr(runtime, "EnrichmentScheduler", FakeScheduler)
     monkeypatch.setattr(runtime, "BootstrapCoordinator", FakeBootstrapCoordinator)
-    monkeypatch.setattr(runtime, "trigger_enrichment", fake_trigger_enrichment)
+    monkeypatch.setattr(runtime, "WatcherRegistry", FakeWatcherRegistry)
 
     server = create_daemon(state_dir=str(tmp_path / "state"), port=0)
     try:
         indexed_callbacks[0]("repo-a", "/repo-a")
-        indexed_callbacks[0]("repo-b", "/repo-b")
+        watcher_callbacks[0]("repo-b", "/repo-b")
     finally:
         server.shutdown()
 
     assert len(registries) == 1
-    assert trigger_registries == [registries[0], registries[0]]
+    assert len(schedulers) == 1
+    assert schedulers[0].process_registry is registries[0]
+    assert indexed_triggers == [("repo-a", "/repo-a")]
+    assert watcher_triggers == [("repo-b", "/repo-b")]
     assert len(close_timeouts) == 1
     assert 0.0 <= close_timeouts[0] <= runtime._SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+
+
+def test_triggered_enrichment_persists_the_current_fingerprint_after_a_successful_pass(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "index.sqlite")
+    IndexMetaStore(db_path)
+    calls = []
+
+    def fake_run_enrichment_pass(**kwargs):
+        calls.append(kwargs["repo_id"])
+        return []
+
+    monkeypatch.setattr(runtime, "run_enrichment_pass", fake_run_enrichment_pass)
+    monkeypatch.setattr(runtime, "compute_repo_fingerprint", lambda repo_root: "fingerprint-1")
+
+    runtime._run_triggered_enrichment(
+        object(),
+        object(),
+        lambda repo_id: db_path,
+        "repo-a",
+        str(tmp_path),
+        lambda repo_root: [],
+    )
+
+    assert calls == ["repo-a"]
+    assert IndexMetaStore(db_path).get_last_enrichment_fingerprint() == "fingerprint-1"
+
+
+def test_triggered_enrichment_keeps_the_previous_fingerprint_when_git_is_unavailable(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "index.sqlite")
+    IndexMetaStore(db_path).set_last_enrichment_fingerprint("previous")
+
+    monkeypatch.setattr(runtime, "run_enrichment_pass", lambda **kwargs: [])
+    monkeypatch.setattr(runtime, "compute_repo_fingerprint", lambda repo_root: None)
+
+    runtime._run_triggered_enrichment(
+        object(),
+        object(),
+        lambda repo_id: db_path,
+        "repo-a",
+        str(tmp_path),
+        lambda repo_root: [],
+    )
+
+    assert IndexMetaStore(db_path).get_last_enrichment_fingerprint() == "previous"
+
+
+def test_runtime_watcher_edit_triggers_a_second_enrichment_pass_without_restart(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "module.py").write_text("def target():\n    pass\n", encoding="utf-8")
+
+    calls = []
+    calls_lock = threading.Lock()
+    first_pass = threading.Event()
+
+    def fake_run_enrichment_pass(**kwargs):
+        with calls_lock:
+            calls.append((kwargs["repo_id"], kwargs["repo_root"]))
+        first_pass.set()
+        return []
+
+    real_scheduler = runtime.EnrichmentScheduler
+
+    def fast_scheduler(process_registry, write_queue, db_path_for, *, walk_repo):
+        return real_scheduler(
+            process_registry,
+            write_queue,
+            db_path_for,
+            walk_repo=walk_repo,
+            quiet_seconds=0.05,
+            max_wait_seconds=0.2,
+        )
+
+    monkeypatch.setattr(runtime, "run_enrichment_pass", fake_run_enrichment_pass)
+    monkeypatch.setattr(runtime, "EnrichmentScheduler", fast_scheduler)
+    state_dir = tmp_path / "state"
+    server = create_daemon(state_dir=str(state_dir), port=0)
+    server.start()
+    try:
+        request = build_request("find_symbol", str(repo), {"name": "target"})
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            response = send_request(server.port, request)
+            if response["ok"]:
+                break
+            assert response["error"]["code"] == "INDEX_NOT_READY"
+            time.sleep(0.01)
+        else:
+            raise AssertionError("repo did not finish bootstrap indexing")
+
+        assert first_pass.wait(timeout=2.0)
+        time.sleep(0.2)  # settle the startup reconciliation's one-shot pass
+        with calls_lock:
+            initial_count = len(calls)
+
+        (repo / "added.py").write_text("def new_symbol():\n    pass\n", encoding="utf-8")
+
+        assert _wait_until(
+            lambda: len(calls) > initial_count,
+            timeout=3.0,
+        ), "watcher edit never triggered another enrichment pass"
+    finally:
+        server.shutdown()
+
+
+def test_runtime_reconciles_a_tracked_edit_after_a_daemon_restart(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    tracked = repo / "module.py"
+    tracked.write_text("def target():\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "initial"], check=True)
+
+    calls = []
+    calls_lock = threading.Lock()
+
+    def fake_run_enrichment_pass(**kwargs):
+        with calls_lock:
+            calls.append((kwargs["repo_id"], kwargs["repo_root"]))
+        return []
+
+    monkeypatch.setattr(runtime, "run_enrichment_pass", fake_run_enrichment_pass)
+    state_dir = tmp_path / "state"
+    server_one = create_daemon(state_dir=str(state_dir), port=0)
+    server_one.start()
+    try:
+        request = build_request("find_symbol", str(repo), {"name": "target"})
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            response = send_request(server_one.port, request)
+            if response["ok"]:
+                break
+            assert response["error"]["code"] == "INDEX_NOT_READY"
+            time.sleep(0.01)
+        else:
+            raise AssertionError("repo did not finish bootstrap indexing")
+        assert _wait_until(lambda: len(calls) >= 1)
+        time.sleep(0.2)
+    finally:
+        server_one.shutdown()
+
+    tracked.write_text("def renamed_target():\n    pass\n", encoding="utf-8")
+    server_two = create_daemon(state_dir=str(state_dir), port=0)
+    server_two.start()
+    try:
+        response = send_request(server_two.port, request)
+        assert response["ok"] is True
+        assert _wait_until(lambda: len(calls) >= 2), "restart reconciliation never re-enriched the edited repo"
+    finally:
+        server_two.shutdown()
 
 
 def test_runtime_bootstrap_triggers_enrichment_for_an_ambiguous_cross_file_call(tmp_path):
@@ -600,7 +791,45 @@ def test_runtime_bootstrap_triggers_enrichment_without_a_pyright_binary(monkeypa
             raise AssertionError("repo did not finish bootstrap indexing")
 
         assert triggered.wait(timeout=2.0), "bootstrap never triggered the enrichment pass"
-        assert len(calls) == 1
-        assert calls[0][1] == str(repo)
+        time.sleep(0.1)
+        assert 1 <= len(calls) <= 2
+        assert all(call[1] == str(repo) for call in calls)
     finally:
         server.shutdown()
+
+
+def test_repo_fingerprint_changes_for_tracked_and_untracked_worktree_state(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    tracked = repo / "module.py"
+    tracked.write_text("def target():\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "initial"], check=True)
+
+    clean = compute_repo_fingerprint(str(repo))
+    tracked.write_text("def renamed_target():\n    pass\n", encoding="utf-8")
+    tracked_changed = compute_repo_fingerprint(str(repo))
+    (repo / "untracked.py").write_text("def new_symbol():\n    pass\n", encoding="utf-8")
+    untracked_changed = compute_repo_fingerprint(str(repo))
+
+    assert clean is not None
+    assert tracked_changed is not None
+    assert untracked_changed is not None
+    assert tracked_changed != clean
+    assert untracked_changed != tracked_changed
+
+
+def test_repo_fingerprint_returns_none_when_git_cannot_describe_the_directory(tmp_path):
+    assert compute_repo_fingerprint(str(tmp_path)) is None
+
+
+def test_repo_fingerprint_returns_none_when_git_subprocess_raises(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(repo_fingerprint.subprocess, "run", fail)
+
+    assert compute_repo_fingerprint(str(tmp_path)) is None

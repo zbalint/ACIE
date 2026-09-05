@@ -217,3 +217,51 @@ def test_opening_a_pre_existing_index_meta_table_without_head_sha_migrates_it_in
     assert store.get_last_indexed_head_sha() is None
     store.set_last_indexed_head_sha("abc123")
     assert store.get_last_indexed_head_sha() == "abc123"
+
+
+def test_last_enrichment_fingerprint_is_none_for_a_fresh_store():
+    store = IndexMetaStore(":memory:")
+
+    assert store.get_last_enrichment_fingerprint() is None
+
+
+def test_set_then_get_last_enrichment_fingerprint_round_trips():
+    store = IndexMetaStore(":memory:")
+
+    store.set_last_enrichment_fingerprint("fingerprint-1")
+
+    assert store.get_last_enrichment_fingerprint() == "fingerprint-1"
+
+
+def test_last_enrichment_fingerprint_persists_across_store_instances_on_the_same_db_path(tmp_path):
+    db_path = str(tmp_path / "index.sqlite")
+    IndexMetaStore(db_path).set_last_enrichment_fingerprint("fingerprint-1")
+
+    reopened = IndexMetaStore(db_path)
+
+    assert reopened.get_last_enrichment_fingerprint() == "fingerprint-1"
+
+
+def test_opening_a_pre_existing_index_meta_table_without_enrichment_fingerprint_migrates_it_in_place():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE index_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 0),
+            generation INTEGER NOT NULL,
+            head_sha TEXT,
+            cross_file_pass_version INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO index_meta (id, generation, head_sha, cross_file_pass_version)
+        VALUES (0, 5, 'abc123', 3);
+        """
+    )
+    conn.commit()
+
+    store = IndexMetaStore(conn=conn)
+
+    assert store.get_last_enrichment_fingerprint() is None
+    store.set_last_enrichment_fingerprint("fingerprint-1")
+    assert store.get_last_enrichment_fingerprint() == "fingerprint-1"

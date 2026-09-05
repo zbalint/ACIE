@@ -52,6 +52,8 @@ On-disk layout:
 
 `<repo-id>` is derived from the repo's `.git` common directory, so that git worktrees of one logical repository share one `<repo-id>` rather than duplicating or colliding.
 
+ACIE indexes only git repositories. This is a permanent, intentional product constraint: every indexed repo must resolve a git common directory, and non-git directories are unsupported rather than a partially supported mode.
+
 Rejected alternatives: a pure in-repo `.acie/index.sqlite` (risk of accidental commits, breaks on read-only checkouts/CI); a single global SQLite database shared across every repo the daemon serves (fragile single point of failure, blast radius spans every repo).
 
 ## Daemon & MCP-Server Design

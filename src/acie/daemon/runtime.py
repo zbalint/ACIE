@@ -13,6 +13,7 @@ from typing import Callable, Iterable
 
 from acie.daemon.bootstrap import BootstrapCoordinator
 from acie.daemon.dispatch import dispatch_request, walk_repo
+from acie.daemon.enrichment_scheduler import EnrichmentScheduler
 from acie.daemon.lsp_enrichment import run_enrichment_pass
 from acie.daemon.notify_hook import handle_notify_hook
 from acie.daemon.protocol import build_error_response, build_success_response
@@ -22,9 +23,11 @@ from acie.daemon.staleness import extract_staleness_target
 from acie.daemon.watcher import WatcherRegistry, make_reindex_job
 from acie.daemon.write_queue import WriteQueue
 from acie.repo_id import resolve_repo_id, resolve_repo_root
+from acie.daemon.repo_fingerprint import compute_repo_fingerprint
 from acie.storage.connection import open_connection
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
+from acie.storage.index_meta_store import IndexMetaStore
 
 _logger = logging.getLogger(__name__)
 
@@ -77,13 +80,11 @@ def trigger_enrichment(
     *,
     walk_repo: Callable[[str], Iterable[tuple[str, str]]] = walk_repo,
 ) -> None:
-    """D6: fires an opportunistic enrichment pass after BootstrapCoordinator
-    finishes indexing repo_id for the first time (or completes its one-time
-    cross-file-pass migration catch-up). Always hands off to a fresh thread
-    and returns immediately -- see this spec's finding 2 for why calling
-    run_enrichment_pass inline here would deadlock repo_id's own writer
-    thread (this function is itself invoked from on_indexed, which fires
-    synchronously on that writer thread).
+    """Compatibility helper retained for D6's direct tests and callers.
+
+    Production daemon wiring now sends every trigger through
+    ``EnrichmentScheduler``; this helper still provides D6's original
+    fire-and-forget thread hop for callers that use it directly.
     """
     # shortcut: no per-site mtime/content-hash freshness check against
     # BootstrapCoordinator's walk snapshot; upgrade to pass that snapshot
@@ -118,6 +119,9 @@ def _run_triggered_enrichment(
             symbol_store=SymbolStore(conn=conn),
             relation_store=RelationStore(conn=conn),
         )
+        fingerprint = compute_repo_fingerprint(repo_root)
+        if fingerprint is not None:
+            IndexMetaStore(conn=conn).set_last_enrichment_fingerprint(fingerprint)
     except Exception:  # noqa: BLE001 -- same "never break anything else" principle; logged, not raised.
         _logger.warning("D6 enrichment trigger: enrichment pass failed for repo %r", repo_id, exc_info=True)
     finally:
@@ -169,11 +173,15 @@ def create_daemon(
 
     write_queue = WriteQueue(db_path_for=db_path_for)
     process_registry = PyrightProcessRegistry()
+    scheduler = EnrichmentScheduler(
+        process_registry,
+        write_queue,
+        db_path_for,
+        walk_repo=walk_repo,
+    )
 
     def _on_indexed(repo_id: str, repo_root: str) -> None:
-        trigger_enrichment(
-            process_registry, write_queue, db_path_for, repo_id, repo_root, walk_repo=walk_repo
-        )
+        scheduler.trigger_now(repo_id, repo_root)
 
     bootstrap = BootstrapCoordinator(
         write_queue=write_queue,
@@ -181,7 +189,7 @@ def create_daemon(
         walk_repo=walk_repo,
         on_indexed=_on_indexed,
     )
-    watchers = WatcherRegistry(write_queue)
+    watchers = WatcherRegistry(write_queue, on_paths_changed=scheduler.on_watcher_edit)
 
     def _resolve_repo(repo_path: str) -> tuple[str, str] | None:
         # Resolved once per request and threaded through register_repo,

@@ -15,6 +15,14 @@ _SHORT_DEBOUNCE = 0.05
 _WAIT_PAST_DEBOUNCE = 0.3
 
 
+def _wait_until(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
 def _write(repo_root, rel_path, content):
     abs_path = os.path.join(repo_root, rel_path)
     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
@@ -296,6 +304,7 @@ def test_repo_watcher_stop_flushes_a_pending_debounce_timer_before_returning():
     watcher._repo_root = "/fake/repo"
     watcher._repo_id = "repo-id"
     watcher._write_queue = write_queue
+    watcher._on_paths_changed_hook = lambda repo_id, repo_root: None
     watcher._handler = _DebouncedEventHandler(
         "/fake/repo", watcher._on_paths_changed, debounce_seconds=10.0
     )
@@ -394,3 +403,27 @@ def test_watcher_registry_keys_on_repo_root_not_repo_id(tmp_path):
         assert registry._watchers[str(repo_root)] is first_watcher
     finally:
         registry.close(timeout=2)
+
+
+def test_repo_watcher_calls_injected_hook_once_after_a_debounced_batch(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    write_queue = _RecordingWriteQueue()
+    callbacks = []
+    watcher = RepoWatcher(
+        str(repo_root),
+        "repo-id",
+        write_queue,
+        debounce_seconds=_SHORT_DEBOUNCE,
+        on_paths_changed=lambda repo_id, root: callbacks.append((repo_id, root)),
+    )
+    try:
+        _write(str(repo_root), "a.py", "def a():\n    pass\n")
+        _write(str(repo_root), "b.py", "def b():\n    pass\n")
+
+        assert _wait_until(lambda: callbacks == [("repo-id", str(repo_root))])
+        time.sleep(_WAIT_PAST_DEBOUNCE)
+        assert callbacks == [("repo-id", str(repo_root))]
+        assert set(write_queue.submitted_repo_keys) == {"repo-id"}
+    finally:
+        watcher.stop(timeout=2)

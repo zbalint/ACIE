@@ -4,9 +4,12 @@ import threading
 import time
 from concurrent.futures import Future
 
+from acie.daemon import bootstrap as bootstrap_module
 from acie.daemon.bootstrap import BootstrapCoordinator
 from acie.daemon.write_queue import WriteQueue
 from acie.indexer import index_file
+from acie.daemon import enrichment_scheduler as scheduler_module
+from acie.daemon.enrichment_scheduler import EnrichmentScheduler
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
@@ -546,7 +549,7 @@ def test_register_does_not_call_on_indexed_for_an_empty_bootstrap(tmp_path):
     write_queue.close()
 
 
-def test_register_calls_on_indexed_after_nonempty_cross_file_migration_catchup(tmp_path):
+def test_register_calls_on_indexed_after_nonempty_cross_file_migration_catchup(tmp_path, monkeypatch):
     files = {
         "repo-a": [
             ("pkg/mod.py", "from pkg.other import helper\n\n\nhelper()\n"),
@@ -560,6 +563,8 @@ def test_register_calls_on_indexed_after_nonempty_cross_file_migration_catchup(t
         on_indexed=lambda repo_id, repo_root: calls.append((repo_id, repo_root)),
     )
     _index_files_once_directly(db_path_for("repo-a"), files["repo-a"])
+    IndexMetaStore(db_path_for("repo-a")).set_last_enrichment_fingerprint("same")
+    monkeypatch.setattr(bootstrap_module, "compute_repo_fingerprint", lambda repo_root: "same")
 
     coordinator.register("repo-a", "repo-a")
 
@@ -568,7 +573,7 @@ def test_register_calls_on_indexed_after_nonempty_cross_file_migration_catchup(t
     write_queue.close()
 
 
-def test_register_does_not_call_on_indexed_for_an_empty_migration_catchup(tmp_path):
+def test_register_does_not_call_on_indexed_for_an_empty_migration_catchup(tmp_path, monkeypatch):
     calls = []
     coordinator, write_queue, db_path_for = _make_coordinator(
         tmp_path,
@@ -576,6 +581,8 @@ def test_register_does_not_call_on_indexed_for_an_empty_migration_catchup(tmp_pa
         on_indexed=lambda repo_id, repo_root: calls.append((repo_id, repo_root)),
     )
     sqlite3.connect(db_path_for("repo-a")).close()
+    IndexMetaStore(db_path_for("repo-a")).set_last_enrichment_fingerprint("same")
+    monkeypatch.setattr(bootstrap_module, "compute_repo_fingerprint", lambda repo_root: "same")
 
     coordinator.register("repo-a", "repo-a")
 
@@ -584,7 +591,7 @@ def test_register_does_not_call_on_indexed_for_an_empty_migration_catchup(tmp_pa
     write_queue.close()
 
 
-def test_register_does_not_trigger_indexed_twice_after_bootstrap_and_migration_are_done(tmp_path):
+def test_register_does_not_trigger_indexed_twice_after_bootstrap_and_migration_are_done(tmp_path, monkeypatch):
     calls = []
     coordinator, write_queue, db_path_for = _make_coordinator(
         tmp_path,
@@ -595,10 +602,169 @@ def test_register_does_not_trigger_indexed_twice_after_bootstrap_and_migration_a
     coordinator.register("repo-a", "repo-a")
     assert _wait_until(lambda: len(calls) == 1), "initial on_indexed never fired"
     assert _wait_until(lambda: IndexMetaStore(db_path_for("repo-a")).cross_file_pass_done())
+    IndexMetaStore(db_path_for("repo-a")).set_last_enrichment_fingerprint("same")
+    monkeypatch.setattr(bootstrap_module, "compute_repo_fingerprint", lambda repo_root: "same")
 
     coordinator.register("repo-a", "repo-a")
     coordinator.register("repo-a", "repo-a")
     time.sleep(0.1)
 
     assert calls == [("repo-a", "repo-a")]
+    write_queue.close()
+
+
+def _make_ready_index(coordinator_data):
+    coordinator, write_queue, db_path_for = coordinator_data
+    IndexMetaStore(db_path_for("repo-a")).mark_cross_file_pass_done()
+    return coordinator, write_queue, db_path_for
+
+
+def test_register_reconciliation_triggers_on_a_fingerprint_mismatch(tmp_path, monkeypatch):
+    calls = []
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path,
+        files_by_repo={"repo-a": []},
+        on_indexed=lambda repo_id, repo_root: calls.append((repo_id, repo_root)),
+    )
+    _make_ready_index((coordinator, write_queue, db_path_for))
+    IndexMetaStore(db_path_for("repo-a")).set_last_enrichment_fingerprint("old")
+    monkeypatch.setattr(bootstrap_module, "compute_repo_fingerprint", lambda repo_root: "current")
+
+    coordinator.register("repo-a", "/repo-a")
+
+    assert _wait_until(lambda: calls == [("repo-a", "/repo-a")])
+    coordinator.register("repo-a", "/repo-a")
+    time.sleep(0.1)
+    assert calls == [("repo-a", "/repo-a")]
+    write_queue.close()
+
+
+def test_register_reconciliation_skips_when_the_stored_fingerprint_matches(tmp_path, monkeypatch):
+    calls = []
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path,
+        files_by_repo={"repo-a": []},
+        on_indexed=lambda repo_id, repo_root: calls.append((repo_id, repo_root)),
+    )
+    _make_ready_index((coordinator, write_queue, db_path_for))
+    IndexMetaStore(db_path_for("repo-a")).set_last_enrichment_fingerprint("same")
+    fingerprint_calls = []
+
+    def fingerprint(repo_root):
+        fingerprint_calls.append(repo_root)
+        return "same"
+
+    monkeypatch.setattr(bootstrap_module, "compute_repo_fingerprint", fingerprint)
+    coordinator.register("repo-a", "/repo-a")
+    time.sleep(0.1)
+
+    assert calls == []
+    assert fingerprint_calls == ["/repo-a"]
+    write_queue.close()
+
+
+def test_reconciliation_read_failure_allows_a_later_register_to_retry(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "index.sqlite")
+    IndexMetaStore(db_path)
+    calls = []
+
+    class RetryQueue:
+        def __init__(self):
+            self.submissions = 0
+
+        def submit(self, repo_id, job):
+            self.submissions += 1
+            future = Future()
+            if self.submissions == 1:
+                future.set_exception(RuntimeError("transient queue failure"))
+            else:
+                future.set_result(None)
+            return future
+
+    write_queue = RetryQueue()
+    coordinator = BootstrapCoordinator(
+        write_queue=write_queue,
+        db_path_for=lambda repo_id: db_path,
+        walk_repo=lambda repo_root: [],
+        on_indexed=lambda repo_id, repo_root: calls.append((repo_id, repo_root)),
+    )
+    coordinator._migration_checked.add("repo-a")
+    monkeypatch.setattr(bootstrap_module, "compute_repo_fingerprint", lambda repo_root: "current")
+
+    coordinator.register("repo-a", "/repo-a")
+    assert _wait_until(
+        lambda: write_queue.submissions == 1
+        and "repo-a" not in coordinator._reconciliation_checked
+    )
+
+    coordinator.register("repo-a", "/repo-a")
+
+    assert _wait_until(lambda: calls == [("repo-a", "/repo-a")])
+    assert write_queue.submissions == 2
+
+
+def test_bootstrap_double_fire_and_reconciliation_share_one_scheduler_follow_up(tmp_path, monkeypatch):
+    db_paths = {}
+
+    def db_path_for(repo_id):
+        return db_paths.setdefault(repo_id, str(tmp_path / f"{repo_id}.sqlite"))
+
+    write_queue = WriteQueue(db_path_for=db_path_for)
+    calls = []
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    finished = threading.Event()
+
+    def runner(*args):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(args[3])
+            call_number = len(calls)
+            if call_number == 1:
+                first_started.set()
+        if call_number == 1:
+            release_first.wait(timeout=2.0)
+        with lock:
+            active -= 1
+            if len(calls) == 2 and active == 0:
+                finished.set()
+
+    monkeypatch.setattr(scheduler_module, "_run_triggered_enrichment", runner)
+    scheduler = EnrichmentScheduler(
+        object(),
+        write_queue,
+        db_path_for,
+        walk_repo=lambda repo_root: [],
+    )
+    coordinator = BootstrapCoordinator(
+        write_queue=write_queue,
+        db_path_for=db_path_for,
+        walk_repo=lambda repo_root: [],
+        on_indexed=scheduler.trigger_now,
+    )
+    IndexMetaStore(db_path_for("repo-a")).mark_cross_file_pass_done()
+    IndexMetaStore(db_path_for("repo-a")).set_last_enrichment_fingerprint("old")
+    monkeypatch.setattr(bootstrap_module, "compute_repo_fingerprint", lambda repo_root: "current")
+
+    coordinator._on_indexed("repo-a", "/repo-a")  # bootstrap completion
+    assert first_started.wait(timeout=2.0)
+    coordinator._on_indexed("repo-a", "/repo-a")  # accepted bootstrap double-fire race
+    reconciliation = threading.Thread(
+        target=coordinator._run_reconciliation_check,
+        args=("repo-a", "/repo-a"),
+        daemon=True,
+    )
+    reconciliation.start()
+    reconciliation.join(timeout=2.0)
+    assert not reconciliation.is_alive()
+
+    release_first.set()
+    assert finished.wait(timeout=2.0)
+    assert calls == ["repo-a", "repo-a"]
+    assert max_active == 1
     write_queue.close()
