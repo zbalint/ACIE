@@ -526,6 +526,118 @@ def test_enrichment_persists_all_ambiguous_mixin_composition_candidates(
     finally:
         write_queue.close(timeout=5)
 
+def test_enrichment_retires_stale_ambiguous_mixin_candidate_after_membership_changes(
+    monkeypatch, tmp_path
+):
+    db_path = str(tmp_path / "index.sqlite")
+    symbols = SymbolStore(db_path)
+    relations = RelationStore(db_path)
+    index_meta = IndexMetaStore(db_path)
+    mixin = (
+        "pkg/mixin.py",
+        "class Mixin:\n"
+        "    def caller(self):\n"
+        "        self.provided()\n",
+    )
+    provider_b = (
+        "pkg/provider_b.py",
+        "class ProviderB:\n"
+        "    def provided(self):\n"
+        "        pass\n",
+    )
+    provider_c = (
+        "pkg/provider_c.py",
+        "class ProviderC:\n"
+        "    def provided(self):\n"
+        "        pass\n",
+    )
+    shared_provider = (
+        "pkg/shared_provider.py",
+        "class SharedProvider:\n"
+        "    def provided(self):\n"
+        "        pass\n",
+    )
+    composed_b = (
+        "pkg/composed.py",
+        "from pkg.mixin import Mixin\n"
+        "from pkg.provider_b import ProviderB\n"
+        "from pkg.shared_provider import SharedProvider\n\n\n"
+        "class ComposedB(Mixin, ProviderB, SharedProvider):\n"
+        "    pass\n",
+    )
+    composed_c = (
+        "pkg/composed.py",
+        "from pkg.mixin import Mixin\n"
+        "from pkg.provider_c import ProviderC\n"
+        "from pkg.shared_provider import SharedProvider\n\n\n"
+        "class ComposedB(Mixin, ProviderC, SharedProvider):\n"
+        "    pass\n",
+    )
+    first_files = [mixin, provider_b, provider_c, shared_provider, composed_b]
+    second_files = [mixin, provider_b, provider_c, shared_provider, composed_c]
+    for path, source in first_files:
+        index_file(
+            path=path,
+            source_text=source,
+            observed_at="2026-09-05T00:00:00Z",
+            symbol_store=symbols,
+            relation_store=relations,
+            index_meta_store=index_meta,
+        )
+
+    write_queue = WriteQueue(lambda _repo_id: db_path)
+    try:
+        first_resolved, _ = _run(
+            monkeypatch,
+            tmp_path,
+            FakeClient([]),
+            symbols,
+            relations,
+            first_files,
+            write_queue=write_queue,
+        )
+        first_targets = {
+            "pkg/provider_b.py:ProviderB.provided#method",
+            "pkg/shared_provider.py:SharedProvider.provided#method",
+        }
+        assert {relation.target for relation in first_resolved} == first_targets
+        assert {relation.confidence for relation in first_resolved} == {Confidence.AMBIGUOUS}
+
+        index_file(
+            path=composed_c[0],
+            source_text=composed_c[1],
+            observed_at="2026-09-05T00:01:00Z",
+            symbol_store=symbols,
+            relation_store=relations,
+            index_meta_store=index_meta,
+        )
+
+        second_resolved, _ = _run(
+            monkeypatch,
+            tmp_path,
+            FakeClient([]),
+            symbols,
+            relations,
+            second_files,
+            write_queue=write_queue,
+        )
+        second_targets = {
+            "pkg/provider_c.py:ProviderC.provided#method",
+            "pkg/shared_provider.py:SharedProvider.provided#method",
+        }
+        assert {relation.target for relation in second_resolved} == second_targets
+        assert {relation.confidence for relation in second_resolved} == {Confidence.AMBIGUOUS}
+        live = relations.list_by_site(
+            site_file=second_resolved[0].site_file,
+            site_line=second_resolved[0].site_line,
+            site_col=second_resolved[0].site_col,
+            predicates={"calls"},
+        )
+        assert {relation.target for relation in live} == second_targets
+        assert all(relation.confidence == Confidence.AMBIGUOUS for relation in live)
+    finally:
+        write_queue.close(timeout=5)
+
 
 def test_enrichment_keeps_h1_direct_base_resolution_out_of_h2(
     monkeypatch, tmp_path
@@ -628,4 +740,55 @@ def test_enrichment_triggers_h2_after_h1_deferred_cross_file_miss_at_any_depth(
     ]
     assert resolved[0].confidence == Confidence.INFERRED
     assert queue.submissions
+    assert client.requests == []
+
+def test_enrichment_keeps_multi_level_mixin_composition_silent_no_match(
+    monkeypatch, tmp_path
+):
+    symbols = SymbolStore(":memory:")
+    relations = RelationStore(":memory:")
+    index_meta = IndexMetaStore(":memory:")
+    files = [
+        (
+            "pkg/mixin.py",
+            "class Mixin:\n"
+            "    def caller(self):\n"
+            "        self.provided()\n",
+        ),
+        (
+            "pkg/composed.py",
+            "from pkg.mixin import Mixin\n\n\n"
+            "class Composed(Mixin):\n"
+            "    pass\n",
+        ),
+        (
+            "pkg/provider.py",
+            "class Provider:\n"
+            "    def provided(self):\n"
+            "        pass\n",
+        ),
+        (
+            "pkg/final.py",
+            "from pkg.composed import Composed\n"
+            "from pkg.provider import Provider\n\n\n"
+            "class Final(Composed, Provider):\n"
+            "    pass\n",
+        ),
+    ]
+    for path, source in files:
+        index_file(
+            path=path,
+            source_text=source,
+            observed_at="2026-09-05T00:00:00Z",
+            symbol_store=symbols,
+            relation_store=relations,
+            index_meta_store=index_meta,
+        )
+
+    client = FakeClient([])
+    resolved, queue = _run(monkeypatch, tmp_path, client, symbols, relations, files)
+
+    assert resolved == []
+    assert relations.list_by_site_file("pkg/mixin.py", predicates={"calls"}) == []
+    assert queue.submissions == []
     assert client.requests == []
