@@ -266,6 +266,33 @@ def test_explain_requires_exactly_one_of_symbol_id_or_edge_ref():
         )
 
 
+def test_explain_raises_invalid_argument_for_an_incomplete_edge_ref():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    with pytest.raises(
+        InvalidArgumentError,
+        match=r"edge_ref.*site_col.*site_file.*site_line",
+    ):
+        explain(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            edge_ref={
+                "source_symbol_id": "pkg/mod.py:a#function",
+                "target_symbol_id": "pkg/mod.py:b#function",
+                "predicate": "calls",
+            },
+        )
+
+
+def test_explain_raises_invalid_argument_for_a_non_dict_edge_ref():
+    symbol_store, relation_store, index_meta_store = _stores()
+
+    with pytest.raises(InvalidArgumentError, match="edge_ref"):
+        explain(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            edge_ref="not-a-dict",
+        )
+
+
 def test_explain_raises_invalid_limit_for_a_non_positive_limit():
     symbol_store, relation_store, index_meta_store = _stores()
     foo = _symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function", line=1)

@@ -13,6 +13,7 @@ already set for pagination.py's cursor mechanics.
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
 from acie.tools.errors import SymbolNotFoundError
+from acie.tools.validation import require_dict_keys
 
 # Relation predicates whose site is a genuine "reference to a symbol"
 # resolvable to a target. imports is excluded: its target is a raw
@@ -51,6 +52,7 @@ def resolve_symbol_or_position(
             raise SymbolNotFoundError(f"no live symbol with id {symbol_id!r}")
         return [symbol]
 
+    position = require_dict_keys(position, {"file", "line", "column"}, param_name="position")
     path, line, column = position["file"], position["line"], position["column"]
 
     reference_sites = relation_store.list_by_site(

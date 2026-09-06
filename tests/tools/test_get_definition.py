@@ -122,6 +122,49 @@ def test_get_definition_raises_invalid_argument_when_neither_symbol_id_nor_posit
         )
 
 
+def test_get_definition_raises_invalid_argument_for_position_missing_column():
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+
+    with pytest.raises(InvalidArgumentError, match=r"position.*column"):
+        get_definition(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            position={"file": "pkg/mod.py", "line": 1},
+        )
+
+
+def test_get_definition_raises_invalid_argument_for_a_non_dict_position():
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+
+    with pytest.raises(InvalidArgumentError, match="position"):
+        get_definition(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            position="not-a-dict",
+        )
+
+
+def test_get_definition_round_trips_a_symbol_definition_through_its_exact_position():
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+    symbol = _symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function", line=1, col=0)
+    symbol_store.upsert(symbol)
+
+    by_symbol_id = get_definition(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        symbol_id=symbol.id,
+    )
+    definition = by_symbol_id["results"][0]
+
+    by_position = get_definition(
+        symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+        position={
+            "file": definition["path"],
+            "line": definition["start_line"],
+            "column": definition["start_col"],
+        },
+    )
+
+    assert [result["id"] for result in by_position["results"]] == [symbol.id]
+
+
 def test_get_definition_raises_invalid_limit_for_a_non_positive_limit():
     symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
     symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))

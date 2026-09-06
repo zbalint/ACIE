@@ -165,6 +165,26 @@ def test_find_references_raises_invalid_argument_when_neither_symbol_id_nor_posi
         )
 
 
+def test_find_references_raises_invalid_argument_for_position_missing_column():
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+
+    with pytest.raises(InvalidArgumentError, match=r"position.*column"):
+        find_references(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            position={"file": "pkg/mod.py", "line": 1},
+        )
+
+
+def test_find_references_raises_invalid_argument_for_a_non_dict_position():
+    symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
+
+    with pytest.raises(InvalidArgumentError, match="position"):
+        find_references(
+            symbol_store=symbol_store, relation_store=relation_store, index_meta_store=index_meta_store,
+            position="not-a-dict",
+        )
+
+
 def test_find_references_raises_invalid_limit_for_a_non_positive_limit():
     symbol_store, relation_store, index_meta_store = _stores_with_generation(1)
     symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))

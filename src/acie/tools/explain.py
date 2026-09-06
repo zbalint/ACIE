@@ -49,6 +49,7 @@ from acie.storage.symbol_store import SymbolStore
 from acie.tools.errors import EdgeNotFoundError, InvalidArgumentError, SymbolNotFoundError
 from acie.tools.pagination import coerce_tuple_key, decode_cursor, filter_since, paginate
 from acie.tools.render import render_relation, render_symbol
+from acie.tools.validation import require_dict_keys
 
 _DEFAULT_LIMIT = 50
 
@@ -125,6 +126,11 @@ def _symbol_entries(symbol_store: SymbolStore, symbol_id: str) -> list[tuple[tup
 
 
 def _edge_entries(relation_store: RelationStore, edge_ref: dict) -> list[tuple[tuple, dict]]:
+    edge_ref = require_dict_keys(
+        edge_ref,
+        {"source_symbol_id", "target_symbol_id", "predicate", "site_file", "site_line", "site_col"},
+        param_name="edge_ref",
+    )
     key = {
         "source": edge_ref["source_symbol_id"],
         "target": edge_ref["target_symbol_id"],
