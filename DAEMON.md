@@ -64,7 +64,7 @@ Adapted from SALTMDB's `daemon/dispatch.py`, simplified for ACIE's shape:
 
 **Error wrapping**: a single shared wrapper inside `dispatch_tool` catches `AcieToolError` subclasses, mapping `.code` and `str(exc)` into the tool-level error envelope (matching `errors.py`'s own stated design intent). Anything else maps to transport-level `INTERNAL_ERROR`.
 
-**`INDEX_NOT_READY` short-circuit**: dispatch checks a per-repo readiness flag *before* looking up `DISPATCH_TABLE` or constructing any store. An unready repo never opens a store connection at all. That short-circuit response reports `index_generation: 0`, matching `IndexMetaStore`'s own schema default rather than inventing a new sentinel value.
+**`INDEX_NOT_READY` short-circuit**: dispatch checks a per-worktree readiness flag *before* looking up `DISPATCH_TABLE` or constructing any store. An unready worktree never opens a store connection at all. That short-circuit response reports `index_generation: 0`, matching `IndexMetaStore`'s own schema default rather than inventing a new sentinel value.
 
 ## Repo & Session Identity
 
@@ -143,7 +143,7 @@ This idle-timeout teardown is intentionally distinct from the `WriteQueue` short
 
 `acie scan [path]` is a blocking, foreground convenience command for pre-warming a repository after cloning or before a CI/tooling step. It is never load-bearing: the daemon's own on-demand `BootstrapCoordinator` path remains fully sufficient, and no daemon, socket, RPC, discovery file, or MCP surface is involved.
 
-The command resolves the repository, walks its `.gitignore`-aware Python source files, submits every file through the per-repo write queue for two complete indexing passes, then runs one opportunistic pyright enrichment pass. The second indexing pass matches daemon bootstrap's cross-file resolution discipline, so arbitrary walk order does not leave resolvable calls, inherits, or overrides incomplete.
+The command resolves the repository, walks its `.gitignore`-aware Python source files, submits every file through the per-worktree write queue for two complete indexing passes, then runs one opportunistic pyright enrichment pass. The second indexing pass matches daemon bootstrap's cross-file resolution discipline, so arbitrary walk order does not leave resolvable calls, inherits, or overrides incomplete.
 
 After the second pass, the scan writes the existing `index_meta` cross-file-pass migration marker through the same write queue. A later daemon touch therefore sees both a ready `index.sqlite` and a completed current cross-file pass, performing zero redundant bootstrap migration work.
 

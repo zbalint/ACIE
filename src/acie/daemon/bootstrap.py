@@ -1,4 +1,4 @@
-"""Bootstrap indexing and the daemon's per-repo readiness flag.
+"""Bootstrap indexing and the daemon's per-worktree readiness flag.
 
 See DAEMON.md "Bootstrap Indexing & INDEX_NOT_READY". `BootstrapCoordinator`
 is the real seam behind dispatch.py's `repo_ready` parameter (a fake in
@@ -31,12 +31,12 @@ from acie.storage.symbol_store import SymbolStore
 
 
 class BootstrapCoordinator:
-    """Tracks per-repo readiness and drives a repo's first walk-and-index pass.
+    """Tracks per-worktree readiness and drives a worktree's first walk-and-index pass.
 
-    `db_path_for` (repo_id -> index.sqlite path) and `walk_repo` (repo_root
+    `db_path_for` (worktree_id -> index.sqlite path) and `walk_repo` (repo_root
     -> discovered files) are injected exactly like `WriteQueue`'s own
     `db_path_for` -- production wiring (resolving a raw `repo_path` to the
-    canonical `repo_id`/`repo_root` pair register() takes, and reading real
+    `(worktree_id, repo_root)` pair register() takes, and reading real
     files off disk) belongs to the daemon-server slice that constructs the
     real callables; tests here supply fakes so no real git repo or
     filesystem walk is needed.
@@ -67,7 +67,7 @@ class BootstrapCoordinator:
 
         The disk-existence check only ever applies to a repo_id this
         coordinator has never touched (no prior register() call this
-        process lifetime): opening the write queue's per-repo connection
+        process lifetime): opening the write queue's per-worktree connection
         creates repo_id's sqlite file on disk immediately, well before
         that connection's first write is committed, so while a bootstrap
         for repo_id is in flight this must trust `_in_progress`, not the
@@ -89,9 +89,10 @@ class BootstrapCoordinator:
         """Idempotent: starts repo_id's bootstrap walk if it hasn't already.
 
         Two params, not one: readiness/write-queue bookkeeping is keyed on
-        `repo_id` (the canonical, worktree-collapsing identity -- decision
-        10, SALTMDB f4bdfc9d/repo_path-vs-resolve_repo_id keying fix), but
-        `walk_repo` needs an actual on-disk directory to walk, which a
+        `repo_id` (a primary worktree's own canonical identity, or a linked
+        worktree's distinct `worktree_id` -- see `repo_id.py:resolve_worktree_id`;
+        each worktree's bookkeeping is independent, not collapsed together),
+        but `walk_repo` needs an actual on-disk directory to walk, which a
         repo_id hash cannot be reversed back into -- so the caller (already
         holding both, having resolved them together) passes `repo_root`
         through explicitly rather than this class hiding a second lookup.
@@ -147,7 +148,7 @@ class BootstrapCoordinator:
 
         if not files:
             # A genuinely empty repo never gets a write_queue submission at
-            # all (see repo_ready()'s own docstring: opening the per-repo
+            # all (see repo_ready()'s own docstring: opening the per-worktree
             # connection creates index.sqlite on disk immediately) -- so
             # there is no index.sqlite to persist the migration flag into,
             # and nothing to migrate anyway. Skip it; a future daemon
