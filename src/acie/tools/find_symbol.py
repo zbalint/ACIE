@@ -22,6 +22,17 @@ def find_symbol(
     full: bool = False,
     min_confidence: str | None = None,
 ) -> dict:
+    """Find indexed symbols whose qualified name contains ``name``.
+
+    ``name`` is a required substring; optional ``kind`` filters by symbol-kind enum,
+    ``path_glob`` filters paths, ``limit`` sets the page size, ``cursor`` continues
+    opaque keyset pagination, ``full`` includes confidence and provenance, and
+    ``min_confidence`` filters the graded results. Results are ordered by symbol id.
+    Raises ``INVALID_ARGUMENT`` for an invalid ``min_confidence``, ``INVALID_CURSOR``
+    for a malformed or semantically invalid cursor, ``INVALID_LIMIT`` for a
+    non-positive limit, and ``STALE_INDEX_GENERATION`` when a cursor targets an old
+    index generation.
+    """
     index_generation = index_meta_store.current_generation()
 
     after_id = None

@@ -36,6 +36,21 @@ def find_references(
     full: bool = False,
     min_confidence: str | None = None,
 ) -> dict:
+    """Find every indexed reference site for exactly one symbol selector.
+
+    ``symbol_id`` selects a symbol directly; alternatively, ``position`` is a
+    ``{file, line, column}`` mapping where ``line`` is 1-indexed and ``column`` is
+    0-indexed. The selectors are mutually exclusive, and ``position`` triggers a
+    tier-4 lazy staleness check for its file. ``limit`` sets the page size,
+    ``cursor`` continues opaque keyset pagination, ``full`` includes confidence
+    and provenance, and ``min_confidence`` filters the graded results.
+    Raises ``INVALID_ARGUMENT`` when neither or both selectors are supplied or
+    ``min_confidence`` is invalid, ``SYMBOL_NOT_FOUND`` when resolution finds no
+    symbol, ``INVALID_CURSOR`` for a malformed or semantically invalid cursor,
+    ``INVALID_LIMIT`` for a non-positive limit, and ``STALE_INDEX_GENERATION``
+    when a cursor targets an old index generation.
+    """
+
     if (symbol_id is None) == (position is None):
         raise InvalidArgumentError("find_references requires exactly one of symbol_id or position")
 

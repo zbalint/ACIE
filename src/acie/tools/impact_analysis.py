@@ -102,6 +102,18 @@ def impact_analysis(
     depth_clamp: int = _DEFAULT_DEPTH_CLAMP,
     full: bool = False,
 ) -> dict:
+    """Compute a bounded blast-radius analysis for a root symbol.
+
+    ``root`` is a ``symbol_id``. Traversal always follows the fixed predicate
+    set ``{calls, imports, overrides}``; it is not selected by a ``graph_type``
+    parameter. ``node_cap`` bounds the affected-symbol list, ``depth_clamp``
+    bounds traversal depth, and ``full`` includes confidence and provenance.
+    The response includes the capped affected-symbol list and
+    confidence-tier counts in ``impact_summary``. Raises ``INVALID_ARGUMENT``
+    for a non-positive bound and ``SYMBOL_NOT_FOUND`` when ``root`` does not
+    name a live symbol.
+    """
+
     # LIVE_MCP_QUALIFICATION_REPORT.md (2026-09-01): root is seeded into
     # `nodes` before any cap check below, so a non-positive node_cap/
     # depth_clamp used to still return the root node, contradicting the cap.

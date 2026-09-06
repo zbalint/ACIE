@@ -24,6 +24,18 @@ def list_imports(
     cursor: str | None = None,
     full: bool = False,
 ) -> dict:
+    """List the import edges observed at a required source ``file`` path.
+
+    ``file`` is the required repository-relative path; ``limit`` sets the page
+    size, ``cursor`` continues opaque keyset pagination, and ``full`` requests
+    confidence and provenance fields. Import results are always ``EXTRACTED``,
+    so confidence filtering is not available and ``full`` does not add
+    meaningful confidence information; every call triggers a tier-4 lazy
+    staleness check for ``file``. Raises ``INVALID_CURSOR`` for a malformed or
+    semantically invalid cursor, ``INVALID_LIMIT`` for a non-positive limit,
+    and ``STALE_INDEX_GENERATION`` when a cursor targets an old index generation.
+    """
+
     index_generation = index_meta_store.current_generation()
 
     after_key = None

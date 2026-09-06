@@ -102,6 +102,18 @@ def affected_tests(
     depth_clamp: int = _DEFAULT_DEPTH_CLAMP,
     full: bool = False,
 ) -> dict:
+    """Find pytest-convention tests that statically exercise a root symbol.
+
+    ``root`` is a ``symbol_id``. Traversal follows the narrower fixed predicate
+    set ``{calls, overrides}``: a test covers a symbol by calling or overriding
+    it, not by importing it. ``node_cap`` bounds traversal results,
+    ``depth_clamp`` bounds traversal depth, and ``full`` includes confidence
+    and provenance. Test identification follows pytest naming conventions for
+    files and functions; this is not measured runtime coverage. Raises
+    ``INVALID_ARGUMENT`` for a non-positive bound and ``SYMBOL_NOT_FOUND`` when
+    ``root`` does not name a live symbol.
+    """
+
     # Same non-positive-cap guard as graph.py/impact_analysis.py (LIVE_MCP_
     # QUALIFICATION_REPORT.md, 2026-09-01).
     if node_cap <= 0:

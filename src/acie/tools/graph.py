@@ -79,6 +79,18 @@ def graph(
     depth_clamp: int = _DEFAULT_DEPTH_CLAMP,
     full: bool = False,
 ) -> dict:
+    """Traverse the call or dependency graph from a symbol id.
+
+    ``root`` is the starting ``symbol_id``. ``graph_type`` is ``"call"`` or
+    ``"dependency"``; ``direction`` is ``"upstream"`` or ``"downstream"``.
+    ``node_cap`` bounds the returned nodes, ``depth_clamp`` bounds traversal
+    depth, and ``full`` includes confidence and provenance. The node-cap and
+    depth-clamp bounds are a deliberate shortcut, not cursor pagination; the
+    envelope has no ``results``, ``total_count``, or ``next_cursor`` fields.
+    Raises ``INVALID_ARGUMENT`` for an invalid enum or non-positive bound and
+    ``SYMBOL_NOT_FOUND`` when ``root`` does not name a live symbol.
+    """
+
     if graph_type not in _PREDICATES_BY_GRAPH_TYPE:
         raise InvalidArgumentError(
             f"graph_type must be one of {sorted(_PREDICATES_BY_GRAPH_TYPE)}, got {graph_type!r}"

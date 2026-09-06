@@ -6,6 +6,8 @@ import anyio
 
 from acie.cli import main
 from acie.mcp_server import _daemon_tool
+from acie.daemon.dispatch import DISPATCH_TABLE
+
 from acie.tools.architecture import architecture
 
 
@@ -16,6 +18,9 @@ def _free_port() -> int:
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+def test_every_dispatched_tool_has_a_caller_visible_docstring():
+    assert {method for method, tool in DISPATCH_TABLE.items() if not tool.__doc__} == set()
 
 
 def test_architecture_public_schema_excludes_the_dispatch_only_repo_root_seam():

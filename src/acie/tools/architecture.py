@@ -315,6 +315,18 @@ def architecture(
     full: bool = False,
     repo_root: str | None = None,
 ) -> dict:
+    """Aggregate repository architecture at file or package granularity.
+
+    ``root`` optionally scopes the query to a path prefix; ``None`` means the
+    whole repository. ``granularity`` must be ``"file"`` or ``"package"``.
+    ``node_cap`` bounds rendered nodes and ``full`` includes confidence and
+    provenance where available. The response returns nodes and edges, optional
+    ``.acie/config.json``-driven ``layer_violations``, and unconditional
+    Tarjan ``cycles``. Raises ``INVALID_ARGUMENT`` for an invalid granularity
+    or non-positive node cap and ``INVALID_CONFIG`` for an invalid layer
+    configuration.
+    """
+
     if granularity not in ("file", "package"):
         raise InvalidArgumentError(f"granularity must be one of ['file', 'package'], got {granularity!r}")
     # Same non-positive-cap guard as graph.py/impact_analysis.py/
