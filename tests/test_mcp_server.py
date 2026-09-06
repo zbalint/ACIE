@@ -1,3 +1,4 @@
+import socket
 import subprocess
 import sys
 
@@ -6,6 +7,15 @@ import anyio
 from acie.cli import main
 from acie.mcp_server import _daemon_tool
 from acie.tools.architecture import architecture
+
+
+def _free_port() -> int:
+    """Reserves an ephemeral port number, then releases it immediately."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
 def test_architecture_public_schema_excludes_the_dispatch_only_repo_root_seam():
@@ -40,7 +50,10 @@ def test_serve_mcp_exposes_and_routes_the_ten_tools(monkeypatch, tmp_path):
         server = StdioServerParameters(
             command=sys.executable,
             args=["-m", "acie", "serve-mcp"],
-            env={"HOME": str(tmp_path / "home")},
+            env={
+                "HOME": str(tmp_path / "home"),
+                "ACIE_DAEMON_ELECTION_PORT": str(_free_port()),
+            },
             cwd=repo,
         )
         async with stdio_client(server) as streams:

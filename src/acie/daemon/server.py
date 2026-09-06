@@ -329,7 +329,15 @@ def main() -> int:
     # process dies, and _spawn_daemon (cli.py) already redirects this
     # process's stderr to daemon.log.
     faulthandler.enable()
-    server = create_daemon(election_port=DAEMON_ELECTION_PORT)
+    configured_election_port = os.environ.get("ACIE_DAEMON_ELECTION_PORT")
+    if configured_election_port is None:
+        election_port = DAEMON_ELECTION_PORT
+    else:
+        try:
+            election_port = int(configured_election_port)
+        except ValueError as exc:
+            raise ValueError("ACIE_DAEMON_ELECTION_PORT must be an integer") from exc
+    server = create_daemon(election_port=election_port)
     install_signal_handlers(server)
     server.start()
     server.serve_forever()
