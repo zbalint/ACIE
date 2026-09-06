@@ -47,3 +47,4 @@ class Symbol:
     end_col: int
     confidence: Confidence
     provenance: Provenance
+    is_stub: bool = False

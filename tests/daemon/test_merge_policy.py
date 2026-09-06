@@ -153,3 +153,23 @@ def test_preserves_ambiguous_siblings_when_incoming_candidate_is_ambiguous():
         site_col=first.site_col,
         predicates={"calls"},
     ) == [first, second, third]
+
+
+def test_preserve_siblings_keeps_an_additive_union_member():
+    store = RelationStore(":memory:")
+    existing = make_relation(target="stub", confidence=Confidence.AMBIGUOUS)
+    incoming = make_relation(target="concrete", confidence=Confidence.INFERRED)
+    store.upsert(existing)
+
+    outcome = apply_enrichment_write(store, incoming, preserve_siblings=True)
+
+    assert outcome == MergeOutcome(True, 0)
+    assert {
+        relation.target
+        for relation in store.list_by_site(
+            site_file=incoming.site_file,
+            site_line=incoming.site_line,
+            site_col=incoming.site_col,
+            predicates={"calls"},
+        )
+    } == {"stub", "concrete"}

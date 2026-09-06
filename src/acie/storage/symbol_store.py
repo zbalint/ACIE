@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS symbols_live (
     start_col INTEGER NOT NULL,
     end_line INTEGER NOT NULL,
     end_col INTEGER NOT NULL,
+    is_stub INTEGER NOT NULL,
     confidence TEXT NOT NULL CHECK (confidence IN ('EXTRACTED', 'INFERRED', 'AMBIGUOUS')),
     provenance_provider TEXT NOT NULL,
     provenance_version TEXT NOT NULL,
@@ -29,12 +30,14 @@ CREATE TABLE IF NOT EXISTS symbols_history (
     start_col INTEGER,
     end_line INTEGER,
     end_col INTEGER,
+    is_stub INTEGER,
     confidence TEXT,
     provenance_provider TEXT,
     provenance_version TEXT,
     observed_at TEXT NOT NULL,
     tombstone INTEGER NOT NULL DEFAULT 0
 );
+
 """
 
 
@@ -60,8 +63,8 @@ class SymbolStore:
             """
             INSERT INTO symbols_live (
                 id, path, qualname, kind, start_line, start_col, end_line, end_col,
-                confidence, provenance_provider, provenance_version, observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_stub, confidence, provenance_provider, provenance_version, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 path = excluded.path,
                 qualname = excluded.qualname,
@@ -70,6 +73,7 @@ class SymbolStore:
                 start_col = excluded.start_col,
                 end_line = excluded.end_line,
                 end_col = excluded.end_col,
+                is_stub = excluded.is_stub,
                 confidence = excluded.confidence,
                 provenance_provider = excluded.provenance_provider,
                 provenance_version = excluded.provenance_version,
@@ -84,6 +88,7 @@ class SymbolStore:
                 symbol.start_col,
                 symbol.end_line,
                 symbol.end_col,
+                int(symbol.is_stub),
                 symbol.confidence.value,
                 symbol.provenance.provider,
                 symbol.provenance.version,
@@ -95,8 +100,8 @@ class SymbolStore:
                 """
                 INSERT INTO symbols_history (
                     id, path, qualname, kind, start_line, start_col, end_line, end_col,
-                    confidence, provenance_provider, provenance_version, observed_at, tombstone
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    is_stub, confidence, provenance_provider, provenance_version, observed_at, tombstone
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
                     symbol.id,
@@ -107,6 +112,7 @@ class SymbolStore:
                     symbol.start_col,
                     symbol.end_line,
                     symbol.end_col,
+                    int(symbol.is_stub),
                     symbol.confidence.value,
                     symbol.provenance.provider,
                     symbol.provenance.version,
@@ -119,7 +125,7 @@ class SymbolStore:
         rows = self._conn.execute(
             """
             SELECT id, path, qualname, kind, start_line, start_col, end_line, end_col,
-                   confidence, provenance_provider, provenance_version, observed_at
+                   is_stub, confidence, provenance_provider, provenance_version, observed_at
             FROM symbols_history WHERE id = ? AND tombstone = 0 ORDER BY history_id ASC
             """,
             (symbol_id,),
@@ -143,7 +149,7 @@ class SymbolStore:
         rows = self._conn.execute(
             """
             SELECT id, path, qualname, kind, start_line, start_col, end_line, end_col,
-                   confidence, provenance_provider, provenance_version, observed_at
+                   is_stub, confidence, provenance_provider, provenance_version, observed_at
             FROM symbols_live WHERE path = ?
             """,
             (path,),
@@ -170,7 +176,7 @@ class SymbolStore:
         rows = self._conn.execute(
             f"""
             SELECT id, path, qualname, kind, start_line, start_col, end_line, end_col,
-                   confidence, provenance_provider, provenance_version, observed_at
+                   is_stub, confidence, provenance_provider, provenance_version, observed_at
             FROM symbols_live WHERE {" AND ".join(clauses)} ORDER BY id ASC
             """,
             params,
@@ -188,7 +194,7 @@ class SymbolStore:
         rows = self._conn.execute(
             """
             SELECT id, path, qualname, kind, start_line, start_col, end_line, end_col,
-                   confidence, provenance_provider, provenance_version, observed_at
+                   is_stub, confidence, provenance_provider, provenance_version, observed_at
             FROM symbols_live WHERE qualname = ? AND kind = ?
             """,
             (qualname, kind),
@@ -203,7 +209,7 @@ class SymbolStore:
         row = self._conn.execute(
             """
             SELECT id, path, qualname, kind, start_line, start_col, end_line, end_col,
-                   confidence, provenance_provider, provenance_version, observed_at
+                   is_stub, confidence, provenance_provider, provenance_version, observed_at
             FROM symbols_live WHERE path = ? AND start_line = ? AND start_col = ?
             """,
             (path, line, col),
@@ -217,7 +223,7 @@ class SymbolStore:
         row = self._conn.execute(
             """
             SELECT id, path, qualname, kind, start_line, start_col, end_line, end_col,
-                   confidence, provenance_provider, provenance_version, observed_at
+                   is_stub, confidence, provenance_provider, provenance_version, observed_at
             FROM symbols_live
             WHERE path = ?
               AND (start_line, start_col) <= (?, ?)
@@ -245,7 +251,7 @@ class SymbolStore:
         row = self._conn.execute(
             """
             SELECT id, path, qualname, kind, start_line, start_col, end_line, end_col,
-                   confidence, provenance_provider, provenance_version, observed_at
+                   is_stub, confidence, provenance_provider, provenance_version, observed_at
             FROM symbols_live WHERE id = ?
             """,
             (symbol_id,),
@@ -275,6 +281,7 @@ def _content_differs(a: Symbol, b: Symbol) -> bool:
         or a.start_col != b.start_col
         or a.end_line != b.end_line
         or a.end_col != b.end_col
+        or a.is_stub != b.is_stub
         or a.confidence != b.confidence
         or a.provenance.provider != b.provenance.provider
         or a.provenance.version != b.provenance.version
@@ -291,6 +298,7 @@ def _row_to_symbol(row: tuple) -> Symbol:
         start_col,
         end_line,
         end_col,
+        is_stub,
         confidence,
         provenance_provider,
         provenance_version,
@@ -305,6 +313,7 @@ def _row_to_symbol(row: tuple) -> Symbol:
         start_col=start_col,
         end_line=end_line,
         end_col=end_col,
+        is_stub=bool(is_stub),
         confidence=Confidence(confidence),
         provenance=Provenance(
             provider=provenance_provider, version=provenance_version, observed_at=observed_at

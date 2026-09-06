@@ -21,11 +21,14 @@ def apply_enrichment_write(
     relation_store: RelationStore,
     relation: Relation,
     current_pass_targets: frozenset[str] | None = None,
+    *,
+    preserve_siblings: bool = False,
 ) -> MergeOutcome:
     """Apply an enrichment relation without regressing a more-certain fact.
 
     An incoming AMBIGUOUS relation adds a candidate and, without a
     pass-scoped target set, must not retire its same-site ambiguous siblings.
+    Additive union producers can also preserve all existing siblings.
     """
     existing = relation_store.get(
         source=relation.source,
@@ -47,7 +50,11 @@ def apply_enrichment_write(
         return MergeOutcome(applied=False, retired_siblings=0, reason="would_regress_existing_confidence")
 
     relation_store.upsert(relation)
-    retired_siblings = _retire_stale_siblings(relation_store, relation, current_pass_targets)
+    retired_siblings = (
+        0
+        if preserve_siblings
+        else _retire_stale_siblings(relation_store, relation, current_pass_targets)
+    )
     return MergeOutcome(applied=True, retired_siblings=retired_siblings)
 
 

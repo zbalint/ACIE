@@ -30,6 +30,15 @@ def test_upsert_then_get_round_trips_symbol():
     assert store.get(symbol.id) == symbol
 
 
+def test_upsert_and_history_round_trip_stub_classification():
+    store = SymbolStore(":memory:")
+    symbol = make_symbol(is_stub=True)
+
+    store.upsert(symbol)
+
+    assert store.get(symbol.id) == symbol
+    assert store.history(symbol.id) == [symbol]
+
 def test_conn_kwarg_reuses_an_already_open_connection_instead_of_opening_its_own():
     import sqlite3
 

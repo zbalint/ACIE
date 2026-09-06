@@ -1,9 +1,10 @@
 """One bounded, opportunistic pyright enrichment pass for D3.
 
 This module deliberately owns neither daemon triggering (D6) nor relation merge
-policy (D4). It rechecks only unresolved or AMBIGUOUS calls/inherits sites,
-then submits LSP definitions and H2 composition inferences through the existing
-WriteQueue.
+policy (D4). It rechecks unresolved or AMBIGUOUS calls/inherits sites and
+submits LSP definitions and H2 composition inferences through the existing
+WriteQueue. Its Protocol/ABC stub pass is a separate graph-only step that
+does not use the LSP.
 """
 
 import logging
@@ -25,6 +26,7 @@ from acie.storage.symbol_store import SymbolStore
 
 _logger = logging.getLogger(__name__)
 _REQUEST_TIMEOUT_SECONDS = 30.0
+_PROTOCOL_STUB_RESOLUTION_VERSION = "1"
 
 
 @dataclass(frozen=True, order=True)
@@ -56,11 +58,26 @@ def run_enrichment_pass(
     relation_store: RelationStore,
     observed_at_fn: Callable[[], str] = lambda: datetime.now(timezone.utc).isoformat(),
 ) -> list[Relation]:
-    """Enrich current unresolved calls/inherits from one fresh LSP conversation."""
+    """Enrich unresolved calls/inherits and Protocol/ABC stub calls."""
+    files = list(walk_repo(repo_root))
+    source_by_path = dict(files)
+    h3_resolved = _resolve_protocol_stub_calls(
+        files, symbol_store, relation_store, observed_at_fn()
+    )
+    submitted = [
+        write_queue.submit(repo_id, _make_merge_job(relation, preserve_siblings=True))
+        for relation in h3_resolved
+    ]
+
+    def wait_for_submissions() -> None:
+        if submitted:
+            submitted[-1].result()
+
     process = process_registry.ensure_process(repo_root)
     if process is None:
         _logger.warning("Skipping LSP enrichment for %r: no pyright process", repo_root)
-        return []
+        wait_for_submissions()
+        return h3_resolved
 
     client = LspClient(process)
     try:
@@ -68,20 +85,19 @@ def run_enrichment_pass(
             initialize_result = client.initialize(repo_root)
         except (LspError, TimeoutError, ConnectionError):
             _logger.warning("Skipping LSP enrichment for %r: initialization failed", repo_root, exc_info=True)
-            return []
+            wait_for_submissions()
+            return h3_resolved
         if not (client.server_capabilities or {}).get("definitionProvider"):
             _logger.warning("Skipping LSP enrichment for %r: definitionProvider is unavailable", repo_root)
-            return []
+            wait_for_submissions()
+            return h3_resolved
 
         server_info = initialize_result.get("serverInfo", {})
         provider = server_info.get("name", "basedpyright") if isinstance(server_info, dict) else "basedpyright"
         version = server_info.get("version", "unknown") if isinstance(server_info, dict) else "unknown"
-        files = list(walk_repo(repo_root))
-        source_by_path = dict(files)
         sites = _worklist(files, symbol_store, relation_store, observed_at_fn())
         opened_uris: set[str] = set()
-        submitted = []
-        resolved: list[Relation] = []
+        resolved: list[Relation] = list(h3_resolved)
 
         for site in sites:
             if isinstance(site, _MixinSite):
@@ -142,11 +158,19 @@ def run_enrichment_pass(
             submitted.append(write_queue.submit(repo_id, _make_merge_job(relation)))
             resolved.append(relation)
 
-        if submitted:
-            submitted[-1].result()
+        wait_for_submissions()
         return resolved
     finally:
         client.close()
+
+
+
+def _is_protocol_stub_relation(relation: Relation) -> bool:
+    return (
+        relation.predicate == "calls"
+        and relation.provenance.provider == "acie"
+        and relation.provenance.version == _PROTOCOL_STUB_RESOLUTION_VERSION
+    )
 
 
 def _worklist(
@@ -156,7 +180,7 @@ def _worklist(
     mixin_sites: set[_MixinSite] = set()
     for path, source_text in files:
         for relation in relation_store.list_by_site_file(path, predicates={"calls", "inherits"}):
-            if relation.confidence == Confidence.AMBIGUOUS:
+            if relation.confidence == Confidence.AMBIGUOUS and not _is_protocol_stub_relation(relation):
                 sites.add(_Site(relation.source, relation.site_file, relation.site_line, relation.site_col, relation.predicate))
         (
             extracted_relations,
@@ -213,6 +237,105 @@ def _worklist(
         if (site.source, site.site_file, site.site_line, site.site_col) not in mixin_site_keys
     }
     return sorted(sites) + sorted(mixin_sites, key=lambda site: (site.site_file, site.site_line, site.site_col, site.source))
+
+
+def _resolve_protocol_stub_calls(
+    files: list[tuple[str, str]],
+    symbol_store: SymbolStore,
+    relation_store: RelationStore,
+    observed_at: str,
+) -> list[Relation]:
+    """Add inferred calls to concrete implementers of stub call targets."""
+    calls: dict[tuple[str, str, str, int, int], Relation] = {}
+    for path, _ in files:
+        for relation in relation_store.list_by_site_file(path, predicates={"calls"}):
+            key = (
+                relation.source,
+                relation.target,
+                relation.site_file,
+                relation.site_line,
+                relation.site_col,
+            )
+            calls[key] = relation
+
+    provenance = Provenance(
+        provider="acie",
+        version=_PROTOCOL_STUB_RESOLUTION_VERSION,
+        observed_at=observed_at,
+    )
+    resolved: list[Relation] = []
+    for call in sorted(
+        calls.values(),
+        key=lambda relation: (
+            relation.source,
+            relation.site_file,
+            relation.site_line,
+            relation.site_col,
+            relation.target,
+        ),
+    ):
+        stub = symbol_store.get(call.target)
+        if stub is None or not stub.is_stub or "." not in stub.qualname:
+            continue
+        method_name = stub.qualname.rsplit(".", 1)[1]
+        candidates: dict[str, Symbol] = {}
+        for declaring_class in _declaring_classes_for_stub(stub, relation_store, symbol_store):
+            for inheritance in relation_store.list_by_target(
+                declaring_class.id, predicates={"inherits"}
+            ):
+                if inheritance.source == declaring_class.id:
+                    continue
+                implementer = symbol_store.get(inheritance.source)
+                if implementer is None or implementer.kind != "class":
+                    continue
+                for method in symbol_store.find_by_qualname_and_kind(
+                    qualname=f"{implementer.qualname}.{method_name}",
+                    kind="method",
+                ):
+                    if method.path == implementer.path and not method.is_stub:
+                        candidates[method.id] = method
+        if not candidates:
+            continue
+        confidence = Confidence.INFERRED if len(candidates) == 1 else Confidence.AMBIGUOUS
+        for candidate in sorted(candidates.values(), key=lambda method: method.id):
+            resolved.append(
+                Relation(
+                    source=call.source,
+                    target=candidate.id,
+                    predicate="calls",
+                    site_file=call.site_file,
+                    site_line=call.site_line,
+                    site_col=call.site_col,
+                    confidence=confidence,
+                    provenance=provenance,
+                )
+            )
+    return resolved
+
+
+def _declaring_classes_for_stub(
+    stub: Symbol, relation_store: RelationStore, symbol_store: SymbolStore
+) -> list[Symbol]:
+    classes: dict[str, Symbol] = {}
+    for definition in relation_store.list_by_target(stub.id, predicates={"defines"}):
+        declaring_class = symbol_store.get(definition.source)
+        if (
+            declaring_class is not None
+            and declaring_class.kind == "class"
+            and declaring_class.path == stub.path
+        ):
+            classes[declaring_class.id] = declaring_class
+    if classes:
+        return [classes[class_id] for class_id in sorted(classes)]
+
+    class_qualname = stub.qualname.rsplit(".", 1)[0]
+    return [
+        declaring_class
+        for declaring_class in symbol_store.find_by_qualname_and_kind(
+            qualname=class_qualname, kind="class"
+        )
+        if declaring_class.path == stub.path
+    ]
 
 
 def _composition_method_candidates(
@@ -275,12 +398,15 @@ def _relative_path_from_uri(uri: str, repo_root: str) -> str | None:
 def _make_merge_job(
     relation: Relation,
     current_pass_targets: frozenset[str] | None = None,
+    *,
+    preserve_siblings: bool = False,
 ):
     def job(conn) -> merge_policy.MergeOutcome:
         return merge_policy.apply_enrichment_write(
             RelationStore(conn=conn),
             relation,
             current_pass_targets=current_pass_targets,
+            preserve_siblings=preserve_siblings,
         )
 
     return job

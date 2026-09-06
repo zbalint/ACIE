@@ -1,3 +1,4 @@
+import sqlite3
 from concurrent.futures import Future
 from pathlib import Path
 
@@ -32,6 +33,23 @@ class FakeWriteQueue:
         self.submissions.append((repo_id, job, future))
         future.set_result(None)
         return future
+
+class ImmediateWriteQueue:
+    def __init__(self, conn):
+        self._conn = conn
+        self.submissions = []
+
+    def submit(self, repo_id, job):
+        future = Future()
+        self.submissions.append((repo_id, job, future))
+        try:
+            future.set_result(job(self._conn))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    def close(self, timeout=None):
+        return None
 
 
 class FakeClient:
@@ -77,13 +95,22 @@ def _symbol(symbol_id, path, *, start_line=1, start_col=0, end_line=20, end_col=
     )
 
 
-def _run(monkeypatch, tmp_path, client, symbol_store, relation_store, files, write_queue=None):
+def _run(
+    monkeypatch,
+    tmp_path,
+    client,
+    symbol_store,
+    relation_store,
+    files,
+    write_queue=None,
+    process=object(),
+):
     monkeypatch.setattr(lsp_enrichment, "LspClient", lambda process: client)
     queue = write_queue if write_queue is not None else FakeWriteQueue()
     relations = lsp_enrichment.run_enrichment_pass(
         repo_root=str(tmp_path),
         repo_id="repo-id",
-        process_registry=FakeRegistry(),
+        process_registry=FakeRegistry(process),
         write_queue=queue,
         walk_repo=lambda root: files,
         symbol_store=symbol_store,
@@ -792,3 +819,245 @@ def test_enrichment_keeps_multi_level_mixin_composition_silent_no_match(
     assert relations.list_by_site_file("pkg/mixin.py", predicates={"calls"}) == []
     assert queue.submissions == []
     assert client.requests == []
+
+
+@pytest.mark.parametrize(
+    "stub_confidence",
+    [Confidence.EXTRACTED, Confidence.INFERRED, Confidence.AMBIGUOUS],
+)
+def test_enrichment_unions_a_concrete_protocol_implementation_with_the_stub_target(
+    monkeypatch, tmp_path, stub_confidence
+):
+    db_path = str(tmp_path / "index.sqlite")
+    symbols = SymbolStore(db_path)
+    relations = RelationStore(db_path)
+    index_meta = IndexMetaStore(db_path)
+    files = [
+        (
+            "typing.py",
+            "class Protocol:\n"
+            "    pass\n",
+        ),
+        (
+            "pkg/protocol.py",
+            "from typing import Protocol\n\n\n"
+            "class Contract(Protocol):\n"
+            "    def provided(self): ...\n",
+        ),
+        (
+            "pkg/mixin.py",
+            "from pkg.protocol import Contract\n\n\n"
+            "class Mixin(Contract):\n"
+            "    def caller(self):\n"
+            "        self.provided()\n",
+        ),
+        (
+            "pkg/implementation.py",
+            "from pkg.protocol import Contract\n\n\n"
+            "class Implementation(Contract):\n"
+            "    def provided(self):\n"
+            "        return 1\n",
+        ),
+        (
+            "pkg/duck_decoy.py",
+            "class DuckDecoy:\n"
+            "    def provided(self):\n"
+            "        return 2\n",
+        ),
+    ]
+    for path, source in files:
+        index_file(
+            path=path,
+            source_text=source,
+            observed_at="2026-09-06T00:00:00Z",
+            symbol_store=symbols,
+            relation_store=relations,
+            index_meta_store=index_meta,
+        )
+
+    stub_call = relations.list_by_site_file("pkg/mixin.py", predicates={"calls"})[0]
+    relations.upsert(
+        Relation(
+            source=stub_call.source,
+            target=stub_call.target,
+            predicate=stub_call.predicate,
+            site_file=stub_call.site_file,
+            site_line=stub_call.site_line,
+            site_col=stub_call.site_col,
+            confidence=stub_confidence,
+            provenance=stub_call.provenance,
+        )
+    )
+
+    write_queue = WriteQueue(lambda _repo_id: db_path)
+    try:
+        client = FakeClient([])
+        resolved, _ = _run(
+            monkeypatch,
+            tmp_path,
+            client,
+            symbols,
+            relations,
+            files,
+            write_queue=write_queue,
+            process=None,
+        )
+
+        assert [(relation.target, relation.confidence) for relation in resolved] == [
+            ("pkg/implementation.py:Implementation.provided#method", Confidence.INFERRED)
+        ]
+        live_calls = relations.list_by_site_file("pkg/mixin.py", predicates={"calls"})
+        assert {relation.target for relation in live_calls} == {
+            "pkg/protocol.py:Contract.provided#method",
+            "pkg/implementation.py:Implementation.provided#method",
+        }
+        assert {
+            relation.target: relation.confidence for relation in live_calls
+        } == {
+            "pkg/protocol.py:Contract.provided#method": stub_confidence,
+            "pkg/implementation.py:Implementation.provided#method": Confidence.INFERRED,
+        }
+        assert client.requests == []
+        assert client.notifications == []
+        assert client.closed is False
+    finally:
+        write_queue.close(timeout=5)
+
+
+def test_enrichment_marks_abstract_implementations_ambiguous_and_excludes_non_stubs(
+    monkeypatch, tmp_path
+):
+    conn = sqlite3.connect(":memory:")
+    symbols = SymbolStore(conn=conn)
+    relations = RelationStore(conn=conn)
+    index_meta = IndexMetaStore(conn=conn)
+    files = [
+        (
+            "abc.py",
+            "class ABC:\n"
+            "    pass\n",
+        ),
+        (
+            "pkg/abstract.py",
+            "from abc import ABC, abstractmethod\n\n\n"
+            "class Abstract(ABC):\n"
+            "    @abstractmethod\n"
+            "    def provided(self):\n"
+            "        pass\n\n\n"
+            "class ConcreteA(Abstract):\n"
+            "    def provided(self):\n"
+            "        return 1\n\n\n"
+            "class ConcreteB(Abstract):\n"
+            "    def provided(self):\n"
+            "        return 2\n\n\n"
+            "class StubConcrete(Abstract):\n"
+            "    @abstractmethod\n"
+            "    def provided(self):\n"
+            "        pass\n",
+        ),
+        (
+            "pkg/abstract_caller.py",
+            "from pkg.abstract import Abstract\n\n\n"
+            "class Caller(Abstract):\n"
+            "    def caller(self):\n"
+            "        self.provided()\n",
+        ),
+        (
+            "pkg/ordinary.py",
+            "class Ordinary:\n"
+            "    def provided(self):\n"
+            "        pass\n\n\n"
+            "class ConcreteOrdinary(Ordinary):\n"
+            "    def provided(self):\n"
+            "        return 1\n\n\n"
+            "class OrdinaryCaller(Ordinary):\n"
+            "    def caller(self):\n"
+            "        self.provided()\n",
+        ),
+    ]
+    for path, source in files:
+        index_file(
+            path=path,
+            source_text=source,
+            observed_at="2026-09-06T00:00:00Z",
+            symbol_store=symbols,
+            relation_store=relations,
+            index_meta_store=index_meta,
+        )
+
+    assert symbols.get("pkg/abstract.py:StubConcrete.provided#method").is_stub is True
+
+    write_queue = ImmediateWriteQueue(conn)
+    try:
+        client = FakeClient([])
+        resolved, _ = _run(
+            monkeypatch,
+            tmp_path,
+            client,
+            symbols,
+            relations,
+            files,
+            write_queue=write_queue,
+        )
+
+        assert {
+            relation.target for relation in resolved if relation.site_file == "pkg/abstract_caller.py"
+        } == {
+            "pkg/abstract.py:ConcreteA.provided#method",
+            "pkg/abstract.py:ConcreteB.provided#method",
+        }
+        assert {
+            relation.confidence
+            for relation in resolved
+            if relation.site_file == "pkg/abstract_caller.py"
+        } == {Confidence.AMBIGUOUS}
+        abstract_calls = relations.list_by_site_file(
+            "pkg/abstract_caller.py", predicates={"calls"}
+        )
+        assert {relation.target for relation in abstract_calls} == {
+            "pkg/abstract.py:Abstract.provided#method",
+            "pkg/abstract.py:ConcreteA.provided#method",
+            "pkg/abstract.py:ConcreteB.provided#method",
+        }
+        assert {
+            relation.target: relation.confidence for relation in abstract_calls
+        } == {
+            "pkg/abstract.py:Abstract.provided#method": Confidence.EXTRACTED,
+            "pkg/abstract.py:ConcreteA.provided#method": Confidence.AMBIGUOUS,
+            "pkg/abstract.py:ConcreteB.provided#method": Confidence.AMBIGUOUS,
+        }
+        ordinary_calls = relations.list_by_site_file("pkg/ordinary.py", predicates={"calls"})
+        assert {relation.target for relation in ordinary_calls} == {
+            "pkg/ordinary.py:Ordinary.provided#method"
+        }
+        assert all(
+            relation.target != "pkg/ordinary.py:ConcreteOrdinary.provided#method"
+            for relation in ordinary_calls
+        )
+        assert all(
+            relation.target != "pkg/abstract.py:StubConcrete.provided#method"
+            for relation in abstract_calls
+        )
+        assert client.requests == []
+        assert client.notifications == []
+        second_client = FakeClient([])
+        second_resolved, _ = _run(
+            monkeypatch,
+            tmp_path,
+            second_client,
+            symbols,
+            relations,
+            files,
+            write_queue=write_queue,
+        )
+        assert {
+            (relation.target, relation.confidence)
+            for relation in second_resolved
+            if relation.site_file == "pkg/abstract_caller.py"
+        } == {
+            ("pkg/abstract.py:ConcreteA.provided#method", Confidence.AMBIGUOUS),
+            ("pkg/abstract.py:ConcreteB.provided#method", Confidence.AMBIGUOUS),
+        }
+        assert second_client.requests == []
+    finally:
+        write_queue.close(timeout=5)

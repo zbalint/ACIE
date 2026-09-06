@@ -116,3 +116,63 @@ def test_has_syntax_error_is_false_for_valid_source():
 
 def test_has_syntax_error_is_true_for_an_unterminated_def():
     assert has_syntax_error("def foo(\n") is True
+
+def test_marks_only_protocol_or_abstractmethod_stub_methods():
+    source = (
+        "from abc import ABC, ABCMeta, abstractmethod\n"
+        "from typing import Protocol\n\n"
+        "class Contract(Protocol):\n"
+        "    def ellipsis(self): ...\n"
+        "    def no_op(self):\n"
+        "        pass\n"
+        "    def documented(self):\n"
+        "        \"\"\"docs\"\"\"\n"
+        "    def implemented(self):\n"
+        "        return 1\n"
+        "    def mixed(self):\n"
+        "        pass\n"
+        "        return 1\n\n"
+        "class GenericContract(Protocol[T]):\n"
+        "    def generic(self): ...\n\n"
+        "class Abstract(ABC):\n"
+        "    @abstractmethod\n"
+        "    def abstract_ellipsis(self): ...\n"
+        "    @abstractmethod()\n"
+        "    def abstract_pass(self):\n"
+        "        pass\n"
+        "    @abstractmethod\n"
+        "    def abstract_docs(self):\n"
+        "        \"\"\"docs\"\"\"\n"
+        "    @abstractmethod\n"
+        "    def abstract_implemented(self):\n"
+        "        return 1\n\n"
+        "class MetaAbstract(metaclass=ABCMeta):\n"
+        "    @abstractmethod\n"
+        "    def meta(self):\n"
+        "        pass\n\n"
+        "class Ordinary:\n"
+        "    def no_op(self):\n"
+        "        pass\n"
+        "    @abstractmethod\n"
+        "    def decorated_no_op(self):\n"
+        "        pass\n"
+    )
+
+    symbols = extract_symbols(path="pkg/mod.py", source_text=source, observed_at="2026-09-06T00:00:00Z")
+
+    methods = {symbol.qualname: symbol for symbol in symbols if symbol.kind == "method"}
+    assert {name for name, symbol in methods.items() if symbol.is_stub} == {
+        "Contract.ellipsis",
+        "Contract.no_op",
+        "Contract.documented",
+        "Abstract.abstract_ellipsis",
+        "Abstract.abstract_pass",
+        "Abstract.abstract_docs",
+        "GenericContract.generic",
+        "MetaAbstract.meta",
+    }
+    assert all(
+        not symbol.is_stub
+        for name, symbol in methods.items()
+        if name in {"Contract.implemented", "Contract.mixed", "Abstract.abstract_implemented", "Ordinary.no_op", "Ordinary.decorated_no_op"}
+    )
