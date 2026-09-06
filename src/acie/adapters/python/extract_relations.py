@@ -388,8 +388,40 @@ def _class_position_key(value) -> str:
     return f"{line}:{col}"
 
 
+def _terminal_name(node) -> str | None:
+    """Mirrors extract_symbols._terminal_name (kept local rather than
+    imported across the module boundary, same as this file's other small
+    tree-walking helpers like _unwrap_decorated): resolves a base-class node
+    to the single name that matters for same-file/import-alias lookups --
+    an identifier as-is, a qualified `module.Base` (attribute) down to just
+    `Base`, and a generic `Base[T]` (subscript) down to just `Base`. Any
+    other node shape (e.g. a `metaclass=M` keyword_argument) has no such
+    name and returns None.
+    """
+    if node.type == "identifier":
+        return node.text.decode("utf-8")
+    if node.type == "attribute":
+        attribute = node.child_by_field_name("attribute")
+        return attribute.text.decode("utf-8") if attribute is not None else None
+    if node.type == "subscript":
+        value = node.child_by_field_name("value")
+        return _terminal_name(value) if value is not None else None
+    return None
+
+
 def _top_level_base_names(root) -> dict[str, list[str]]:
-    """Top-level class-definition start position -> direct identifier bases."""
+    """Top-level class-definition start position -> resolvable base names.
+
+    A qualified (`module.Base`) or generic (`Base[T]`) base resolves via
+    _terminal_name to the same name a same-file identifier base would --
+    previously these two shapes were silently dropped (identifier-only
+    filter), producing zero `inherits`/`overrides`/self-call-base edge for
+    them even when the name was otherwise perfectly resolvable. Filtering
+    on `_terminal_name(base) is not None` here MUST stay in lockstep with
+    _inherits_relations's own `base_nodes` filter below (same predicate,
+    same child sequence) -- that function zips this list against the raw
+    nodes by position, so the two lists must have identical length/order.
+    """
     base_names: dict[str, list[str]] = {}
     for child in root.named_children:
         if child.type != "class_definition":
@@ -398,9 +430,9 @@ def _top_level_base_names(root) -> dict[str, list[str]]:
         if superclasses is None:
             continue
         base_names[_class_position_key(child)] = [
-            base.text.decode("utf-8")
+            name
             for base in superclasses.named_children
-            if base.type == "identifier"
+            if (name := _terminal_name(base)) is not None
         ]
     return base_names
 
@@ -430,17 +462,20 @@ def _inherits_relations(
 ) -> tuple[list[Relation], list[DeferredImportInherit]]:
     """Top-level `class Foo(Base): ...` only (this slice's narrow first cut,
     matching extract_symbols's own top-level-only scope) -- decorated
-    classes, keyword base-class args like `metaclass=M` (correctly skipped,
-    not an identifier), and multi-level nesting are out of scope here.
+    classes and multi-level nesting are out of scope here. A qualified
+    (`class Foo(module.Base):`) or generic (`class Foo(Base[T]):`) base
+    resolves via _terminal_name the same as a plain identifier base;
+    keyword base-class args like `metaclass=M` (correctly skipped, no
+    resolvable name) remain the one base shape with no edge.
 
-    A base identifier that matches neither a same-file class nor
-    import_alias_map is a genuinely undefined/unresolvable name and produces
-    no edge at all -- unchanged from before this slice. One that resolves to
-    no same-file class but *is* a `from`-imported name produces a
-    DeferredImportInherit instead (slice A2), mirroring how
-    _call_and_reference_relations defers a bare call to an imported name:
-    indexer.py resolves it against the repo-wide symbol index, which this
-    pure, single-file function has no access to.
+    A base name that matches neither a same-file class nor import_alias_map
+    is a genuinely undefined/unresolvable name and produces no edge at all
+    -- unchanged from before this slice. One that resolves to no same-file
+    class but *is* a `from`-imported name produces a DeferredImportInherit
+    instead (slice A2), mirroring how _call_and_reference_relations defers a
+    bare call to an imported name: indexer.py resolves it against the
+    repo-wide symbol index, which this pure, single-file function has no
+    access to.
     """
     by_position = _symbol_by_position(symbols)
     class_candidates_by_name = {
@@ -457,7 +492,11 @@ def _inherits_relations(
         superclasses = child.child_by_field_name("superclasses")
         if source_symbol is None or superclasses is None:
             continue
-        base_nodes = [base for base in superclasses.named_children if base.type == "identifier"]
+        # Must apply the identical predicate _top_level_base_names uses, in
+        # the same child order, so this zips correctly against base_names.
+        base_nodes = [
+            base for base in superclasses.named_children if _terminal_name(base) is not None
+        ]
         base_names = top_level_base_names.get(_class_position_key(child), [])
         for base_name, base in zip(base_names, base_nodes):
             candidates = class_candidates_by_name.get(base_name, [])

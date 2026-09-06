@@ -302,6 +302,37 @@ def test_class_inherits_from_a_name_not_defined_in_this_file():
     assert inherits == []
 
 
+def test_class_inherits_from_a_qualified_base_name_matching_a_same_file_class():
+    # Previously: extract_relations only ever considered `identifier` base
+    # nodes -- a qualified base (`class Foo(mod.Base):`, tree-sitter
+    # `attribute` node) was silently skipped entirely, producing zero edge
+    # at all even when `Base` unambiguously matches a same-file class.
+    source = "import somewhere\n\n\nclass Base:\n    pass\n\n\nclass Foo(somewhere.Base):\n    pass\n"
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    inherits = [r for r in relations if r.predicate == "inherits"]
+    assert len(inherits) == 1
+    assert inherits[0].source == "pkg/mod.py:Foo#class"
+    assert inherits[0].target == "pkg/mod.py:Base#class"
+    assert inherits[0].confidence == Confidence.EXTRACTED
+
+
+def test_class_inherits_from_a_generic_subscripted_base_name_matching_a_same_file_class():
+    # Previously: a generic base (`class Foo(Base[int]):`, tree-sitter
+    # `subscript` node) was likewise silently skipped -- no edge at all,
+    # even though `Base` unambiguously matches a same-file class.
+    source = "class Base:\n    pass\n\n\nclass Foo(Base[int]):\n    pass\n"
+
+    relations = extract_relations(path="pkg/mod.py", source_text=source, observed_at="2026-08-31T00:00:00Z")
+
+    inherits = [r for r in relations if r.predicate == "inherits"]
+    assert len(inherits) == 1
+    assert inherits[0].source == "pkg/mod.py:Foo#class"
+    assert inherits[0].target == "pkg/mod.py:Base#class"
+    assert inherits[0].confidence == Confidence.EXTRACTED
+
+
 def test_class_inheriting_from_a_name_imported_from_another_module_is_deferred_not_dropped():
     # Mirrors test_call_to_a_name_imported_from_another_module_is_deferred_not_dropped:
     # extract_relations is single-file-scoped and cannot itself resolve a
