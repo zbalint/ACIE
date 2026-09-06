@@ -176,3 +176,80 @@ def test_marks_only_protocol_or_abstractmethod_stub_methods():
         for name, symbol in methods.items()
         if name in {"Contract.implemented", "Contract.mixed", "Abstract.abstract_implemented", "Ordinary.no_op", "Ordinary.decorated_no_op"}
     )
+
+
+def test_marks_stub_method_in_protocol_with_an_aliased_base():
+    source = (
+        "from typing import Protocol as P\n\n"
+        "class Contract(P):\n"
+        "    def bar(self) -> int: ...\n"
+    )
+
+    symbols = extract_symbols(path="pkg/mod.py", source_text=source, observed_at="2026-09-06T00:00:00Z")
+
+    methods = {symbol.qualname: symbol for symbol in symbols if symbol.kind == "method"}
+    assert methods["Contract.bar"].is_stub is True
+
+
+def test_marks_aliased_abstractmethod_stub_in_an_abc():
+    source = (
+        "from abc import ABC, abstractmethod as am\n\n"
+        "class Base(ABC):\n"
+        "    @am\n"
+        "    def bar(self) -> int: ...\n"
+    )
+
+    symbols = extract_symbols(path="pkg/mod.py", source_text=source, observed_at="2026-09-06T00:00:00Z")
+
+    methods = {symbol.qualname: symbol for symbol in symbols if symbol.kind == "method"}
+    assert methods["Base.bar"].is_stub is True
+
+
+def test_marks_abstractmethod_stub_for_an_aliased_abc_meta():
+    source = (
+        "from abc import ABCMeta as Meta, abstractmethod\n\n"
+        "class Base(metaclass=Meta):\n"
+        "    @abstractmethod\n"
+        "    def bar(self) -> int: ...\n"
+    )
+
+    symbols = extract_symbols(path="pkg/mod.py", source_text=source, observed_at="2026-09-06T00:00:00Z")
+
+    methods = {symbol.qualname: symbol for symbol in symbols if symbol.kind == "method"}
+    assert methods["Base.bar"].is_stub is True
+
+
+def test_does_not_treat_a_protocol_alias_as_an_abstractmethod_decorator():
+    source = (
+        "from typing import Protocol as P\n\n"
+        "class Ordinary:\n"
+        "    @P\n"
+        "    def bar(self) -> int: ...\n"
+    )
+
+    symbols = extract_symbols(path="pkg/mod.py", source_text=source, observed_at="2026-09-06T00:00:00Z")
+
+    methods = {symbol.qualname: symbol for symbol in symbols if symbol.kind == "method"}
+    assert methods["Ordinary.bar"].is_stub is False
+
+
+def test_does_not_treat_local_bindings_that_shadow_aliases_as_stub_contexts():
+    source = (
+        "from typing import Protocol as P\n"
+        "from abc import ABC, abstractmethod as am\n\n"
+        "class P:\n"
+        "    pass\n\n"
+        "def am(function):\n"
+        "    return function\n\n"
+        "class Child(P):\n"
+        "    def child(self) -> int: ...\n\n"
+        "class Base(ABC):\n"
+        "    @am\n"
+        "    def base(self) -> int: ...\n"
+    )
+
+    symbols = extract_symbols(path="pkg/mod.py", source_text=source, observed_at="2026-09-06T00:00:00Z")
+
+    methods = {symbol.qualname: symbol for symbol in symbols if symbol.kind == "method"}
+    assert methods["Child.child"].is_stub is False
+    assert methods["Base.base"].is_stub is False

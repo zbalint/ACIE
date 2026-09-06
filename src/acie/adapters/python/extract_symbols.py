@@ -36,7 +36,8 @@ def extract_symbols(path: str, source_text: str, observed_at: str) -> list[Symbo
     module_symbol = _build_symbol(root, path=path, qualname="", kind="module", provenance=provenance)
     symbols = [module_symbol]
     seen_counts: dict[tuple[str, str], int] = {}
-    class_contexts = _class_contexts(root)
+    import_aliases = _local_import_aliases(root)
+    class_contexts = _class_contexts(root, import_aliases)
 
     def add(node, qualname: str, kind: str, *, is_stub: bool = False) -> None:
         key = (qualname, kind)
@@ -79,13 +80,48 @@ def extract_symbols(path: str, source_text: str, observed_at: str) -> list[Symbo
                             decorated_node=member,
                             protocol_context=protocol_context,
                             abc_context=abc_context,
+                            import_aliases=import_aliases,
                         ),
                     )
 
     return symbols
 
 
-def _class_contexts(root) -> dict[tuple[int, int], tuple[bool, bool]]:
+def _local_import_aliases(root) -> dict[str, str]:
+    """Collect file-level aliases from from-imports.
+
+    A later module-level class or function definition shadows an alias with
+    the same bound name, matching Python's sequential name binding.
+    """
+    aliases: dict[str, str] = {}
+    definition_types = {"class_definition", "function_definition"}
+
+    def walk(node, *, module_scope: bool) -> None:
+        if node.type == "import_from_statement":
+            for name_node in node.children_by_field_name("name"):
+                if name_node.type != "aliased_import":
+                    continue
+                imported = name_node.child_by_field_name("name")
+                alias = name_node.child_by_field_name("alias")
+                if imported is not None and imported.type == "dotted_name" and alias is not None:
+                    aliases[alias.text.decode("utf-8")] = imported.text.decode("utf-8")
+        elif module_scope and node.type in definition_types:
+            name = node.child_by_field_name("name")
+            if name is not None:
+                aliases.pop(name.text.decode("utf-8"), None)
+        for child in node.named_children:
+            walk(
+                child,
+                module_scope=module_scope and node.type not in definition_types,
+            )
+
+    walk(root, module_scope=True)
+    return aliases
+
+
+def _class_contexts(
+    root, import_aliases: dict[str, str]
+) -> dict[tuple[int, int], tuple[bool, bool]]:
     class_nodes = [
         _unwrap_decorated(child)
         for child in root.named_children
@@ -93,8 +129,8 @@ def _class_contexts(root) -> dict[tuple[int, int], tuple[bool, bool]]:
     ]
     contexts = {
         (node.start_point.row, node.start_point.column): (
-            "Protocol" in _base_names(node),
-            "ABC" in _base_names(node) or _has_abc_meta(node),
+            "Protocol" in _base_names(node, import_aliases),
+            "ABC" in _base_names(node, import_aliases) or _has_abc_meta(node, import_aliases),
         )
         for node in class_nodes
     }
@@ -114,7 +150,7 @@ def _class_contexts(root) -> dict[tuple[int, int], tuple[bool, bool]]:
         for node in class_nodes:
             key = (node.start_point.row, node.start_point.column)
             protocol_context, abc_context = contexts[key]
-            base_names = _base_names(node)
+            base_names = _base_names(node, import_aliases)
             updated = (
                 protocol_context or bool(protocol_classes.intersection(base_names)),
                 abc_context or bool(abc_classes.intersection(base_names)),
@@ -128,7 +164,7 @@ def _class_contexts(root) -> dict[tuple[int, int], tuple[bool, bool]]:
     return contexts
 
 
-def _base_names(class_node) -> set[str]:
+def _base_names(class_node, import_aliases: dict[str, str]) -> set[str]:
     superclasses = class_node.child_by_field_name("superclasses")
     if superclasses is None:
         return set()
@@ -138,6 +174,9 @@ def _base_names(class_node) -> set[str]:
             continue
         name = _terminal_name(base)
         if name is not None:
+            resolved_name = import_aliases.get(name)
+            if resolved_name in ("Protocol", "ABC"):
+                name = resolved_name
             names.add(name)
     return names
 
@@ -154,7 +193,7 @@ def _terminal_name(node) -> str | None:
     return None
 
 
-def _has_abc_meta(class_node) -> bool:
+def _has_abc_meta(class_node, import_aliases: dict[str, str]) -> bool:
     superclasses = class_node.child_by_field_name("superclasses")
     if superclasses is None:
         return False
@@ -163,12 +202,10 @@ def _has_abc_meta(class_node) -> bool:
             continue
         name = argument.child_by_field_name("name")
         value = argument.child_by_field_name("value")
-        if (
-            name is not None
-            and name.text == b"metaclass"
-            and value is not None
-            and _terminal_name(value) == "ABCMeta"
-        ):
+        if name is None or name.text != b"metaclass" or value is None:
+            continue
+        value_name = _terminal_name(value)
+        if import_aliases.get(value_name, value_name) == "ABCMeta":
             return True
     return False
 
@@ -179,10 +216,13 @@ def _is_stub_method(
     decorated_node,
     protocol_context: bool,
     abc_context: bool,
+    import_aliases: dict[str, str],
 ) -> bool:
     if not _is_stub_body(function_node):
         return False
-    return protocol_context or (abc_context and _has_abstractmethod_decorator(decorated_node))
+    return protocol_context or (
+        abc_context and _has_abstractmethod_decorator(decorated_node, import_aliases)
+    )
 
 
 def _is_stub_body(function_node) -> bool:
@@ -197,7 +237,7 @@ def _is_stub_body(function_node) -> bool:
     return statement.named_children[0].type in {"ellipsis", "string"}
 
 
-def _has_abstractmethod_decorator(node) -> bool:
+def _has_abstractmethod_decorator(node, import_aliases: dict[str, str]) -> bool:
     if node.type != "decorated_definition":
         return False
     for decorator in node.named_children:
@@ -206,8 +246,10 @@ def _has_abstractmethod_decorator(node) -> bool:
         expression = decorator.named_children[0]
         if expression.type == "call":
             expression = expression.child_by_field_name("function")
-        if expression is not None and _terminal_name(expression) == "abstractmethod":
-            return True
+        if expression is not None:
+            name = _terminal_name(expression)
+            if import_aliases.get(name, name) == "abstractmethod":
+                return True
     return False
 
 
