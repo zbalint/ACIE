@@ -137,9 +137,14 @@ def test_preserves_ambiguous_siblings_when_incoming_candidate_is_ambiguous():
     store = RelationStore(":memory:")
     first = make_relation(target="first", confidence=Confidence.AMBIGUOUS)
     second = make_relation(target="second", confidence=Confidence.AMBIGUOUS)
+    third = make_relation(target="third", confidence=Confidence.AMBIGUOUS)
+    current_pass_targets = frozenset({"first", "second", "third"})
     store.upsert(first)
 
-    outcome = apply_enrichment_write(store, second)
+    default_outcome = apply_enrichment_write(store, second)
+    assert default_outcome == MergeOutcome(True, 0)
+
+    outcome = apply_enrichment_write(store, third, current_pass_targets=current_pass_targets)
 
     assert outcome == MergeOutcome(True, 0)
     assert store.list_by_site(
@@ -147,4 +152,4 @@ def test_preserves_ambiguous_siblings_when_incoming_candidate_is_ambiguous():
         site_line=first.site_line,
         site_col=first.site_col,
         predicates={"calls"},
-    ) == [first, second]
+    ) == [first, second, third]

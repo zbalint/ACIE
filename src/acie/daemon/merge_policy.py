@@ -17,11 +17,15 @@ class MergeOutcome:
     reason: str | None = None
 
 
-def apply_enrichment_write(relation_store: RelationStore, relation: Relation) -> MergeOutcome:
+def apply_enrichment_write(
+    relation_store: RelationStore,
+    relation: Relation,
+    current_pass_targets: frozenset[str] | None = None,
+) -> MergeOutcome:
     """Apply an enrichment relation without regressing a more-certain fact.
 
-    An incoming AMBIGUOUS relation adds a candidate and must not retire its
-    same-site ambiguous siblings.
+    An incoming AMBIGUOUS relation adds a candidate and, without a
+    pass-scoped target set, must not retire its same-site ambiguous siblings.
     """
     existing = relation_store.get(
         source=relation.source,
@@ -43,12 +47,16 @@ def apply_enrichment_write(relation_store: RelationStore, relation: Relation) ->
         return MergeOutcome(applied=False, retired_siblings=0, reason="would_regress_existing_confidence")
 
     relation_store.upsert(relation)
-    retired_siblings = _retire_stale_siblings(relation_store, relation)
+    retired_siblings = _retire_stale_siblings(relation_store, relation, current_pass_targets)
     return MergeOutcome(applied=True, retired_siblings=retired_siblings)
 
 
-def _retire_stale_siblings(relation_store: RelationStore, relation: Relation) -> int:
-    if relation.confidence == Confidence.AMBIGUOUS:
+def _retire_stale_siblings(
+    relation_store: RelationStore,
+    relation: Relation,
+    current_pass_targets: frozenset[str] | None = None,
+) -> int:
+    if relation.confidence == Confidence.AMBIGUOUS and current_pass_targets is None:
         return 0
     siblings = relation_store.list_by_site(
         site_file=relation.site_file,
@@ -62,6 +70,10 @@ def _retire_stale_siblings(relation_store: RelationStore, relation: Relation) ->
         if sibling.source == relation.source
         and sibling.target != relation.target
         and sibling.confidence == Confidence.AMBIGUOUS
+        and (
+            relation.confidence != Confidence.AMBIGUOUS
+            or sibling.target not in current_pass_targets
+        )
     ]
     # shortcut: do not reconcile stale INFERRED rows from cross-pass re-ambiguation;
     # retire them if a real repo exposes a visibly wrong stale fact.

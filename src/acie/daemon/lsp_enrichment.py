@@ -36,7 +36,6 @@ class _Site:
     predicate: str
 
 
-
 @dataclass(frozen=True)
 class _MixinSite:
     source: str
@@ -89,6 +88,7 @@ def run_enrichment_pass(
                 candidates = _composition_method_candidates(site, relation_store, symbol_store)
                 if not candidates:
                     continue
+                current_pass_targets = frozenset(candidate.id for candidate in candidates)
                 confidence = Confidence.INFERRED if len(candidates) == 1 else Confidence.AMBIGUOUS
                 for target in candidates:
                     relation = Relation(
@@ -101,7 +101,9 @@ def run_enrichment_pass(
                         confidence=confidence,
                         provenance=Provenance(provider=provider, version=version, observed_at=observed_at_fn()),
                     )
-                    submitted.append(write_queue.submit(repo_id, _make_merge_job(relation)))
+                    submitted.append(
+                        write_queue.submit(repo_id, _make_merge_job(relation, current_pass_targets))
+                    )
                     resolved.append(relation)
                 continue
             uri = (Path(repo_root) / site.site_file).resolve().as_uri()
@@ -270,8 +272,15 @@ def _relative_path_from_uri(uri: str, repo_root: str) -> str | None:
         return None
 
 
-def _make_merge_job(relation: Relation):
+def _make_merge_job(
+    relation: Relation,
+    current_pass_targets: frozenset[str] | None = None,
+):
     def job(conn) -> merge_policy.MergeOutcome:
-        return merge_policy.apply_enrichment_write(RelationStore(conn=conn), relation)
+        return merge_policy.apply_enrichment_write(
+            RelationStore(conn=conn),
+            relation,
+            current_pass_targets=current_pass_targets,
+        )
 
     return job
