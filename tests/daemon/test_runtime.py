@@ -12,6 +12,7 @@ from acie.daemon import repo_fingerprint
 from acie.daemon.repo_fingerprint import compute_repo_fingerprint
 from acie.daemon.runtime import create_daemon, ensure_fresh
 from acie.daemon.write_queue import WriteQueue
+from acie.repo_id import resolve_repo_id, resolve_worktree_id
 from acie.storage.index_meta_store import IndexMetaStore
 from tests.daemon.rpc import send_request
 
@@ -216,14 +217,10 @@ def test_runtime_dedupes_write_queue_and_bootstrap_state_across_repo_path_spelli
         server.shutdown()
 
 
-def test_runtime_worktree_smoke_shared_bootstrap_state_does_not_crash_or_deadlock(tmp_path):
-    # decision 10's fix: two live worktrees of one repo now share one
-    # repo_id-keyed write queue and bootstrap-readiness flag. Full
-    # multi-worktree walk-merging semantics are explicitly out of v0 scope
-    # (ARCHITECTURE.md "Not Yet Specified") -- this only smoke-tests that
-    # the shared-state path doesn't crash or deadlock and matches the
-    # agreed first-registrant-wins behavior, not that both worktrees'
-    # possibly-diverged content ends up indexed.
+def test_runtime_worktree_bootstrap_seeds_a_second_index_without_deadlock(tmp_path):
+    # A linked worktree gets its own write queue, readiness state, and index.
+    # This smoke test covers the same-content seed path; the divergent-content
+    # isolation contract is asserted separately below.
     main_repo = tmp_path / "main_repo"
     main_repo.mkdir()
     subprocess.run(["git", "init", "-q", str(main_repo)], check=True)
@@ -251,11 +248,19 @@ def test_runtime_worktree_smoke_shared_bootstrap_state_does_not_crash_or_deadloc
         else:
             raise AssertionError("main worktree did not finish bootstrap indexing")
 
-        # Registering the second worktree (shared repo_id, distinct
-        # repo_root) must not crash or deadlock, and per the agreed
-        # first-registrant-wins behavior it reads as ready immediately too.
-        response = send_request(server.port, build_request("find_symbol", str(worktree), {"name": "target"}))
-        assert response["ok"] is True
+        # Registering the second worktree must start its own seeded bootstrap
+        # without crashing or deadlocking.
+        worktree_request = build_request("find_symbol", str(worktree), {"name": "target"})
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            response = send_request(server.port, worktree_request)
+            if response["ok"]:
+                break
+            assert response["error"]["code"] == "INDEX_NOT_READY"
+            time.sleep(0.01)
+        else:
+            raise AssertionError("linked worktree did not finish bootstrap indexing")
+        assert [item["qualname"] for item in response["result"]["results"]] == ["target"]
     finally:
         server.shutdown()
 
@@ -833,3 +838,56 @@ def test_repo_fingerprint_returns_none_when_git_subprocess_raises(tmp_path, monk
     monkeypatch.setattr(repo_fingerprint.subprocess, "run", fail)
 
     assert compute_repo_fingerprint(str(tmp_path)) is None
+def test_runtime_isolates_divergent_worktree_indexes_and_storage(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.name", "T"], check=True)
+    (main / "module.py").write_text("def main_symbol():\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(main), "add", "module.py"], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "initial"], check=True)
+
+    worktree = tmp_path / "worktree"
+    subprocess.run(
+        ["git", "-C", str(main), "worktree", "add", "-b", "other", str(worktree)], check=True
+    )
+    (worktree / "module.py").write_text("def worktree_symbol():\n    pass\n", encoding="utf-8")
+
+    state_dir = tmp_path / "state"
+    server = create_daemon(state_dir=str(state_dir), port=0)
+    server.start()
+    try:
+        main_request = build_request("find_symbol", str(main), {"name": "main_symbol"})
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            main_response = send_request(server.port, main_request)
+            if main_response["ok"]:
+                break
+            assert main_response["error"]["code"] == "INDEX_NOT_READY"
+            time.sleep(0.01)
+        else:
+            raise AssertionError("main worktree did not finish bootstrap indexing")
+
+        worktree_request = build_request("find_symbol", str(worktree), {"name": "worktree_symbol"})
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            worktree_response = send_request(server.port, worktree_request)
+            if worktree_response["ok"]:
+                break
+            assert worktree_response["error"]["code"] == "INDEX_NOT_READY"
+            time.sleep(0.01)
+        else:
+            raise AssertionError("linked worktree did not finish bootstrap indexing")
+
+        assert [item["qualname"] for item in main_response["result"]["results"]] == ["main_symbol"]
+        assert [item["qualname"] for item in worktree_response["result"]["results"]] == ["worktree_symbol"]
+        assert send_request(
+            server.port, build_request("find_symbol", str(main), {"name": "worktree_symbol"})
+        )["result"]["results"] == []
+        repo_id = resolve_repo_id(str(main))
+        worktree_id = resolve_worktree_id(str(worktree))
+        assert (state_dir / "repos" / repo_id / "index.sqlite").is_file()
+        assert (state_dir / "repos" / repo_id / "worktrees" / worktree_id / "index.sqlite").is_file()
+    finally:
+        server.shutdown()

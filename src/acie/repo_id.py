@@ -9,9 +9,9 @@ import subprocess
 _REPO_ID_HEX_LENGTH = 16
 
 
-def resolve_git_common_dir(repo_path: str) -> str | None:
+def _resolve_git_dir(repo_path: str, argument: str) -> str | None:
     result = subprocess.run(
-        ["git", "-C", repo_path, "rev-parse", "--git-common-dir"],
+        ["git", "-C", repo_path, "rev-parse", argument],
         capture_output=True,
         text=True,
         check=False,
@@ -22,6 +22,10 @@ def resolve_git_common_dir(repo_path: str) -> str | None:
     raw = result.stdout.strip()
     resolved = os.path.normpath(os.path.join(repo_path, raw))
     return os.path.realpath(resolved)
+
+
+def resolve_git_common_dir(repo_path: str) -> str | None:
+    return _resolve_git_dir(repo_path, "--git-common-dir")
 
 
 def resolve_repo_root(repo_path: str) -> str | None:
@@ -52,6 +56,22 @@ def resolve_repo_id(repo_path: str) -> str | None:
 
     digest = hashlib.sha256(common_dir.encode("utf-8")).hexdigest()
     return digest[:_REPO_ID_HEX_LENGTH]
+def is_primary_worktree(repo_path: str) -> bool:
+    git_dir = _resolve_git_dir(repo_path, "--git-dir")
+    common_dir = resolve_git_common_dir(repo_path)
+    return git_dir is not None and git_dir == common_dir
+
+
+def resolve_worktree_id(repo_path: str) -> str | None:
+    repo_id = resolve_repo_id(repo_path)
+    repo_root = resolve_repo_root(repo_path)
+    if repo_id is None or repo_root is None:
+        return None
+    if is_primary_worktree(repo_path):
+        return repo_id
+
+    root_digest = hashlib.sha256(repo_root.encode("utf-8")).hexdigest()
+    return f"{repo_id}-{root_digest[:_REPO_ID_HEX_LENGTH]}"
 
 
 def resolve_repo_state_dir(repo_path: str, base_dir: str | None = None) -> str | None:
@@ -79,9 +99,15 @@ def resolve_index_db_path(repo_path: str, base_dir: str | None = None) -> str | 
     -- SymbolStore/RelationStore create it on first connect.
     """
     state_dir = resolve_repo_state_dir(repo_path, base_dir=base_dir)
-    if state_dir is None:
+    worktree_id = resolve_worktree_id(repo_path)
+    repo_id = resolve_repo_id(repo_path)
+    if state_dir is None or worktree_id is None or repo_id is None:
         return None
-    return os.path.join(state_dir, "index.sqlite")
+    if worktree_id == repo_id:
+        return os.path.join(state_dir, "index.sqlite")
+    worktree_dir = os.path.join(state_dir, "worktrees", worktree_id)
+    os.makedirs(worktree_dir, exist_ok=True)
+    return os.path.join(worktree_dir, "index.sqlite")
 
 
 def to_repo_relative(file_path: str, repo_root: str) -> str | None:

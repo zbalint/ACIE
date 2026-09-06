@@ -14,13 +14,15 @@ watcher-triggered enrichment is composed by the daemon runtime.
 """
 
 import os
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import Callable, Iterable
 
 from acie.daemon.write_queue import WriteQueue
-from acie.daemon.repo_fingerprint import compute_repo_fingerprint
+from acie.daemon.repo_fingerprint import compute_changed_relpaths, compute_repo_fingerprint, compute_repo_head_sha
 from acie.indexer import IndexResult, index_file
+from acie.repo_id import is_primary_worktree, resolve_git_common_dir, resolve_worktree_id
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
@@ -45,10 +47,12 @@ class BootstrapCoordinator:
         walk_repo: Callable[[str], Iterable[tuple[str, str]]],
         *,
         on_indexed: Callable[[str, str], None] = lambda repo_id, repo_root: None,
+        read_files: Callable[[str, Iterable[str]], Iterable[tuple[str, str]]] | None = None,
     ) -> None:
         self._write_queue = write_queue
         self._db_path_for = db_path_for
         self._walk_repo = walk_repo
+        self._read_files = read_files
         self._on_indexed = on_indexed
         self._lock = threading.Lock()
         self._ready: set[str] = set()
@@ -117,6 +121,21 @@ class BootstrapCoordinator:
         threading.Thread(target=self._run_bootstrap, args=(repo_id, repo_root), daemon=True).start()
 
     def _run_bootstrap(self, repo_id: str, repo_root: str) -> None:
+        seeded_files = self._seed_worktree(repo_id, repo_root)
+        if seeded_files is not None:
+            def on_seeded_done(persist_head: bool = True) -> None:
+                if persist_head:
+                    self._persist_head_sha(repo_id, repo_root, lambda: on_seeded_done(False))
+                    return
+                self._mark_ready(repo_id)
+                self._on_indexed(repo_id, repo_root)
+
+            if not seeded_files:
+                on_seeded_done()
+                return
+            self._run_indexing_pass(repo_id, seeded_files, on_pass_done=on_seeded_done)
+            return
+
         try:
             files = list(self._walk_repo(repo_root))
         except BaseException:
@@ -134,7 +153,10 @@ class BootstrapCoordinator:
             self._mark_ready(repo_id)
             return
 
-        def on_bootstrap_done() -> None:
+        def on_bootstrap_done(persist_head: bool = True) -> None:
+            if persist_head:
+                self._persist_head_sha(repo_id, repo_root, lambda: on_bootstrap_done(False))
+                return
             self._mark_ready(repo_id)
             # A from-scratch bootstrap already gets the full two-pass
             # treatment below -- mark the migration flag done too, so a
@@ -182,6 +204,92 @@ class BootstrapCoordinator:
         self._run_indexing_pass(
             repo_id, files, on_pass_done=lambda: self._run_indexing_pass(repo_id, files, on_pass_done=on_bootstrap_done)
         )
+    def _seed_worktree(self, repo_id: str, repo_root: str) -> list[tuple[str, str | None]] | None:
+        if is_primary_worktree(repo_root):
+            return None
+        common_dir = resolve_git_common_dir(repo_root)
+        if common_dir is None:
+            return None
+        primary_root = os.path.dirname(common_dir)
+        primary_id = resolve_worktree_id(primary_root)
+        if primary_id is None or primary_id == repo_id or not self.repo_ready(primary_id):
+            return None
+
+        source_db = self._db_path_for(primary_id)
+        target_db = self._db_path_for(repo_id)
+        try:
+            conn = sqlite3.connect(source_db)
+            try:
+                meta = IndexMetaStore(conn=conn)
+                previous_head_sha = meta.get_last_indexed_head_sha()
+                previous_fingerprint = meta.get_last_enrichment_fingerprint()
+                seeded_paths = {
+                    row[0] for row in conn.execute("SELECT DISTINCT path FROM symbols_live")
+                }
+            finally:
+                conn.close()
+            if previous_head_sha is None:
+                return None
+            baseline_head_sha = previous_head_sha
+            primary_diff = compute_changed_relpaths(
+                primary_root,
+                previous_head_sha=baseline_head_sha,
+                baseline_relpaths=seeded_paths,
+            )
+            if primary_diff is None:
+                return None
+            primary_changed_paths = set(primary_diff)
+
+            target_diff = compute_changed_relpaths(
+                repo_root,
+                previous_head_sha=baseline_head_sha,
+                previous_fingerprint=previous_fingerprint,
+                baseline_relpaths=seeded_paths,
+            )
+            if target_diff is None:
+                return None
+            target_changed_paths = set(target_diff)
+            changed_paths = sorted(primary_changed_paths | target_changed_paths)
+            read_files = self._read_files or self._read_changed_files
+            files_by_path = dict(read_files(repo_root, changed_paths))
+            files: list[tuple[str, str | None]] = []
+            for path in changed_paths:
+                if path in files_by_path:
+                    files.append((path, files_by_path[path]))
+                elif path in seeded_paths:
+                    files.append((path, None))
+            self._copy_index(source_db, target_db)
+            return files
+        except (OSError, sqlite3.Error):
+            return None
+
+    @staticmethod
+    def _read_changed_files(repo_root: str, rel_paths: Iterable[str]) -> Iterable[tuple[str, str]]:
+        root = os.path.realpath(repo_root)
+        for rel_path in rel_paths:
+            if not rel_path.endswith(".py") or any(part.startswith(".") for part in rel_path.split(os.sep)):
+                continue
+            absolute_path = os.path.realpath(os.path.join(root, rel_path))
+            try:
+                if os.path.commonpath((root, absolute_path)) != root:
+                    continue
+                with open(absolute_path, encoding="utf-8") as source_file:
+                    yield rel_path, source_file.read()
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+
+    @staticmethod
+    def _copy_index(source_db: str, target_db: str) -> None:
+        parent = os.path.dirname(target_db)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        source = sqlite3.connect(source_db)
+        target = sqlite3.connect(target_db)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
 
     def _maybe_schedule_cross_file_migration(self, repo_id: str, repo_root: str) -> None:
         """One-time catch-up for a repo that was already `repo_ready()`
@@ -276,28 +384,15 @@ class BootstrapCoordinator:
         self._on_indexed(repo_id, repo_root)
 
     def _run_indexing_pass(
-        self, repo_id: str, files: list[tuple[str, str]], *, on_pass_done: Callable[[], None]
+        self, repo_id: str, files: list[tuple[str, str | None]], *, on_pass_done: Callable[[], None]
     ) -> None:
         remaining = [len(files)]
         remaining_lock = threading.Lock()
 
         def on_job_done(future) -> None:
             # shortcut: a failing file -- or one whose submission never
-            # even reached a writer thread (e.g. a writer-startup failure
-            # in WriteQueue.submit()) -- still counts toward "done" so one
-            # bad file can't wedge the repo in INDEX_NOT_READY forever, but
-            # its exception is never surfaced anywhere else since
-            # bootstrap doesn't retain per-file futures. Upgrade trigger:
-            # add error aggregation/logging once silent per-file bootstrap
-            # failures need visibility.
-            #
-            # Attached via add_done_callback rather than embedded in the
-            # job closure's own finally block: a concurrent.futures.Future
-            # guarantees this fires exactly once whether the job ran to
-            # completion, raised, or WriteQueue.submit() failed before the
-            # job was ever enqueued at all (that Future comes back already
-            # failed, and add_done_callback on an already-done Future
-            # still calls its callback immediately).
+            # even reached a writer thread -- still counts toward done so
+            # one bad file cannot wedge the repo in INDEX_NOT_READY forever.
             with remaining_lock:
                 remaining[0] -= 1
                 done = remaining[0] == 0
@@ -306,6 +401,16 @@ class BootstrapCoordinator:
 
         for path, source_text in files:
             self._write_queue.submit(repo_id, make_index_job(path, source_text)).add_done_callback(on_job_done)
+    def _persist_head_sha(self, repo_id: str, repo_root: str, on_done: Callable[[], None]) -> None:
+        head_sha = compute_repo_head_sha(repo_root)
+        if head_sha is None:
+            on_done()
+            return
+
+        def persist(conn) -> None:
+            IndexMetaStore(conn=conn).set_last_indexed_head_sha(head_sha)
+
+        self._write_queue.submit(repo_id, persist).add_done_callback(lambda _future: on_done())
 
     def _mark_ready(self, repo_id: str) -> None:
         with self._lock:
@@ -319,13 +424,19 @@ class BootstrapCoordinator:
         self._write_queue.submit(repo_id, mark_job)
 
 
-def make_index_job(path: str, source_text: str):
+def make_index_job(path: str, source_text: str | None):
     def job(conn) -> IndexResult:
-        return index_file(
-            path=path, source_text=source_text,
-            observed_at=datetime.now(timezone.utc).isoformat(),
-            symbol_store=SymbolStore(conn=conn),
-            relation_store=RelationStore(conn=conn),
-            index_meta_store=IndexMetaStore(conn=conn),
+        observed_at = datetime.now(timezone.utc).isoformat()
+        symbol_store = SymbolStore(conn=conn)
+        relation_store = RelationStore(conn=conn)
+        index_meta_store = IndexMetaStore(conn=conn)
+        result = index_file(
+            path=path, source_text=source_text or "", observed_at=observed_at,
+            symbol_store=symbol_store, relation_store=relation_store,
+            index_meta_store=index_meta_store,
         )
+        if source_text is None:
+            for symbol in symbol_store.list_by_path(path):
+                symbol_store.delete(symbol.id, observed_at=observed_at)
+        return result
     return job

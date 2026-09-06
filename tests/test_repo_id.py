@@ -1,12 +1,15 @@
+import hashlib
 import os
 import subprocess
 
 from acie.repo_id import (
+    is_primary_worktree,
     resolve_git_common_dir,
     resolve_index_db_path,
     resolve_repo_id,
     resolve_repo_root,
     resolve_repo_state_dir,
+    resolve_worktree_id,
 )
 
 
@@ -96,6 +99,29 @@ def test_worktree_shares_repo_id_with_main_checkout(tmp_path):
     )
 
     assert resolve_repo_id(str(main)) == resolve_repo_id(str(worktree))
+def test_worktree_identity_and_index_path_isolate_linked_worktree(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(
+        ["git", "-C", str(main), "commit", "-q", "--allow-empty", "-m", "init"],
+        check=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.com",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.com"},
+    )
+    worktree = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", str(worktree)], check=True)
+    base = tmp_path / "acie-home"
+
+    repo_id = resolve_repo_id(str(main))
+    worktree_id = resolve_worktree_id(str(worktree))
+
+    assert is_primary_worktree(str(main)) is True
+    assert is_primary_worktree(str(worktree)) is False
+    assert resolve_worktree_id(str(main)) == repo_id
+    assert worktree_id == f"{repo_id}-{hashlib.sha256(os.path.realpath(worktree).encode('utf-8')).hexdigest()[:16]}"
+    assert resolve_index_db_path(str(main), base_dir=str(base)) == str(base / "repos" / repo_id / "index.sqlite")
+    assert resolve_index_db_path(str(worktree), base_dir=str(base)) == str(base / "repos" / repo_id / "worktrees" / worktree_id / "index.sqlite")
 
 
 def test_resolve_repo_state_dir_creates_and_returns_the_directory(tmp_path):

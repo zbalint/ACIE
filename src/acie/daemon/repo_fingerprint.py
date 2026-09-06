@@ -3,7 +3,7 @@
 import hashlib
 import os
 import subprocess
-
+from collections.abc import Iterable
 
 def compute_repo_fingerprint(repo_root: str) -> str | None:
     """Return a git-native fingerprint of ``repo_root``'s working-tree state.
@@ -48,6 +48,46 @@ def compute_repo_fingerprint(repo_root: str) -> str | None:
     for rel_path, mtime_ns, size in untracked:
         hasher.update(f"{rel_path}\0{mtime_ns}\0{size}\0".encode("utf-8"))
     return hasher.hexdigest()
+
+
+def compute_repo_head_sha(repo_root: str) -> str | None:
+    """Return the current commit SHA used as an index baseline."""
+    head = _run_git(repo_root, "rev-parse", "HEAD")
+    return None if head is None else head.strip()
+
+
+def compute_changed_relpaths(
+    repo_root: str,
+    *,
+    previous_head_sha: str | None = None,
+    previous_fingerprint: str | None = None,
+    baseline_relpaths: Iterable[str] = (),
+) -> list[str] | None:
+    """Return paths changed since a seeded index snapshot."""
+    current_fingerprint = compute_repo_fingerprint(repo_root)
+    if current_fingerprint is None:
+        return None
+
+    root = os.path.realpath(repo_root)
+    missing_seeded = {
+        path for path in baseline_relpaths if not os.path.isfile(os.path.join(root, path))
+    }
+    if previous_fingerprint is not None and current_fingerprint == previous_fingerprint and not missing_seeded:
+        return []
+    if previous_head_sha is None:
+        return None
+
+    committed = _run_git(repo_root, "diff", "--name-only", previous_head_sha, "HEAD")
+    working_tree = _run_git(repo_root, "diff", "--name-only", "HEAD")
+    status = _run_git(repo_root, "status", "--porcelain", "--untracked-files=all")
+    if committed is None or working_tree is None or status is None:
+        return None
+
+    changed: set[str] = set(missing_seeded)
+    changed.update(path for path in committed.splitlines() if path)
+    changed.update(path for path in working_tree.splitlines() if path)
+    changed.update(line[3:] for line in status.splitlines() if line.startswith("?? "))
+    return sorted(changed)
 
 
 def _run_git(repo_root: str, *args: str) -> str | None:

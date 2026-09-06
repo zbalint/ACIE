@@ -1,15 +1,17 @@
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 from concurrent.futures import Future
-
 from acie.daemon import bootstrap as bootstrap_module
 from acie.daemon.bootstrap import BootstrapCoordinator
 from acie.daemon.write_queue import WriteQueue
+from acie.daemon.repo_fingerprint import compute_repo_fingerprint, compute_repo_head_sha
 from acie.indexer import index_file
 from acie.daemon import enrichment_scheduler as scheduler_module
 from acie.daemon.enrichment_scheduler import EnrichmentScheduler
+from acie.repo_id import resolve_repo_id, resolve_worktree_id
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
@@ -31,7 +33,7 @@ def _wait_until(predicate, timeout=2.0):
     return predicate()
 
 
-def _make_coordinator(tmp_path, files_by_repo, db_paths=None, on_indexed=None):
+def _make_coordinator(tmp_path, files_by_repo, db_paths=None, on_indexed=None, read_files=None):
     db_paths = db_paths if db_paths is not None else {}
 
     def db_path_for(repo_id):
@@ -45,6 +47,8 @@ def _make_coordinator(tmp_path, files_by_repo, db_paths=None, on_indexed=None):
     }
     if on_indexed is not None:
         coordinator_kwargs["on_indexed"] = on_indexed
+    if read_files is not None:
+        coordinator_kwargs["read_files"] = read_files
     coordinator = BootstrapCoordinator(**coordinator_kwargs)
     return coordinator, write_queue, db_path_for
 
@@ -767,4 +771,256 @@ def test_bootstrap_double_fire_and_reconciliation_share_one_scheduler_follow_up(
     assert finished.wait(timeout=2.0)
     assert calls == ["repo-a", "repo-a"]
     assert max_active == 1
+    write_queue.close()
+
+def test_linked_worktree_seeds_primary_index_and_reindexes_only_changed_paths(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.name", "T"], check=True)
+    same_source = "def shared():\n    pass\n"
+    (main / "same.py").write_text(same_source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(main), "add", "same.py"], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "initial"], check=True)
+    head_sha = subprocess.run(
+        ["git", "-C", str(main), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    seed_fingerprint = compute_repo_fingerprint(str(main))
+
+    worktree = tmp_path / "worktree"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", str(worktree)], check=True)
+    (worktree / "changed.py").write_text("def changed():\n    pass\n", encoding="utf-8")
+
+    primary_id = resolve_repo_id(str(main))
+    worktree_id = resolve_worktree_id(str(worktree))
+    db_paths = {
+        primary_id: str(tmp_path / "primary.sqlite"),
+        worktree_id: str(tmp_path / "worktree.sqlite"),
+    }
+    files = {
+        str(worktree): [
+            ("same.py", "def incorrectly_rewalked():\n    pass\n"),
+            ("changed.py", "def changed():\n    pass\n"),
+        ]
+    }
+    read_calls = []
+
+    def read_files(repo_root, rel_paths):
+        rel_paths = list(rel_paths)
+        read_calls.append(rel_paths)
+        return [(path, source) for path, source in files.get(repo_root, []) if path in rel_paths]
+
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path, files_by_repo=files, db_paths=db_paths, read_files=read_files
+    )
+    _index_files_once_directly(db_path_for(primary_id), [("same.py", same_source)])
+    primary_meta = IndexMetaStore(db_path_for(primary_id))
+    primary_meta.set_last_indexed_head_sha(head_sha)
+    primary_meta.set_last_enrichment_fingerprint(seed_fingerprint)
+
+    def unexpected_full_walk(_repo_root):
+        raise AssertionError("seed bootstrap must not walk the whole worktree")
+
+    coordinator._walk_repo = unexpected_full_walk
+
+    coordinator.register(worktree_id, str(worktree))
+
+    assert _wait_until(lambda: coordinator.repo_ready(worktree_id)), "linked worktree never became ready"
+    assert read_calls == [["changed.py"]]
+    assert [s.qualname for s in SymbolStore(db_path_for(worktree_id)).list_by_path("same.py")] == ["", "shared"]
+    assert [s.qualname for s in SymbolStore(db_path_for(worktree_id)).list_by_path("changed.py")] == ["", "changed"]
+    assert IndexMetaStore(db_path_for(worktree_id)).get_last_indexed_head_sha() == head_sha
+    write_queue.close()
+def test_linked_worktree_tombstones_a_seeded_file_deleted_in_the_worktree(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.name", "T"], check=True)
+    source = "def shared():\n    pass\n"
+    (main / "same.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(main), "add", "same.py"], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "initial"], check=True)
+    head_sha = subprocess.run(
+        ["git", "-C", str(main), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    seed_fingerprint = compute_repo_fingerprint(str(main))
+
+    worktree = tmp_path / "worktree"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", str(worktree)], check=True)
+    (worktree / "same.py").unlink()
+
+    primary_id = resolve_repo_id(str(main))
+    worktree_id = resolve_worktree_id(str(worktree))
+    db_paths = {
+        primary_id: str(tmp_path / "primary.sqlite"),
+        worktree_id: str(tmp_path / "worktree.sqlite"),
+    }
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path, files_by_repo={str(worktree): []}, db_paths=db_paths
+    )
+    _index_files_once_directly(db_path_for(primary_id), [("same.py", source)])
+    primary_meta = IndexMetaStore(db_path_for(primary_id))
+    primary_meta.set_last_indexed_head_sha(head_sha)
+    primary_meta.set_last_enrichment_fingerprint(seed_fingerprint)
+
+    coordinator.register(worktree_id, str(worktree))
+
+    assert _wait_until(lambda: coordinator.repo_ready(worktree_id)), "linked worktree never became ready"
+    assert SymbolStore(db_path_for(worktree_id)).list_by_path("same.py") == []
+    write_queue.close()
+def test_seed_fallback_does_not_leave_primary_only_deleted_symbols(tmp_path, monkeypatch):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.name", "T"], check=True)
+    source = "def shared():\n    pass\n"
+    (main / "same.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(main), "add", "same.py"], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "initial"], check=True)
+    head_sha = subprocess.run(
+        ["git", "-C", str(main), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    worktree = tmp_path / "worktree"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", str(worktree)], check=True)
+    (worktree / "same.py").unlink()
+
+    primary_id = resolve_repo_id(str(main))
+    worktree_id = resolve_worktree_id(str(worktree))
+    db_paths = {
+        primary_id: str(tmp_path / "primary.sqlite"),
+        worktree_id: str(tmp_path / "worktree.sqlite"),
+    }
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path,
+        files_by_repo={str(worktree): [("new.py", "def discovered():\n    pass\n")]},
+        db_paths=db_paths,
+    )
+    _index_files_once_directly(db_path_for(primary_id), [("same.py", source)])
+    primary_meta = IndexMetaStore(db_path_for(primary_id))
+    primary_meta.set_last_indexed_head_sha(head_sha)
+    monkeypatch.setattr(bootstrap_module, "compute_changed_relpaths", lambda *args, **kwargs: None)
+
+    coordinator.register(worktree_id, str(worktree))
+
+    assert _wait_until(lambda: coordinator.repo_ready(worktree_id)), "fallback bootstrap never became ready"
+    assert [symbol.qualname for symbol in SymbolStore(db_path_for(worktree_id)).list_by_path("new.py")] == ["", "discovered"]
+    assert SymbolStore(db_path_for(worktree_id)).list_by_path("same.py") == []
+    write_queue.close()
+def test_linked_worktree_tombstones_a_seeded_untracked_file_missing_from_worktree(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.name", "T"], check=True)
+    tracked_source = "def tracked():\n    pass\n"
+    untracked_source = "def untracked():\n    pass\n"
+    (main / "tracked.py").write_text(tracked_source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(main), "add", "tracked.py"], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "initial"], check=True)
+    (main / "untracked.py").write_text(untracked_source, encoding="utf-8")
+    head_sha = compute_repo_head_sha(str(main))
+    seed_fingerprint = compute_repo_fingerprint(str(main))
+
+    worktree = tmp_path / "worktree"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", str(worktree)], check=True)
+    assert not (worktree / "untracked.py").exists()
+
+    primary_id = resolve_repo_id(str(main))
+    worktree_id = resolve_worktree_id(str(worktree))
+    db_paths = {
+        primary_id: str(tmp_path / "primary.sqlite"),
+        worktree_id: str(tmp_path / "worktree.sqlite"),
+    }
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path, files_by_repo={str(worktree): []}, db_paths=db_paths
+    )
+    _index_files_once_directly(db_path_for(primary_id), [("untracked.py", untracked_source)])
+    primary_meta = IndexMetaStore(db_path_for(primary_id))
+    primary_meta.set_last_indexed_head_sha(head_sha)
+    primary_meta.set_last_enrichment_fingerprint(seed_fingerprint)
+
+    coordinator.register(worktree_id, str(worktree))
+
+    assert _wait_until(lambda: coordinator.repo_ready(worktree_id)), "linked worktree never became ready"
+    assert SymbolStore(db_path_for(worktree_id)).list_by_path("untracked.py") == []
+    write_queue.close()
+def test_linked_worktree_does_not_seed_a_dirty_primary_index_into_clean_worktree(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.name", "T"], check=True)
+    (main / "module.py").write_text("def clean_symbol():\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(main), "add", "module.py"], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "initial"], check=True)
+    (main / "module.py").write_text("def dirty_symbol():\n    pass\n", encoding="utf-8")
+    head_sha = compute_repo_head_sha(str(main))
+    seed_fingerprint = compute_repo_fingerprint(str(main))
+
+    worktree = tmp_path / "worktree"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", str(worktree)], check=True)
+    assert (worktree / "module.py").read_text(encoding="utf-8") == "def clean_symbol():\n    pass\n"
+
+    primary_id = resolve_repo_id(str(main))
+    worktree_id = resolve_worktree_id(str(worktree))
+    db_paths = {
+        primary_id: str(tmp_path / "primary.sqlite"),
+        worktree_id: str(tmp_path / "worktree.sqlite"),
+    }
+    files = {str(worktree): [("module.py", "def clean_symbol():\n    pass\n")]}
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path, files_by_repo=files, db_paths=db_paths
+    )
+    _index_files_once_directly(db_path_for(primary_id), [("module.py", "def dirty_symbol():\n    pass\n")])
+    primary_meta = IndexMetaStore(db_path_for(primary_id))
+    primary_meta.set_last_indexed_head_sha(head_sha)
+    primary_meta.set_last_enrichment_fingerprint(seed_fingerprint)
+
+    def unexpected_full_walk(_repo_root):
+        raise AssertionError("dirty primary seed must use changed-file reads")
+
+    coordinator._walk_repo = unexpected_full_walk
+    coordinator.register(worktree_id, str(worktree))
+
+    assert _wait_until(lambda: coordinator.repo_ready(worktree_id)), "linked worktree never became ready"
+    symbols = SymbolStore(db_path_for(worktree_id)).list_by_path("module.py")
+    assert [symbol.qualname for symbol in symbols] == ["", "clean_symbol"]
+    write_queue.close()
+def test_linked_worktree_falls_back_when_primary_head_metadata_is_missing(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.name", "T"], check=True)
+    old_source = "def old_symbol():\n    pass\n"
+    new_source = "def new_symbol():\n    pass\n"
+    (main / "module.py").write_text(old_source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(main), "add", "module.py"], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "old"], check=True)
+    primary_id = resolve_repo_id(str(main))
+    (main / "module.py").write_text(new_source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(main), "add", "module.py"], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "new"], check=True)
+
+    worktree = tmp_path / "worktree"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", str(worktree)], check=True)
+    worktree_id = resolve_worktree_id(str(worktree))
+    db_paths = {
+        primary_id: str(tmp_path / "primary.sqlite"),
+        worktree_id: str(tmp_path / "worktree.sqlite"),
+    }
+    files = {str(worktree): [("module.py", new_source)]}
+    coordinator, write_queue, db_path_for = _make_coordinator(
+        tmp_path, files_by_repo=files, db_paths=db_paths
+    )
+    _index_files_once_directly(db_path_for(primary_id), [("module.py", old_source)])
+
+    coordinator.register(worktree_id, str(worktree))
+
+    assert _wait_until(lambda: coordinator.repo_ready(worktree_id)), "legacy seed fallback never became ready"
+    symbols = SymbolStore(db_path_for(worktree_id)).list_by_path("module.py")
+    assert [symbol.qualname for symbol in symbols] == ["", "new_symbol"]
     write_queue.close()

@@ -191,6 +191,23 @@ def _read_source_files(
     return files
 
 
+def read_repo_files(repo_root: str, rel_paths: Iterable[str]) -> Iterable[tuple[str, str]]:
+    """Read only the requested source paths under a repository root."""
+    root = os.path.realpath(repo_root)
+    is_ignored = ignore.get_ignore_matcher(repo_root).matches
+    for rel_path in rel_paths:
+        if not rel_path.endswith(_SOURCE_EXTENSION) or is_ignored(rel_path):
+            continue
+        absolute_path = os.path.realpath(os.path.join(root, rel_path))
+        try:
+            if os.path.commonpath((root, absolute_path)) != root:
+                continue
+            with open(absolute_path, encoding="utf-8") as source_file:
+                yield rel_path, source_file.read()
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+
+
 def walk_repo(repo_root: str) -> Iterable[tuple[str, str]]:
     is_ignored = ignore.get_ignore_matcher(repo_root).matches
     return _read_source_files(repo_root, path_glob=None, is_ignored=is_ignored).items()

@@ -1,12 +1,14 @@
 import logging
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 
 from acie.daemon import ignore
 from acie.daemon.watcher import RepoWatcher, WatcherRegistry, _DebouncedEventHandler, make_reindex_job
 from acie.daemon.write_queue import WriteQueue
+from acie.repo_id import resolve_repo_id, resolve_worktree_id
 from acie.storage.file_state_store import FileStateStore
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.symbol_store import SymbolStore
@@ -427,3 +429,53 @@ def test_repo_watcher_calls_injected_hook_once_after_a_debounced_batch(tmp_path)
         assert set(write_queue.submitted_repo_keys) == {"repo-id"}
     finally:
         watcher.stop(timeout=2)
+def test_watcher_registry_closes_multiple_real_worktree_watchers_and_indexes_each_once(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(main), "config", "user.name", "T"], check=True)
+    (main / "seed.py").write_text("def seed():\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(main), "add", "seed.py"], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "-m", "initial"], check=True)
+
+    worktree_a = tmp_path / "worktree-a"
+    worktree_b = tmp_path / "worktree-b"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-b", "worktree-a", str(worktree_a)], check=True)
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-b", "worktree-b", str(worktree_b)], check=True)
+    repo_id = resolve_repo_id(str(main))
+    worktree_a_id = resolve_worktree_id(str(worktree_a))
+    worktree_b_id = resolve_worktree_id(str(worktree_b))
+    assert resolve_repo_id(str(worktree_a)) == repo_id
+    assert resolve_repo_id(str(worktree_b)) == repo_id
+    assert worktree_a_id != worktree_b_id
+
+    db_paths = {
+        worktree_a_id: str(tmp_path / "worktree-a.sqlite"),
+        worktree_b_id: str(tmp_path / "worktree-b.sqlite"),
+    }
+    write_queue = WriteQueue(db_path_for=lambda worktree_id: db_paths[worktree_id])
+    registry = WatcherRegistry(write_queue)
+    registry.register(worktree_a_id, str(worktree_a))
+    registry.register(worktree_b_id, str(worktree_b))
+    watchers = [registry._watchers[str(worktree_a)], registry._watchers[str(worktree_b)]]
+    try:
+        assert _wait_until(lambda: all(watcher._observer.is_alive() for watcher in watchers))
+        _write(str(worktree_a), "a.py", "def only_a():\n    pass\n")
+        _write(str(worktree_b), "b.py", "def only_b():\n    pass\n")
+
+        assert _wait_until(
+            lambda: SymbolStore(db_paths[worktree_a_id]).list_by_path("a.py")
+            and SymbolStore(db_paths[worktree_b_id]).list_by_path("b.py")
+        )
+        assert [symbol.qualname for symbol in SymbolStore(db_paths[worktree_a_id]).list_by_path("a.py")] == ["", "only_a"]
+        assert [symbol.qualname for symbol in SymbolStore(db_paths[worktree_b_id]).list_by_path("b.py")] == ["", "only_b"]
+
+        started = time.monotonic()
+        registry.close(timeout=2)
+        elapsed = time.monotonic() - started
+        assert elapsed < 2
+        assert all(not watcher._observer.is_alive() for watcher in watchers)
+    finally:
+        registry.close(timeout=2)
+        write_queue.close(timeout=2)
