@@ -144,30 +144,38 @@ def _daemon_stop() -> int:
     return 0 if response is not None and response.get("ok") is True else 1
 
 
-def _ensure_daemon() -> bool:
+def _ensure_daemon(election_port: int | None = None) -> bool:
     discovery_path = _discovery_path()
     if daemon_is_running(discovery_path):
         return True
     for attempt in range(_STARTUP_ATTEMPTS):
         if attempt % _RESPAWN_EVERY_ATTEMPTS == 0:
-            _spawn_daemon()
+            _spawn_daemon(election_port=election_port)
         time.sleep(_STARTUP_POLL_SECONDS)
         if daemon_is_running(discovery_path):
             return True
     return False
 
 
-def _spawn_daemon() -> None:
+def _spawn_daemon(election_port: int | None = None) -> None:
     state_dir = os.path.dirname(_discovery_path())
     os.makedirs(state_dir, exist_ok=True)
     log_path = os.path.join(state_dir, "daemon.log")
     with open(log_path, "ab") as log:
+        popen_kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": log,
+            "stderr": log,
+            "start_new_session": True,
+        }
+        if election_port is not None:
+            popen_kwargs["env"] = {
+                **os.environ,
+                "ACIE_DAEMON_ELECTION_PORT": str(election_port),
+            }
         proc = subprocess.Popen(
             [sys.executable, "-m", "acie.daemon.server"],
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=log,
-            start_new_session=True,
+            **popen_kwargs,
         )
     # Reaps the child the moment it exits (e.g. it lost the election-port
     # race and exited immediately) so it never sits as a zombie for the

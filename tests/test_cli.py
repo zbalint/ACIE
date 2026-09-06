@@ -2,6 +2,7 @@ import io
 import json
 import os
 import signal
+import socket
 import threading
 import time
 
@@ -13,8 +14,17 @@ from acie.cli import main
 from acie.daemon.client import daemon_is_running
 from acie.daemon.discovery import read_discovery_file, write_discovery_file
 from acie.daemon.protocol import build_error_response, build_success_response
-from acie.daemon.server import DaemonServer
+from acie.daemon.server import DaemonServer, main as run_daemon
 from acie.scan import ScanResult
+
+
+def _free_port() -> int:
+    """Reserves an ephemeral port number, then releases it immediately."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
 def test_daemon_status_json_reports_stopped_when_no_discovery_file_exists(
@@ -119,8 +129,56 @@ def test_spawn_daemon_reaps_its_subprocess_so_it_never_zombies(monkeypatch, tmp_
     assert waited.wait(timeout=2), "spawned subprocess was never reaped"
 
 
+def test_spawn_daemon_adds_election_port_to_inherited_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("INHERITED_FOR_DAEMON_TEST", "keep-me")
+    captured = {}
+
+    class FakeProc:
+        def wait(self):
+            return None
+
+    def fake_popen(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(acie.cli.subprocess, "Popen", fake_popen)
+
+    acie.cli._spawn_daemon(election_port=43123)
+
+    child_env = captured["kwargs"]["env"]
+    assert child_env["ACIE_DAEMON_ELECTION_PORT"] == "43123"
+    assert child_env["INHERITED_FOR_DAEMON_TEST"] == "keep-me"
+
+
+def test_ensure_daemon_passes_election_port_to_spawn(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spawned_ports = []
+    running = iter((False, True))
+
+    monkeypatch.setattr(acie.cli, "daemon_is_running", lambda _: next(running))
+    monkeypatch.setattr(
+        acie.cli,
+        "_spawn_daemon",
+        lambda election_port=None: spawned_ports.append(election_port),
+    )
+    monkeypatch.setattr(acie.cli, "_STARTUP_ATTEMPTS", 1)
+    monkeypatch.setattr(acie.cli, "_STARTUP_POLL_SECONDS", 0)
+
+    assert acie.cli._ensure_daemon(election_port=43123)
+    assert spawned_ports == [43123]
+
+
+def test_daemon_server_rejects_non_integer_election_port(monkeypatch):
+    monkeypatch.setenv("ACIE_DAEMON_ELECTION_PORT", "not-an-integer")
+
+    with pytest.raises(ValueError, match="ACIE_DAEMON_ELECTION_PORT must be an integer"):
+        run_daemon()
+
+
 def test_daemon_start_spawns_a_daemon_and_stop_shuts_it_down(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("ACIE_DAEMON_ELECTION_PORT", str(_free_port()))
     discovery_path = str(tmp_path / ".acie" / "daemon.json")
 
     try:
@@ -142,6 +200,7 @@ def test_daemon_stop_actually_terminates_the_os_process(monkeypatch, tmp_path):
     # test asserts the actual OS process exits, not just the discovery-file
     # view of liveness.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("ACIE_DAEMON_ELECTION_PORT", str(_free_port()))
     discovery_path = str(tmp_path / ".acie" / "daemon.json")
     daemon_pid = None
 
