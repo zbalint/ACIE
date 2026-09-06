@@ -56,6 +56,8 @@ def resolve_repo_id(repo_path: str) -> str | None:
 
     digest = hashlib.sha256(common_dir.encode("utf-8")).hexdigest()
     return digest[:_REPO_ID_HEX_LENGTH]
+
+
 def is_primary_worktree(repo_path: str) -> bool:
     git_dir = _resolve_git_dir(repo_path, "--git-dir")
     common_dir = resolve_git_common_dir(repo_path)
@@ -108,6 +110,14 @@ def resolve_index_db_path(repo_path: str, base_dir: str | None = None) -> str | 
     worktree_dir = os.path.join(state_dir, "worktrees", worktree_id)
     os.makedirs(worktree_dir, exist_ok=True)
     return os.path.join(worktree_dir, "index.sqlite")
+
+
+def resolve_worktree_state_dir(worktree_id: str, base_dir: str) -> str:
+    """Returns the state directory for worktree_id under base_dir."""
+    repo_id, separator, worktree_suffix = worktree_id.partition("-")
+    if separator and len(repo_id) == _REPO_ID_HEX_LENGTH and len(worktree_suffix) == _REPO_ID_HEX_LENGTH:
+        return os.path.join(base_dir, "repos", repo_id, "worktrees", worktree_id)
+    return os.path.join(base_dir, "repos", worktree_id)
 
 
 def to_repo_relative(file_path: str, repo_root: str) -> str | None:

@@ -12,8 +12,8 @@ ACIE is completely standalone and must never depend on SALTMDB, a separate, unre
 
 - **Determinism is the north star.** Tree-sitter's AST-based parsing is the deterministic baseline. LSP (`basedpyright`) is a core dependency so it's always installed, but its output is always an opportunistic, versioned, cache-stamped enrichment layer on top of the tree-sitter baseline — it is never a correctness dependency for the core graph. If the LSP subprocess is unavailable or fails for any reason (missing binary, crash, timeout), ACIE still works, just with less precision on semantic (as opposed to purely structural) facts.
 - **No embeddings or LLM calls are required for core functionality**, and they should be avoided wherever possible. "Structural search" specifically means AST-pattern search using tree-sitter's own native `.scm` query language — not semantic/fuzzy/embedding-based search, and not ast-grep (a different, separately-versioned tool) — to avoid maintaining a second independently-versioned parser per language.
-- **Exactly one ACIE daemon runs per computer.** It owns the write queue(s) — one dedicated writer thread and queue per repo, see `DAEMON.md` — and all `.acie`/`~/.acie` on-disk state. Every agent-spawned MCP server process is a client of this one daemon, never a direct writer to the SQLite files. This mirrors the daemon pattern already used by the separate, unrelated SALTMDB project on this machine — cited as prior art/precedent only, not a dependency.
-- **State layout**: `<repo>/.acie/config.json` is user-owned, hand-editable, committable configuration (language overrides, ignore rules). `~/.acie/repos/<repo-id>/{index.sqlite, manifest.json, cache/}` is derived/generated state — one SQLite file per repository, never a single shared global database — keyed by a canonical repo identity resolved from the repo's `.git` common directory, so that multiple git worktrees of the same repository resolve to the same `<repo-id>` instead of duplicating state or colliding.
+- **Exactly one ACIE daemon runs per computer.** It owns the write queue(s) — one dedicated writer thread and queue per indexed worktree, see `DAEMON.md` — and all `.acie`/`~/.acie` on-disk state. Every agent-spawned MCP server process is a client of this one daemon, never a direct writer to the SQLite files. This mirrors the daemon pattern already used by the separate, unrelated SALTMDB project on this machine — cited as prior art/precedent only, not a dependency.
+- **State layout**: `<repo>/.acie/config.json` is user-owned, hand-editable, committable configuration (language overrides, ignore rules). The primary worktree keeps today's `~/.acie/repos/<repo-id>/{index.sqlite, manifest.json, cache/}` derived state, while each linked worktree gets its own `~/.acie/repos/<repo-id>/worktrees/<worktree-id>/index.sqlite`. `repo_id` groups worktrees by their `.git` common directory; each linked worktree's distinct `worktree_id` keeps its index state isolated.
 - **Hook installation is opt-in and composable.** Whether installing git-side hooks or agent-side tool-use hooks, ACIE must never silently overwrite a user's existing hook tooling (e.g. husky, pre-commit, lefthook).
 - ACIE's unified-IR-with-field-level-provenance design (see "Provenance & Confidence Semantics") is genuinely novel — no surveyed code-intelligence tool does exactly this (see "Prior Art Surveyed").
 
@@ -39,18 +39,19 @@ ACIE is completely standalone and must never depend on SALTMDB, a separate, unre
 
 ## System Architecture
 
-Exactly one daemon process runs per computer, single write queue, sole owner of all `.acie`/`~/.acie` state. Agent-spawned MCP server processes are thin clients to this daemon — they never touch the SQLite files directly. This avoids naive multi-process SQLite write contention/corruption, and avoids piling up N separate per-repo daemon processes on a machine that works across many repos.
+Exactly one daemon process runs per computer, with one dedicated writer thread and FIFO queue per indexed worktree, and is the sole owner of all `.acie`/`~/.acie` state. Agent-spawned MCP server processes are thin clients to this daemon — they never touch the SQLite files directly. This avoids naive multi-process SQLite write contention/corruption, and avoids piling up N separate per-repo daemon processes on a machine that works across many repos.
 
 On-disk layout:
 
 ```
 <repo>/.acie/config.json               # in-repo, user-owned, committable config
-~/.acie/repos/<repo-id>/index.sqlite   # one SQLite file per repo (derived state)
-~/.acie/repos/<repo-id>/manifest.json  # per-repo manifest (schema/IR version tracking)
-~/.acie/repos/<repo-id>/cache/         # per-repo cache directory
+~/.acie/repos/<repo-id>/index.sqlite                       # primary worktree's derived state
+~/.acie/repos/<repo-id>/worktrees/<worktree-id>/index.sqlite # linked worktree's derived state
+~/.acie/repos/<repo-id>/manifest.json                      # repo-level manifest (schema/IR version tracking)
+~/.acie/repos/<repo-id>/cache/                             # repo-level cache directory
 ```
 
-`<repo-id>` is derived from the repo's `.git` common directory, so that git worktrees of one logical repository share one `<repo-id>` rather than duplicating or colliding.
+`repo_id` is derived from the repo's `.git` common directory, so the primary worktree keeps today's `repo_id` unchanged while each linked worktree gets a distinct `worktree_id` derived from `(repo_id, realpath(repo_root))`. Each worktree has its own index, write queue, bootstrap-readiness flag, and `Observer`; the linked index remains nested under the primary `repo_id` directory. `resolve_repo_root` canonicalizes symlink/realpath spellings of the same worktree, so they collapse to one `worktree_id` and one `Observer`.
 
 ACIE indexes only git repositories. This is a permanent, intentional product constraint: every indexed repo must resolve a git common directory, and non-git directories are unsupported rather than a partially supported mode.
 
@@ -58,7 +59,7 @@ Rejected alternatives: a pure in-repo `.acie/index.sqlite` (risk of accidental c
 
 ## Daemon & MCP-Server Design
 
-The detailed design for how the daemon and each agent-spawned MCP-server process actually talk to each other — process lifecycle/auto-spawn, IPC transport and wire framing, the RPC request/response envelope, dispatch of the 9 MCP tools, repo/session identity, bootstrap-indexing behavior, per-repo write-queue concurrency, the auth-token stance, shutdown semantics, and the CLI subcommand surface — is locked in **[`DAEMON.md`](./DAEMON.md)**, not restated here. That document assumes every principle above (one daemon per computer, this on-disk layout, the 4-tier indexing precedence below, the `notify-hook` contract) rather than re-deciding it.
+The detailed design for how the daemon and each agent-spawned MCP-server process actually talk to each other — process lifecycle/auto-spawn, IPC transport and wire framing, the RPC envelope and dispatch, repo/session identity, bootstrap-indexing behavior, per-worktree write-queue concurrency, the auth-token stance, shutdown semantics, and the CLI subcommand surface — is locked in **[`DAEMON.md`](./DAEMON.md)**, not restated here. That document assumes every principle above (one daemon per computer, this on-disk layout, the 4-tier indexing precedence below, the `notify-hook` contract) rather than re-deciding it.
 
 ## Canonical IR / Data Model
 
@@ -214,7 +215,7 @@ The following existing code-intelligence tools were studied as prior art (not bl
 
 Deferred to implementation time or to a future, narrower planning effort — not resolved here:
 
-- Monorepo, multi-language-in-one-repo, generated-file, git-worktree, and temporarily-broken-repo handling. Explicitly deferred; the likely v0 stance is "single-language, single-root repos only" but this is not locked. The `repo_path`-vs-canonical-`resolve_repo_id` keying inconsistency itself is fixed (SALTMDB f4bdfc9d/decision 10's follow-up, grilled and shipped 2026-09-02): `WriteQueue`/`BootstrapCoordinator` now key their in-memory state on `resolve_repo_id`'s canonical, worktree-collapsing value, so a symlink and its realpath'd twin (two spellings of the identical worktree) share one writer thread and one bootstrap-readiness flag — and so do two genuinely distinct worktrees of one repo, since they share the same `repo_id`. `WatcherRegistry` keys on the already-canonical `resolve_repo_root` instead: the symlink/realpath'd spelling of one worktree still collapses to one filesystem watch (no duplicate `Observer` on the same directory), but two genuinely distinct worktrees intentionally each get their own — `repo_root` is the actual directory being watched, not a repo-wide identity, so leaving one worktree unwatched would be the bug, not the fix. What remains unsolved, by design, is *walk semantics* once two live worktrees genuinely share that state: whichever worktree registers with the daemon first runs bootstrap's walk-and-index pass (using its own on-disk content); a second worktree sharing the same `repo_id` sees `repo_ready()` already true/in-progress and is never separately walked, even if its checked-out branch has different content at the same paths. Both worktrees' watchers still feed live edits into the one shared index. Fixing that — deciding what "the index" means when worktrees diverge — is a real product question, not a keying bug, and stays out of v0 scope here.
+- Monorepo, multi-language-in-one-repo, generated-file, and temporarily-broken-repo handling remain deferred. Git-worktree handling is implemented: the primary keeps its `repo_id` identity and index path; each linked worktree gets its own `worktree_id`, nested index, write queue, bootstrap-readiness flag, and `Observer`, with seed-and-diff bootstrap when the primary is ready and full-walk fallback otherwise. Symlink/realpath spellings of one worktree resolve to the same canonical `repo_root`, `worktree_id`, and `Observer`.
 - The exact LSP-availability detection/diagnostic surface (something like an `acie doctor` command) and what happens when a detected LSP server is the wrong version or behaving flakily.
 - The language-adapter plugin interface shape, needed for adding a second language after the Python-only MVP.
 - Schema/IR versioning and auto-rebuild-on-upgrade mechanics for `manifest.json`.

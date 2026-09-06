@@ -22,7 +22,7 @@ from acie.daemon.server import DaemonServer
 from acie.daemon.staleness import extract_staleness_target
 from acie.daemon.watcher import WatcherRegistry, make_reindex_job
 from acie.daemon.write_queue import WriteQueue
-from acie.repo_id import resolve_repo_root, resolve_worktree_id
+from acie.repo_id import resolve_repo_root, resolve_worktree_id, resolve_worktree_state_dir
 from acie.daemon.repo_fingerprint import compute_repo_fingerprint
 from acie.storage.connection import open_connection
 from acie.storage.relation_store import RelationStore
@@ -157,11 +157,7 @@ def create_daemon(
     state_dir = state_dir or os.path.expanduser("~/.acie")
 
     def db_path_for(worktree_id: str) -> str:
-        repo_id, separator, worktree_suffix = worktree_id.partition("-")
-        if separator and len(repo_id) == 16 and len(worktree_suffix) == 16:
-            repo_dir = os.path.join(state_dir, "repos", repo_id, "worktrees", worktree_id)
-        else:
-            repo_dir = os.path.join(state_dir, "repos", worktree_id)
+        repo_dir = resolve_worktree_state_dir(worktree_id, state_dir)
         os.makedirs(repo_dir, exist_ok=True)
         return os.path.join(repo_dir, "index.sqlite")
 

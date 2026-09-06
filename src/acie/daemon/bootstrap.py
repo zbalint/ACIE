@@ -20,11 +20,13 @@ from datetime import datetime, timezone
 from typing import Callable, Iterable
 
 from acie.daemon.write_queue import WriteQueue
+from acie.daemon.dispatch import read_repo_files
 from acie.daemon.repo_fingerprint import compute_changed_relpaths, compute_repo_fingerprint, compute_repo_head_sha
 from acie.indexer import IndexResult, index_file
 from acie.repo_id import is_primary_worktree, resolve_git_common_dir, resolve_worktree_id
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
+from acie.storage.connection import open_connection
 from acie.storage.symbol_store import SymbolStore
 
 
@@ -52,7 +54,7 @@ class BootstrapCoordinator:
         self._write_queue = write_queue
         self._db_path_for = db_path_for
         self._walk_repo = walk_repo
-        self._read_files = read_files
+        self._read_files = read_files if read_files is not None else read_repo_files
         self._on_indexed = on_indexed
         self._lock = threading.Lock()
         self._ready: set[str] = set()
@@ -204,6 +206,7 @@ class BootstrapCoordinator:
         self._run_indexing_pass(
             repo_id, files, on_pass_done=lambda: self._run_indexing_pass(repo_id, files, on_pass_done=on_bootstrap_done)
         )
+
     def _seed_worktree(self, repo_id: str, repo_root: str) -> list[tuple[str, str | None]] | None:
         if is_primary_worktree(repo_root):
             return None
@@ -218,7 +221,7 @@ class BootstrapCoordinator:
         source_db = self._db_path_for(primary_id)
         target_db = self._db_path_for(repo_id)
         try:
-            conn = sqlite3.connect(source_db)
+            conn = open_connection(source_db)
             try:
                 meta = IndexMetaStore(conn=conn)
                 previous_head_sha = meta.get_last_indexed_head_sha()
@@ -250,8 +253,7 @@ class BootstrapCoordinator:
                 return None
             target_changed_paths = set(target_diff)
             changed_paths = sorted(primary_changed_paths | target_changed_paths)
-            read_files = self._read_files or self._read_changed_files
-            files_by_path = dict(read_files(repo_root, changed_paths))
+            files_by_path = dict(self._read_files(repo_root, changed_paths))
             files: list[tuple[str, str | None]] = []
             for path in changed_paths:
                 if path in files_by_path:
@@ -263,28 +265,14 @@ class BootstrapCoordinator:
         except (OSError, sqlite3.Error):
             return None
 
-    @staticmethod
-    def _read_changed_files(repo_root: str, rel_paths: Iterable[str]) -> Iterable[tuple[str, str]]:
-        root = os.path.realpath(repo_root)
-        for rel_path in rel_paths:
-            if not rel_path.endswith(".py") or any(part.startswith(".") for part in rel_path.split(os.sep)):
-                continue
-            absolute_path = os.path.realpath(os.path.join(root, rel_path))
-            try:
-                if os.path.commonpath((root, absolute_path)) != root:
-                    continue
-                with open(absolute_path, encoding="utf-8") as source_file:
-                    yield rel_path, source_file.read()
-            except (OSError, UnicodeDecodeError, ValueError):
-                continue
 
     @staticmethod
     def _copy_index(source_db: str, target_db: str) -> None:
         parent = os.path.dirname(target_db)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        source = sqlite3.connect(source_db)
-        target = sqlite3.connect(target_db)
+        source = open_connection(source_db)
+        target = open_connection(target_db)
         try:
             source.backup(target)
         finally:
@@ -401,6 +389,7 @@ class BootstrapCoordinator:
 
         for path, source_text in files:
             self._write_queue.submit(repo_id, make_index_job(path, source_text)).add_done_callback(on_job_done)
+
     def _persist_head_sha(self, repo_id: str, repo_root: str, on_done: Callable[[], None]) -> None:
         head_sha = compute_repo_head_sha(repo_root)
         if head_sha is None:
@@ -436,6 +425,8 @@ def make_index_job(path: str, source_text: str | None):
             index_meta_store=index_meta_store,
         )
         if source_text is None:
+            # `index_file(..., "")` retains the stable module symbol for an
+            # empty-but-present file; a deleted file has no module symbol.
             for symbol in symbol_store.list_by_path(path):
                 symbol_store.delete(symbol.id, observed_at=observed_at)
         return result

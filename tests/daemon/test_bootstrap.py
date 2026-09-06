@@ -832,6 +832,8 @@ def test_linked_worktree_seeds_primary_index_and_reindexes_only_changed_paths(tm
     assert [s.qualname for s in SymbolStore(db_path_for(worktree_id)).list_by_path("changed.py")] == ["", "changed"]
     assert IndexMetaStore(db_path_for(worktree_id)).get_last_indexed_head_sha() == head_sha
     write_queue.close()
+
+
 def test_linked_worktree_tombstones_a_seeded_file_deleted_in_the_worktree(tmp_path):
     main = tmp_path / "main"
     main.mkdir()
@@ -870,6 +872,8 @@ def test_linked_worktree_tombstones_a_seeded_file_deleted_in_the_worktree(tmp_pa
     assert _wait_until(lambda: coordinator.repo_ready(worktree_id)), "linked worktree never became ready"
     assert SymbolStore(db_path_for(worktree_id)).list_by_path("same.py") == []
     write_queue.close()
+
+
 def test_seed_fallback_does_not_leave_primary_only_deleted_symbols(tmp_path, monkeypatch):
     main = tmp_path / "main"
     main.mkdir()
@@ -909,6 +913,8 @@ def test_seed_fallback_does_not_leave_primary_only_deleted_symbols(tmp_path, mon
     assert [symbol.qualname for symbol in SymbolStore(db_path_for(worktree_id)).list_by_path("new.py")] == ["", "discovered"]
     assert SymbolStore(db_path_for(worktree_id)).list_by_path("same.py") == []
     write_queue.close()
+
+
 def test_linked_worktree_tombstones_a_seeded_untracked_file_missing_from_worktree(tmp_path):
     main = tmp_path / "main"
     main.mkdir()
@@ -947,6 +953,8 @@ def test_linked_worktree_tombstones_a_seeded_untracked_file_missing_from_worktre
     assert _wait_until(lambda: coordinator.repo_ready(worktree_id)), "linked worktree never became ready"
     assert SymbolStore(db_path_for(worktree_id)).list_by_path("untracked.py") == []
     write_queue.close()
+
+
 def test_linked_worktree_does_not_seed_a_dirty_primary_index_into_clean_worktree(tmp_path):
     main = tmp_path / "main"
     main.mkdir()
@@ -989,6 +997,8 @@ def test_linked_worktree_does_not_seed_a_dirty_primary_index_into_clean_worktree
     symbols = SymbolStore(db_path_for(worktree_id)).list_by_path("module.py")
     assert [symbol.qualname for symbol in symbols] == ["", "clean_symbol"]
     write_queue.close()
+
+
 def test_linked_worktree_falls_back_when_primary_head_metadata_is_missing(tmp_path):
     main = tmp_path / "main"
     main.mkdir()

@@ -6,6 +6,7 @@ import threading
 import time
 
 from acie.daemon import ignore
+from acie.daemon import watcher as watcher_module
 from acie.daemon.watcher import RepoWatcher, WatcherRegistry, _DebouncedEventHandler, make_reindex_job
 from acie.daemon.write_queue import WriteQueue
 from acie.repo_id import resolve_repo_id, resolve_worktree_id
@@ -282,16 +283,17 @@ class _FakeInstantObserver:
 
 
 class _RecordingWriteQueue:
-    """A minimal WriteQueue double that just records which repo_key each
-    submit() call was for -- used where a test cares only about whether/
-    what RepoWatcher submitted, not real write-queue execution.
-    """
+    """A WriteQueue double that records repo keys and optionally delegates."""
 
-    def __init__(self) -> None:
+    def __init__(self, delegate=None) -> None:
+        self._delegate = delegate
         self.submitted_repo_keys: list[str] = []
 
     def submit(self, repo_key, fn):  # noqa: ANN001 -- test double, matches WriteQueue.submit's shape loosely.
         self.submitted_repo_keys.append(repo_key)
+        if self._delegate is None:
+            return None
+        return self._delegate.submit(repo_key, fn)
 
 
 def test_repo_watcher_stop_flushes_a_pending_debounce_timer_before_returning():
@@ -429,6 +431,8 @@ def test_repo_watcher_calls_injected_hook_once_after_a_debounced_batch(tmp_path)
         assert set(write_queue.submitted_repo_keys) == {"repo-id"}
     finally:
         watcher.stop(timeout=2)
+
+
 def test_watcher_registry_closes_multiple_real_worktree_watchers_and_indexes_each_once(tmp_path):
     main = tmp_path / "main"
     main.mkdir()
@@ -449,13 +453,16 @@ def test_watcher_registry_closes_multiple_real_worktree_watchers_and_indexes_eac
     assert resolve_repo_id(str(worktree_a)) == repo_id
     assert resolve_repo_id(str(worktree_b)) == repo_id
     assert worktree_a_id != worktree_b_id
+    assert worktree_a_id is not None
+    assert worktree_b_id is not None
 
     db_paths = {
         worktree_a_id: str(tmp_path / "worktree-a.sqlite"),
         worktree_b_id: str(tmp_path / "worktree-b.sqlite"),
     }
     write_queue = WriteQueue(db_path_for=lambda worktree_id: db_paths[worktree_id])
-    registry = WatcherRegistry(write_queue)
+    recording_queue = _RecordingWriteQueue(write_queue)
+    registry = WatcherRegistry(recording_queue)
     registry.register(worktree_a_id, str(worktree_a))
     registry.register(worktree_b_id, str(worktree_b))
     watchers = [registry._watchers[str(worktree_a)], registry._watchers[str(worktree_b)]]
@@ -468,8 +475,12 @@ def test_watcher_registry_closes_multiple_real_worktree_watchers_and_indexes_eac
             lambda: SymbolStore(db_paths[worktree_a_id]).list_by_path("a.py")
             and SymbolStore(db_paths[worktree_b_id]).list_by_path("b.py")
         )
+        time.sleep(watcher_module._DEBOUNCE_SECONDS + 0.1)
         assert [symbol.qualname for symbol in SymbolStore(db_paths[worktree_a_id]).list_by_path("a.py")] == ["", "only_a"]
         assert [symbol.qualname for symbol in SymbolStore(db_paths[worktree_b_id]).list_by_path("b.py")] == ["", "only_b"]
+        assert recording_queue.submitted_repo_keys.count(worktree_a_id) == 1
+        assert recording_queue.submitted_repo_keys.count(worktree_b_id) == 1
+        assert len(recording_queue.submitted_repo_keys) == 2
 
         started = time.monotonic()
         registry.close(timeout=2)
