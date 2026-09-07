@@ -294,6 +294,95 @@ def test_root_matching_no_files_returns_an_empty_view_not_an_error():
     assert result["edges"] == []
 
 
+def test_absolute_root_equal_to_repo_root_scopes_to_the_whole_repo(tmp_path):
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "src/one/a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "tests/two/b.py", "def b():\n    pass\n")
+
+    result = architecture(
+        symbol_store, relation_store, index_meta_store,
+        root=str(tmp_path), repo_root=str(tmp_path),
+    )
+
+    assert {node["path"] for node in result["nodes"]} == {"src/one/a.py", "tests/two/b.py"}
+
+
+def test_absolute_root_under_repo_root_is_normalized_to_the_equivalent_relative_scope(tmp_path):
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/sub/a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/subx/b.py", "def b():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/other/c.py", "def c():\n    pass\n")
+
+    expected = architecture(symbol_store, relation_store, index_meta_store, root="pkg/sub")
+    result = architecture(
+        symbol_store, relation_store, index_meta_store,
+        root=str(tmp_path / "pkg" / "sub"), repo_root=str(tmp_path),
+    )
+
+    assert result["nodes"] == expected["nodes"]
+    assert result["edges"] == expected["edges"]
+
+
+def test_absolute_root_outside_repo_root_raises_invalid_argument_error(tmp_path):
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "def a():\n    pass\n")
+    root = str(tmp_path.parent / f"{tmp_path.name}-outside")
+    repo_root = str(tmp_path)
+
+    try:
+        architecture(
+            symbol_store, relation_store, index_meta_store,
+            root=root, repo_root=repo_root,
+        )
+        assert False, "expected InvalidArgumentError"
+    except InvalidArgumentError as exc:
+        assert root in str(exc)
+        assert repo_root in str(exc)
+
+
+def test_absolute_root_with_no_repo_root_supplied_raises_invalid_argument_error(tmp_path):
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/a.py", "def a():\n    pass\n")
+    root = str(tmp_path)
+
+    try:
+        architecture(symbol_store, relation_store, index_meta_store, root=root)
+        assert False, "expected InvalidArgumentError"
+    except InvalidArgumentError as exc:
+        assert "repo_root" in str(exc)
+
+
+def test_relative_root_behavior_is_unchanged_when_repo_root_is_also_supplied(tmp_path):
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "pkg/sub/a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/subx/b.py", "def b():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "pkg/other/c.py", "def c():\n    pass\n")
+
+    expected = architecture(symbol_store, relation_store, index_meta_store, root="pkg/sub")
+    result = architecture(
+        symbol_store, relation_store, index_meta_store,
+        root="pkg/sub", repo_root=str(tmp_path),
+    )
+
+    assert result["nodes"] == expected["nodes"]
+    assert result["edges"] == expected["edges"]
+
+
+def test_root_none_is_unaffected_by_repo_root_being_supplied(tmp_path):
+    symbol_store, relation_store, index_meta_store = _stores()
+    _index(symbol_store, relation_store, index_meta_store, "a.py", "def a():\n    pass\n")
+    _index(symbol_store, relation_store, index_meta_store, "b/c.py", "def c():\n    pass\n")
+
+    expected = architecture(symbol_store, relation_store, index_meta_store, root=None)
+    result = architecture(
+        symbol_store, relation_store, index_meta_store,
+        root=None, repo_root=str(tmp_path),
+    )
+
+    assert result["nodes"] == expected["nodes"]
+    assert result["edges"] == expected["edges"]
+
+
 def test_an_import_resolving_outside_the_scoped_root_produces_no_edge_and_is_not_external():
     # pkg/sub/a.py imports pkg/other/c.py -- resolves internally, but
     # pkg/other/c.py is out of root="pkg/sub" scope, so no edge is rendered
