@@ -55,7 +55,7 @@ class SymbolStore:
         # match) must be too, or "Foo" and "foo" would collide.
         self._conn.execute("PRAGMA case_sensitive_like = ON")
 
-    def upsert(self, symbol: Symbol) -> None:
+    def upsert(self, symbol: Symbol, *, commit: bool = True) -> None:
         existing = self.get(symbol.id)
         content_changed = existing is None or _content_differs(existing, symbol)
 
@@ -119,7 +119,8 @@ class SymbolStore:
                     symbol.provenance.observed_at,
                 ),
             )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def history(self, symbol_id: str) -> list[Symbol]:
         rows = self._conn.execute(
@@ -132,7 +133,7 @@ class SymbolStore:
         ).fetchall()
         return [_row_to_symbol(row) for row in rows]
 
-    def delete(self, symbol_id: str, observed_at: str) -> None:
+    def delete(self, symbol_id: str, observed_at: str, *, commit: bool = True) -> None:
         self._conn.execute("DELETE FROM symbols_live WHERE id = ?", (symbol_id,))
         self._conn.execute(
             """
@@ -143,7 +144,8 @@ class SymbolStore:
             """,
             (symbol_id, observed_at),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def list_by_path(self, path: str) -> list[Symbol]:
         rows = self._conn.execute(

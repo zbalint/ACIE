@@ -96,7 +96,7 @@ class RelationStore:
             self._conn.execute("DROP TABLE relations_live")
             self._conn.execute("ALTER TABLE relations_live__migrating RENAME TO relations_live")
 
-    def upsert(self, relation: Relation) -> None:
+    def upsert(self, relation: Relation, *, commit: bool = True) -> None:
         existing = self.get(
             source=relation.source,
             target=relation.target,
@@ -153,7 +153,8 @@ class RelationStore:
                     relation.provenance.observed_at,
                 ),
             )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def history(
         self,
@@ -212,6 +213,7 @@ class RelationStore:
         site_line: int,
         site_col: int,
         observed_at: str,
+        commit: bool = True,
     ) -> None:
         self._conn.execute(
             """
@@ -230,7 +232,8 @@ class RelationStore:
             """,
             (source, target, predicate, site_file, site_line, site_col, observed_at),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def list_by_site_file(
         self,
