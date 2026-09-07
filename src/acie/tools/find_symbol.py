@@ -1,7 +1,7 @@
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.symbol_store import SymbolStore
 from acie.tools.confidence import filter_by_min_confidence
-from acie.tools.errors import StaleIndexGenerationError
+from acie.tools.errors import InvalidArgumentError, StaleIndexGenerationError
 from acie.tools.pagination import decode_cursor, filter_since, paginate
 from acie.tools.render import render_symbol
 
@@ -9,6 +9,7 @@ from acie.tools.render import render_symbol
 # implementation decision, same status as symbol_id's now-removed local
 # kind validation was before slice 2 settled where that seam belongs.
 _DEFAULT_LIMIT = 50
+_VALID_KINDS = frozenset({"module", "class", "function", "method"})
 
 
 def find_symbol(
@@ -24,15 +25,18 @@ def find_symbol(
 ) -> dict:
     """Find indexed symbols whose qualified name contains ``name``.
 
-    ``name`` is a required substring; optional ``kind`` filters by symbol-kind enum,
+    ``name`` is a required substring; optional ``kind`` filters by symbol kind,
     ``path_glob`` filters paths, ``limit`` sets the page size, ``cursor`` continues
     opaque keyset pagination, ``full`` includes confidence and provenance, and
     ``min_confidence`` filters the graded results. Results are ordered by symbol id.
-    Raises ``INVALID_ARGUMENT`` for an invalid ``min_confidence``, ``INVALID_CURSOR``
+    Raises ``INVALID_ARGUMENT`` for an invalid ``kind`` or ``min_confidence``, ``INVALID_CURSOR``
     for a malformed or semantically invalid cursor, ``INVALID_LIMIT`` for a
     non-positive limit, and ``STALE_INDEX_GENERATION`` when a cursor targets an old
     index generation.
     """
+    if kind is not None and kind not in _VALID_KINDS:
+        raise InvalidArgumentError(f"kind must be one of {sorted(_VALID_KINDS)}, got {kind!r}")
+
     index_generation = index_meta_store.current_generation()
 
     after_id = None

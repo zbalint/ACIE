@@ -73,6 +73,61 @@ def test_find_symbol_passes_kind_and_path_glob_filters_through_to_the_store():
     assert [r["id"] for r in by_path["results"]] == ["pkg/mod.py:foo#class", "pkg/mod.py:foo#function"]
 
 
+def test_find_symbol_rejects_invalid_kind():
+    symbol_store, index_meta_store = _stores_with_generation(1)
+
+    with pytest.raises(
+        InvalidArgumentError,
+        match=r"kind must be one of \['class', 'function', 'method', 'module'\], got 'bogus_kind_xyz'",
+    ):
+        find_symbol(
+            symbol_store=symbol_store,
+            index_meta_store=index_meta_store,
+            name="foo",
+            kind="bogus_kind_xyz",
+        )
+
+
+@pytest.mark.parametrize("kind", ["module", "class", "function", "method"])
+def test_find_symbol_filters_each_valid_kind(kind):
+    symbol_store, index_meta_store = _stores_with_generation(1)
+    for stored_kind in ["module", "class", "function", "method"]:
+        symbol_store.upsert(
+            _symbol(f"pkg/mod.py:foo#{stored_kind}", "pkg/mod.py", "foo", stored_kind)
+        )
+
+    envelope = find_symbol(
+        symbol_store=symbol_store,
+        index_meta_store=index_meta_store,
+        name="foo",
+        kind=kind,
+    )
+
+    assert [r["id"] for r in envelope["results"]] == [f"pkg/mod.py:foo#{kind}"]
+
+
+def test_find_symbol_kind_none_does_not_filter():
+    symbol_store, index_meta_store = _stores_with_generation(1)
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#module", "pkg/mod.py", "foo", "module"))
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#class", "pkg/mod.py", "foo", "class"))
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#function", "pkg/mod.py", "foo", "function"))
+    symbol_store.upsert(_symbol("pkg/mod.py:foo#method", "pkg/mod.py", "foo", "method"))
+
+    envelope = find_symbol(
+        symbol_store=symbol_store,
+        index_meta_store=index_meta_store,
+        name="foo",
+        kind=None,
+    )
+
+    assert [r["id"] for r in envelope["results"]] == [
+        "pkg/mod.py:foo#class",
+        "pkg/mod.py:foo#function",
+        "pkg/mod.py:foo#method",
+        "pkg/mod.py:foo#module",
+    ]
+
+
 def test_find_symbol_paginates_via_next_cursor_and_total_count_stays_stable_across_pages():
     symbol_store, index_meta_store = _stores_with_generation(1)
     symbol_store.upsert(_symbol("pkg/mod.py:foo_a#function", "pkg/mod.py", "foo_a", "function"))
