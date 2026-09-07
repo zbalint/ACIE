@@ -9,6 +9,7 @@ from acie.mcp_server import _daemon_tool
 from acie.daemon.dispatch import DISPATCH_TABLE
 
 from acie.tools.architecture import architecture
+from acie.tools.structural_search import structural_search
 
 
 def _free_port() -> int:
@@ -39,6 +40,34 @@ def test_architecture_public_schema_excludes_the_dispatch_only_repo_root_seam():
 
     assert public_names == {"root", "granularity", "node_cap", "full"}
     assert "repo_root" not in public_names
+
+def test_structural_search_daemon_wrapper_uses_extended_timeout(monkeypatch):
+    timeouts = []
+
+    def fake_request(discovery_path, *, method, repo_path, params, timeout=None):
+        timeouts.append((method, timeout))
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr("acie.mcp_server.request_daemon", fake_request)
+    call = _daemon_tool("structural_search", structural_search, "unused", "unused")
+
+    assert call(pattern="(function_definition) @fn") == {}
+    assert timeouts == [("structural_search", 10.0)]
+
+
+def test_other_daemon_tool_wrappers_keep_the_default_timeout(monkeypatch):
+    timeouts = []
+
+    def fake_request(discovery_path, *, method, repo_path, params, timeout=None):
+        timeouts.append((method, timeout))
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr("acie.mcp_server.request_daemon", fake_request)
+    call = _daemon_tool("architecture", architecture, "unused", "unused")
+
+    assert call() == {}
+    assert timeouts == [("architecture", 2.0)]
+
 
 
 def test_serve_mcp_exposes_and_routes_the_ten_tools(monkeypatch, tmp_path):

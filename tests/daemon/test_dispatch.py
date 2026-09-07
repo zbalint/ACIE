@@ -272,6 +272,30 @@ def test_dispatch_request_honors_structural_search_path_glob_by_only_reading_mat
     assert response["result"]["total_count"] == 1
     assert response["result"]["results"][0]["captures"]["func.name"][0]["text"] == "bar"
 
+def test_dispatch_request_excludes_gitignored_non_dot_directories_from_structural_search(
+    tmp_path,
+):
+    repo = _git_repo(tmp_path)
+    base_dir = tmp_path / "acie-home"
+    _index_one_file(repo, base_dir)
+    (repo / ".gitignore").write_text("vendor/\n")
+    (repo / "kept.py").write_text("def kept():\n    pass\n")
+    vendor_dir = repo / "vendor"
+    vendor_dir.mkdir()
+    (vendor_dir / "generated.py").write_text("def generated():\n    pass\n")
+
+    request = build_request(
+        "structural_search", str(repo),
+        {"pattern": "(function_definition name: (identifier) @func.name)"},
+    )
+
+    response = dispatch_request(request, repo_ready=_ALL_ALWAYS_READY, base_dir=str(base_dir))
+
+    assert response["ok"] is True
+    names = {r["captures"]["func.name"][0]["text"] for r in response["result"]["results"]}
+    assert names == {"kept"}
+
+
 
 def test_read_source_files_with_no_is_ignored_reads_everything_as_before(tmp_path):
     repo_root = tmp_path

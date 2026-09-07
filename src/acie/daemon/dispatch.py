@@ -137,7 +137,10 @@ def _call_tool(
         # reads matching files off disk, scoped by path_glob against the
         # repo root resolved from repo_path.
         repo_root = resolve_repo_root(repo_path)
-        kwargs["files"] = _read_source_files(repo_root, params.get("path_glob"))
+        is_ignored = ignore.get_ignore_matcher(repo_root).matches
+        kwargs["files"] = _read_source_files(
+            repo_root, params.get("path_glob"), is_ignored=is_ignored
+        )
     if "repo_root" in sig_params:
         # architecture's C5 layering-violation detection reads
         # `<repo_root>/.acie/config.json` (acie.layer_config) -- the same
