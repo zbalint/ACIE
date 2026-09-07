@@ -20,6 +20,8 @@ _DAEMON_INJECTED_PARAMETERS = {
     "repo_root",
 }
 
+_METHOD_TIMEOUTS: dict[str, float] = {"structural_search": 10.0}
+
 
 def create_mcp_server(*, discovery_path: str, repo_path: str, log_level: str) -> MCPServer:
     """Create an MCP server for one captured working-directory repository."""
@@ -37,7 +39,11 @@ def _daemon_tool(
 ) -> Callable[..., dict]:
     def call(**params) -> dict | CallToolResult:
         response = request_daemon(
-            discovery_path, method=method, repo_path=repo_path, params=params
+            discovery_path,
+            method=method,
+            repo_path=repo_path,
+            params=params,
+            timeout=_METHOD_TIMEOUTS.get(method, 2.0),
         )
         if response is None:
             return _error_result(
