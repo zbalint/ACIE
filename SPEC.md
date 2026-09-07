@@ -85,15 +85,56 @@ def index_file(
 
 When `prune_inferred=False`, exclude relations whose `confidence ==
 Confidence.INFERRED` from `prior_relation_keys` (equivalently: never place an
-INFERRED relation sited in `path` into `removed_relation_keys`). Everything
-else in `index_file` is unchanged:
+INFERRED relation sited in `path` into `removed_relation_keys`).
 
 - The cross-file `stale_cross_file_relations` sweep (relations elsewhere in
-  the repo targeting a symbol just removed from `path`) is **not** touched by
-  `prune_inferred` — a symbol's removal from `path` is a fact tree-sitter
+  the repo targeting a symbol just removed from `path`) is **not** exempted
+  by `prune_inferred` — a symbol's removal from `path` is a fact tree-sitter
   *can* prove (via `extract_symbols`), so a relation targeting a
   now-nonexistent symbol is genuinely dangling regardless of its confidence,
-  and should still be tombstoned exactly as today.
+  and must still be tombstoned. **This requires one correction to today's
+  implementation, not just a pass-through:** the sweep currently skips a
+  candidate via a location proxy —
+  `if relation.site_file == path: continue` — reasoning that any such
+  same-site relation was "already removed by the diff above." That proxy is
+  only valid when the same-site diff considers every confidence level, which
+  is true today but stops being true once `prune_inferred=False` carves
+  INFERRED relations out of that diff. Left unpatched, an INFERRED relation
+  sited in `path` whose target symbol is *also* defined in and removed from
+  `path` (a same-file self-referencing edge — plausible for
+  `lsp_enrichment.py`'s mixin/composition resolution) would be skipped by
+  **both**
+  mechanisms: excluded from the diff (INFERRED, `prune_inferred=False`) and
+  skipped by the sweep (`site_file == path`) — never tombstoned, silently
+  contradicting the "removal is unconditional" rule this bullet just stated.
+
+  Fix the sweep to check actual membership in the diff's own result instead
+  of approximating it by location — compute `removed_relation_keys` first
+  (as today, respecting the `prune_inferred` exclusion above), then:
+
+  ```python
+  for symbol_id in removed_symbol_ids:
+      for relation in relation_store.list_by_target(symbol_id):
+          if _relation_key(relation) in removed_relation_keys:
+              continue  # already deleted by the same-site diff above
+          relation_store.delete(...)
+          stale_cross_file_relations += 1
+  ```
+
+  This is behavior-identical to today's `site_file == path` check whenever
+  `prune_inferred=True` (provably: a relation with `site_file == path`
+  targeting a symbol just removed from `path` can never be reproduced by the
+  fresh extraction under the default full diff, so it is always already a
+  member of `removed_relation_keys` in that case — the two conditions
+  coincide). It only diverges — correctly — when `prune_inferred=False`
+  left an INFERRED same-site relation out of the diff, which is exactly the
+  gap this correction closes. **Governing contract for §6 items 3-4 (the
+  question OMP raised):** a relation targeting a genuinely-removed symbol
+  must always be tombstoned regardless of confidence AND regardless of
+  whether its site is
+  in `path` or elsewhere — that invariant governs, and the sweep is
+  corrected as above to actually satisfy it in every case, not just the
+  cross-file one it happened to cover before `prune_inferred` existed.
 - `IndexResult.relations_tombstoned` still reports however many rows were
   actually deleted (i.e., it naturally reports fewer when `prune_inferred`
   held some back — no separate counter needed).
@@ -223,13 +264,25 @@ family:
    — same setup, call `index_file(...)` with `prune_inferred` omitted
    (default `True`). Assert the relation IS removed — proves the default is
    unchanged from today's behavior (no regression for any existing caller).
-3. `test_prune_inferred_false_still_tombstones_a_relation_whose_target_symbol_was_removed`
-   — combine an INFERRED relation sited in `path` with a *symbol actually
-   deleted* from `path`'s new source (not just "not reproduced" — genuinely
-   gone). Assert it's still tombstoned even with `prune_inferred=False`,
-   proving §3's carve-out for symbol-removal-driven cross-file tombstoning is
-   untouched.
-4. `test_prune_inferred_false_still_removes_a_stale_extracted_relation`
+3. `test_prune_inferred_false_still_tombstones_a_cross_file_relation_whose_target_symbol_was_removed`
+   — an INFERRED relation sited in a *different* file (`caller.py`) targeting
+   a symbol defined in `path`; reindex `path` with that symbol genuinely
+   deleted from its new source. Assert the cross-file relation is still
+   tombstoned even with `prune_inferred=False` — this is the ordinary
+   `stale_cross_file_relations` sweep, `site_file != path`, unaffected by
+   this spec's change either before or after the §3 correction.
+4. `test_prune_inferred_false_still_tombstones_a_same_file_relation_whose_target_symbol_was_removed`
+   — the case that actually exercises §3's sweep correction: an INFERRED
+   relation sited **in `path` itself**, targeting a symbol **also defined in
+   and removed from `path`**'s new source (a same-file self-referencing
+   edge). Assert it is still tombstoned with `prune_inferred=False`. Without
+   §3's fix to the sweep (checking `removed_relation_keys` membership
+   instead of `site_file == path`), this relation is skipped by both the
+   diff (INFERRED, excluded) and the sweep (`site_file == path`, wrongly
+   assumed already handled) and survives — this test must fail on an
+   implementation that only adds the `prune_inferred` parameter without also
+   correcting the sweep.
+5. `test_prune_inferred_false_still_removes_a_stale_extracted_relation`
    — an EXTRACTED (not INFERRED) relation sited in `path` whose call site is
    actually deleted from the new source. Assert it's still removed even with
    `prune_inferred=False` — proves the parameter only carves out INFERRED,
@@ -237,20 +290,20 @@ family:
 
 ### `tests/daemon/test_watcher.py`
 
-5. `test_watch_job_with_prune_inferred_false_preserves_an_inferred_relation_on_reindex`
+6. `test_watch_job_with_prune_inferred_false_preserves_an_inferred_relation_on_reindex`
    — `make_reindex_job(repo_root, "mod.py", prune_inferred=False)`, same
    INFERRED-seeding approach as test 1, assert survival after the job runs
    against unchanged-but-newly-mtime'd content (the job's mtime/hash check
    must actually reach `index_file`, i.e. change mtime or omit prior
    `FileStateStore` state so the reindex isn't skipped by decision 1's cheap
    check).
-6. `test_watch_job_default_prune_inferred_still_tombstones_on_real_watcher_edits`
+7. `test_watch_job_default_prune_inferred_still_tombstones_on_real_watcher_edits`
    — `make_reindex_job(repo_root, "mod.py")` (no `prune_inferred` argument at
    all), same INFERRED seed, assert it IS removed — confirms the watcher's
    own real-edit call site is unaffected by this change (matches §3.1's "do
    not touch the watcher's own default" decision explicitly, not just by
    omission).
-7. `test_watch_job_delete_branch_tombstones_an_inferred_relation_regardless_of_prune_inferred`
+8. `test_watch_job_delete_branch_tombstones_an_inferred_relation_regardless_of_prune_inferred`
    — seed an INFERRED relation sited in `mod.py`, then run the *delete*
    branch (remove the file from disk, run the job). Assert the relation is
    gone — confirms §3.1's explicit exclusion of the delete branch from the
@@ -258,7 +311,7 @@ family:
 
 ### `tests/daemon/test_runtime.py`
 
-8. `test_ensure_fresh_position_lookup_does_not_tombstone_a_live_inferred_relation`
+9. `test_ensure_fresh_position_lookup_does_not_tombstone_a_live_inferred_relation`
    — end-to-end through `dispatch()`/`ensure_fresh` (mirror the existing
    `test_runtime_get_definition_by_position_sees_a_fresh_edit_with_no_wait_for_the_watchers_debounce`
    fixture setup): seed a repo where a file has one INFERRED relation sited
@@ -272,9 +325,9 @@ family:
    queried site). Assert the INFERRED relation is still present and
    undeleted immediately after the call returns. This is the direct
    regression test for the exact bug reproduced in memory `daa3157f`.
-9. `test_ensure_fresh_list_imports_does_not_tombstone_a_live_inferred_relation`
-   — same shape as test 8, but through `list_imports(file=...)`, since
-   `staleness.py` documents it as sharing tier 4's exact scope.
+10. `test_ensure_fresh_list_imports_does_not_tombstone_a_live_inferred_relation`
+    — same shape as test 9, but through `list_imports(file=...)`, since
+    `staleness.py` documents it as sharing tier 4's exact scope.
 
 Run the repo's actual test command (`uv run pytest`, or whatever
 `CONTRIBUTING`/CI uses — check before assuming) as the mandatory final step;
@@ -294,7 +347,7 @@ paste real failures, fix, re-run, never declare done on assumed correctness
 
 ## 8. Definition of done
 
-- All 9 new tests pass; full existing suite still passes with no regressions.
+- All 10 new tests pass; full existing suite still passes with no regressions.
 - `git diff` shows changes confined to: `src/acie/indexer.py`,
   `src/acie/daemon/watcher.py`, `src/acie/daemon/runtime.py`, and the three
   test files above. No incidental changes elsewhere.
