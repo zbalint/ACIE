@@ -63,6 +63,21 @@ def explain(
     cursor: str | None = None,
     full: bool = False,
 ) -> dict:
+    """Show the complete observation history for exactly one target.
+
+    Supply exactly one of ``symbol_id`` or ``edge_ref``. ``edge_ref`` must be
+    the full ``{source_symbol_id, target_symbol_id, predicate, site_file,
+    site_line, site_col}`` composite key. ``limit`` sets the page size,
+    ``cursor`` continues opaque keyset pagination, and ``full`` is accepted for
+    interface consistency but does not hide confidence or provenance. Results
+    are newest-first and always include the full observation history; this tool
+    never raises ``STALE_INDEX_GENERATION``. Raises ``INVALID_ARGUMENT`` when
+    neither or both selectors are supplied, ``SYMBOL_NOT_FOUND`` for an unknown
+    symbol target, ``EDGE_NOT_FOUND`` for an unknown edge target,
+    ``INVALID_CURSOR`` for a malformed or semantically invalid cursor, and
+    ``INVALID_LIMIT`` for a non-positive limit.
+    """
+
     if (symbol_id is None) == (edge_ref is None):
         raise InvalidArgumentError("explain requires exactly one of symbol_id or edge_ref")
 
