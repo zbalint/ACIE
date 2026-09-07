@@ -68,13 +68,16 @@ def structural_search(
     """Search source text with a live tree-sitter structural query.
 
     ``pattern`` is tree-sitter's own ``.scm`` query syntax, not an ast-grep
-    pattern; for example, ``(import_statement) @import``. ``files`` is a
-    caller-supplied ``{path: source_text}`` mapping because ACIE's IR stores no
-    source text to query. Optional ``path_glob`` limits searched paths, ``limit``
-    sets the page size, ``cursor`` continues opaque keyset pagination, and
-    ``full`` includes confidence and provenance. Raises ``INVALID_PATTERN`` when
-    the query fails to parse, ``INVALID_CURSOR`` for a malformed or semantically
-    invalid cursor, ``INVALID_LIMIT`` for a non-positive limit, and
+    pattern; for example, ``(import_statement) @import``. ``files`` is not a
+    parameter this tool accepts through the MCP interface. The daemon always
+    searches the live, ``.gitignore``-scoped Python source on disk at call time,
+    using the same file set as the repository index; modified-but-unsaved or
+    synthetic content cannot be searched through this interface. Optional
+    ``path_glob`` narrows the on-disk files walked, ``limit`` sets the page size,
+    ``cursor`` continues opaque keyset pagination, and ``full`` includes
+    confidence and provenance. Raises ``INVALID_PATTERN`` when the query fails
+    to parse, ``INVALID_CURSOR`` for a malformed or semantically invalid cursor,
+    ``INVALID_LIMIT`` for a non-positive limit, and
     ``STALE_INDEX_GENERATION`` when a cursor targets an old index generation.
     """
 

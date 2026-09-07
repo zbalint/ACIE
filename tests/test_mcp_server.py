@@ -41,6 +41,19 @@ def test_architecture_public_schema_excludes_the_dispatch_only_repo_root_seam():
     assert public_names == {"root", "granularity", "node_cap", "full"}
     assert "repo_root" not in public_names
 
+def test_structural_search_public_schema_and_docstring_describe_daemon_owned_files():
+    call = _daemon_tool(
+        "structural_search", structural_search, discovery_path="unused", repo_path="unused"
+    )
+
+    public_names = {parameter.name for parameter in call.__signature__.parameters.values()}
+
+    assert "files" not in public_names
+    assert call.__doc__ is not None
+    doc = " ".join(call.__doc__.split())
+    assert "not a parameter this tool accepts" in doc
+    assert "caller-supplied" not in doc
+
 def test_structural_search_daemon_wrapper_uses_extended_timeout(monkeypatch):
     timeouts = []
 
