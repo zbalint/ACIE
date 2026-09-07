@@ -74,46 +74,59 @@ def index_file(
 
     prior_symbol_ids = {s.id for s in symbol_store.list_by_path(path)}
     prior_relation_keys = {_relation_key(r) for r in relation_store.list_by_site_file(path)}
+    # Daemon write jobs pass one connection to all three stores. Preserve
+    # per-operation commits for callers that provide separate connections.
+    shared_connection = (
+        symbol_store._conn is relation_store._conn
+        and symbol_store._conn is index_meta_store._conn
+    )
 
-    for symbol in new_symbols:
-        symbol_store.upsert(symbol)
-    for relation in new_relations:
-        relation_store.upsert(relation)
+    try:
+        for symbol in new_symbols:
+            symbol_store.upsert(symbol, commit=not shared_connection)
+        for relation in new_relations:
+            relation_store.upsert(relation, commit=not shared_connection)
 
-    removed_symbol_ids = prior_symbol_ids - {s.id for s in new_symbols}
-    for symbol_id in removed_symbol_ids:
-        symbol_store.delete(symbol_id, observed_at=observed_at)
-
-    removed_relation_keys = prior_relation_keys - {_relation_key(r) for r in new_relations}
-    for source, target, predicate, site_file, site_line, site_col in removed_relation_keys:
-        relation_store.delete(
-            source=source, target=target, predicate=predicate,
-            site_file=site_file, site_line=site_line, site_col=site_col,
-            observed_at=observed_at,
-        )
-
-    # Cross-file edges (Slice C's calls resolution) mean a relation's site
-    # and target can now live in different files -- codex review finding:
-    # the same-site diff above only ever catches a stale relation SITED in
-    # `path`, so a symbol removed/renamed here (removed_symbol_ids) can
-    # leave a `calls` edge elsewhere still EXTRACTED and pointing at a
-    # tombstoned id, if that edge's own site_file was never touched. Every
-    # relation elsewhere in the repo targeting a symbol just removed here is
-    # invalidated too; `site_file == path` ones are skipped since the diff
-    # above already removed them (avoids double-tombstoning the same key).
-    stale_cross_file_relations = 0
-    for symbol_id in removed_symbol_ids:
-        for relation in relation_store.list_by_target(symbol_id):
-            if relation.site_file == path:
-                continue
-            relation_store.delete(
-                source=relation.source, target=relation.target, predicate=relation.predicate,
-                site_file=relation.site_file, site_line=relation.site_line, site_col=relation.site_col,
-                observed_at=observed_at,
+        removed_symbol_ids = prior_symbol_ids - {s.id for s in new_symbols}
+        for symbol_id in removed_symbol_ids:
+            symbol_store.delete(
+                symbol_id, observed_at=observed_at, commit=not shared_connection
             )
-            stale_cross_file_relations += 1
 
-    index_meta_store.bump_generation()
+        removed_relation_keys = prior_relation_keys - {_relation_key(r) for r in new_relations}
+        for source, target, predicate, site_file, site_line, site_col in removed_relation_keys:
+            relation_store.delete(
+                source=source, target=target, predicate=predicate,
+                site_file=site_file, site_line=site_line, site_col=site_col,
+                observed_at=observed_at, commit=not shared_connection,
+            )
+
+        # Cross-file edges (Slice C's calls resolution) mean a relation's site
+        # and target can now live in different files -- codex review finding:
+        # the same-site diff above only ever catches a stale relation SITED in
+        # `path`, so a symbol removed/renamed here (removed_symbol_ids) can
+        # leave a `calls` edge elsewhere still EXTRACTED and pointing at a
+        # tombstoned id, if that edge's own site_file was never touched. Every
+        # relation elsewhere in the repo targeting a symbol just removed here is
+        # invalidated too; `site_file == path` ones are skipped since the diff
+        # above already removed them (avoids double-tombstoning the same key).
+        stale_cross_file_relations = 0
+        for symbol_id in removed_symbol_ids:
+            for relation in relation_store.list_by_target(symbol_id):
+                if relation.site_file == path:
+                    continue
+                relation_store.delete(
+                    source=relation.source, target=relation.target, predicate=relation.predicate,
+                    site_file=relation.site_file, site_line=relation.site_line, site_col=relation.site_col,
+                    observed_at=observed_at, commit=not shared_connection,
+                )
+                stale_cross_file_relations += 1
+
+        index_meta_store.bump_generation()
+    except BaseException:  # noqa: BLE001 -- rollback before a reusable writer sees the failure.
+        if shared_connection:
+            symbol_store._conn.rollback()
+        raise
 
     return IndexResult(
         skipped=False,
