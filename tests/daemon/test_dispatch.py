@@ -251,6 +251,30 @@ def test_dispatch_request_fills_structural_search_files_from_real_disk(tmp_path)
     names = {r["captures"]["func.name"][0]["text"] for r in response["result"]["results"]}
     assert names == {"foo", "bar"}
 
+def test_dispatch_request_ignores_caller_files_and_searches_real_disk(tmp_path):
+    repo = _git_repo(tmp_path)
+    base_dir = tmp_path / "acie-home"
+    _index_one_file(repo, base_dir)
+
+    pkg_dir = repo / "pkg"
+    pkg_dir.mkdir(exist_ok=True)
+    (pkg_dir / "mod.py").write_text("def live_disk_function():\n    pass\n")
+
+    request = build_request(
+        "structural_search",
+        str(repo),
+        {
+            "pattern": "(function_definition name: (identifier) @func.name)",
+            "files": {"pkg/mod.py": "def fabricated_caller_function():\n    pass\n"},
+        },
+    )
+
+    response = dispatch_request(request, repo_ready=_ALL_ALWAYS_READY, base_dir=str(base_dir))
+
+    assert response["ok"] is True
+    names = {r["captures"]["func.name"][0]["text"] for r in response["result"]["results"]}
+    assert names == {"live_disk_function"}
+
 
 def test_dispatch_request_honors_structural_search_path_glob_by_only_reading_matching_files(tmp_path):
     repo = _git_repo(tmp_path)
