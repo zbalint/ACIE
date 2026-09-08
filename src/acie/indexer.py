@@ -38,7 +38,16 @@ def index_file(
     symbol_store: SymbolStore,
     relation_store: RelationStore,
     index_meta_store: IndexMetaStore,
+    *,
+    prune_inferred: bool = True,
 ) -> IndexResult:
+    """Index one source file and reconcile its extracted state.
+
+    When ``prune_inferred`` is false, preserve site-local INFERRED relations
+    that tree-sitter cannot disprove; relations targeting symbols genuinely
+    removed from this path are still tombstoned regardless of confidence or
+    site location.
+    """
     if has_syntax_error(source_text):
         return IndexResult(
             skipped=True,
@@ -73,7 +82,11 @@ def index_file(
     new_relations = new_relations + _resolve_deferred_self_calls(deferred_self_calls, symbol_store)
 
     prior_symbol_ids = {s.id for s in symbol_store.list_by_path(path)}
-    prior_relation_keys = {_relation_key(r) for r in relation_store.list_by_site_file(path)}
+    prior_relation_keys = {
+        _relation_key(r)
+        for r in relation_store.list_by_site_file(path)
+        if prune_inferred or r.confidence != Confidence.INFERRED
+    }
     # Daemon write jobs pass one connection to all three stores. Preserve
     # per-operation commits for callers that provide separate connections.
     shared_connection = (
@@ -102,19 +115,16 @@ def index_file(
             )
 
         # Cross-file edges (Slice C's calls resolution) mean a relation's site
-        # and target can now live in different files -- codex review finding:
-        # the same-site diff above only ever catches a stale relation SITED in
-        # `path`, so a symbol removed/renamed here (removed_symbol_ids) can
-        # leave a `calls` edge elsewhere still EXTRACTED and pointing at a
-        # tombstoned id, if that edge's own site_file was never touched. Every
-        # relation elsewhere in the repo targeting a symbol just removed here is
-        # invalidated too; `site_file == path` ones are skipped since the diff
-        # above already removed them (avoids double-tombstoning the same key).
+        # and target can now live in different files. Any relation targeting a
+        # symbol removed here is invalidated unless the same-site diff already
+        # removed that exact relation key. Checking the diff result instead of
+        # the relation's location remains correct when INFERRED rows are
+        # excluded from that diff by prune_inferred=False.
         stale_cross_file_relations = 0
         for symbol_id in removed_symbol_ids:
             for relation in relation_store.list_by_target(symbol_id):
-                if relation.site_file == path:
-                    continue
+                if _relation_key(relation) in removed_relation_keys:
+                    continue  # already deleted by the same-site diff above.
                 relation_store.delete(
                     source=relation.source, target=relation.target, predicate=relation.predicate,
                     site_file=relation.site_file, site_line=relation.site_line, site_col=relation.site_col,

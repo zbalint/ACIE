@@ -8,11 +8,15 @@ import time
 from acie.daemon import ignore
 from acie.daemon import watcher as watcher_module
 from acie.daemon.watcher import RepoWatcher, WatcherRegistry, _DebouncedEventHandler, make_reindex_job
+from acie.indexer import index_file
+from acie.ir.relation import Relation
+from acie.ir.symbol import Confidence, Provenance
 from acie.daemon.write_queue import WriteQueue
 from acie.repo_id import resolve_repo_id, resolve_worktree_id
 from acie.storage.file_state_store import FileStateStore
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.symbol_store import SymbolStore
+from acie.storage.relation_store import RelationStore
 
 _SHORT_DEBOUNCE = 0.05
 _WAIT_PAST_DEBOUNCE = 0.3
@@ -106,6 +110,48 @@ def _fresh_conn():
     return sqlite3.connect(":memory:")
 
 
+def _seed_indexed_mod_with_inferred_relation(repo_root, conn):
+    source = "def caller():\n    pass\n"
+    _write(repo_root, "mod.py", source)
+    index_file(
+        path="mod.py",
+        source_text=source,
+        observed_at="2026-09-08T00:00:00Z",
+        symbol_store=SymbolStore(conn=conn),
+        relation_store=RelationStore(conn=conn),
+        index_meta_store=IndexMetaStore(conn=conn),
+    )
+    relation = Relation(
+        source="mod.py:#module",
+        target="other.py:target#function",
+        predicate="calls",
+        site_file="mod.py",
+        site_line=2,
+        site_col=4,
+        confidence=Confidence.INFERRED,
+        provenance=Provenance(
+            provider="basedpyright",
+            version="1.0",
+            observed_at="2026-09-08T00:00:00Z",
+        ),
+    )
+    RelationStore(conn=conn).upsert(relation)
+    return relation
+
+
+def _relation_kwargs(relation):
+    return {
+        "source": relation.source,
+        "target": relation.target,
+        "predicate": relation.predicate,
+        "site_file": relation.site_file,
+        "site_line": relation.site_line,
+        "site_col": relation.site_col,
+    }
+
+
+
+
 def test_watch_job_for_a_new_file_indexes_it_and_records_its_state(tmp_path):
     repo_root = str(tmp_path)
     _write(repo_root, "mod.py", "def foo():\n    pass\n")
@@ -171,6 +217,43 @@ def test_watch_job_reindexes_when_content_actually_changes(tmp_path):
     job(conn)
 
     assert [s.qualname for s in SymbolStore(conn=conn).list_by_path("mod.py")] == ["", "bar"]
+
+
+def test_watch_job_with_prune_inferred_false_preserves_an_inferred_relation_on_reindex(tmp_path):
+    repo_root = str(tmp_path)
+    conn = _fresh_conn()
+    relation = _seed_indexed_mod_with_inferred_relation(repo_root, conn)
+
+    make_reindex_job(repo_root, "mod.py", prune_inferred=False)(conn)
+
+    relation_store = RelationStore(conn=conn)
+    assert relation_store.get(**_relation_kwargs(relation)) == relation
+    assert not relation_store.is_tombstoned(**_relation_kwargs(relation))
+
+
+def test_watch_job_default_prune_inferred_still_tombstones_on_real_watcher_edits(tmp_path):
+    repo_root = str(tmp_path)
+    conn = _fresh_conn()
+    relation = _seed_indexed_mod_with_inferred_relation(repo_root, conn)
+
+    make_reindex_job(repo_root, "mod.py")(conn)
+
+    relation_store = RelationStore(conn=conn)
+    assert relation_store.get(**_relation_kwargs(relation)) is None
+    assert relation_store.is_tombstoned(**_relation_kwargs(relation))
+
+
+def test_watch_job_delete_branch_tombstones_an_inferred_relation_regardless_of_prune_inferred(tmp_path):
+    repo_root = str(tmp_path)
+    conn = _fresh_conn()
+    relation = _seed_indexed_mod_with_inferred_relation(repo_root, conn)
+    os.remove(os.path.join(repo_root, "mod.py"))
+
+    make_reindex_job(repo_root, "mod.py", prune_inferred=False)(conn)
+
+    relation_store = RelationStore(conn=conn)
+    assert relation_store.get(**_relation_kwargs(relation)) is None
+    assert relation_store.is_tombstoned(**_relation_kwargs(relation))
 
 
 def test_watch_job_for_a_deleted_file_tombstones_its_prior_symbols(tmp_path):
