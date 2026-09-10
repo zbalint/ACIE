@@ -8,12 +8,15 @@ import pytest
 
 from acie.daemon import runtime
 from acie.daemon.protocol import build_request
+from acie.ir.relation import Relation
+from acie.ir.symbol import Confidence, Provenance
 from acie.daemon import repo_fingerprint
 from acie.daemon.repo_fingerprint import compute_repo_fingerprint
 from acie.daemon.runtime import create_daemon, ensure_fresh
 from acie.daemon.write_queue import WriteQueue
-from acie.repo_id import resolve_repo_id, resolve_worktree_id
+from acie.repo_id import resolve_index_db_path, resolve_repo_id, resolve_worktree_id
 from acie.storage.index_meta_store import IndexMetaStore
+from acie.storage.relation_store import RelationStore
 from tests.daemon.rpc import send_request
 
 
@@ -26,6 +29,42 @@ def _wait_until(predicate, timeout=2.0):
     return predicate()
 
 _DEBOUNCE_WAIT = 1.0
+
+
+def _seed_runtime_inferred_relation(repo_root, state_dir, *, site_line):
+    db_path = resolve_index_db_path(str(repo_root), base_dir=str(state_dir))
+    assert db_path is not None
+    relation = Relation(
+        source="module.py:#module",
+        target="other.py:target#function",
+        predicate="calls",
+        site_file="module.py",
+        site_line=site_line,
+        site_col=4,
+        confidence=Confidence.INFERRED,
+        provenance=Provenance(
+            provider="basedpyright",
+            version="1.0",
+            observed_at="2026-09-08T00:00:00Z",
+        ),
+    )
+    relation_store = RelationStore(db_path)
+    relation_store.upsert(relation)
+    return relation_store, relation
+
+
+def _wait_for_runtime_repo(server, repo):
+    request = build_request("find_symbol", str(repo), {"name": "caller"})
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        response = send_request(server.port, request)
+        if response["ok"] and response["result"]["results"]:
+            return response
+        assert response["error"]["code"] == "INDEX_NOT_READY"
+        time.sleep(0.01)
+    raise AssertionError("repo did not finish bootstrap indexing")
+
+
 
 
 def test_runtime_bootstraps_a_real_repo_then_dispatches_its_indexed_tool_request(tmp_path):
@@ -326,6 +365,92 @@ def test_runtime_get_definition_by_position_sees_a_fresh_edit_with_no_wait_for_t
         )
         assert response["ok"] is True
         assert [r["id"] for r in response["result"]["results"]] == ["module.py:target#function"]
+    finally:
+        server.shutdown()
+
+
+def test_ensure_fresh_position_lookup_does_not_tombstone_a_live_inferred_relation(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "module.py").write_text("def caller():\n    pass\n", encoding="utf-8")
+    state_dir = tmp_path / "state"
+
+    server = create_daemon(state_dir=str(state_dir), port=0)
+    server.start()
+    try:
+        _wait_for_runtime_repo(server, repo)
+        relation_store, relation = _seed_runtime_inferred_relation(repo, state_dir, site_line=2)
+
+        response = send_request(
+            server.port,
+            build_request(
+                "get_definition",
+                str(repo),
+                {"position": {"file": "module.py", "line": 1, "column": 0}},
+            ),
+        )
+
+        assert response["ok"] is True
+        assert relation_store.get(
+            source=relation.source,
+            target=relation.target,
+            predicate=relation.predicate,
+            site_file=relation.site_file,
+            site_line=relation.site_line,
+            site_col=relation.site_col,
+        ) == relation
+        assert not relation_store.is_tombstoned(
+            source=relation.source,
+            target=relation.target,
+            predicate=relation.predicate,
+            site_file=relation.site_file,
+            site_line=relation.site_line,
+            site_col=relation.site_col,
+        )
+    finally:
+        server.shutdown()
+
+
+def test_ensure_fresh_list_imports_does_not_tombstone_a_live_inferred_relation(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "module.py").write_text(
+        "import os\n\n\ndef caller():\n    pass\n",
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "state"
+
+    server = create_daemon(state_dir=str(state_dir), port=0)
+    server.start()
+    try:
+        _wait_for_runtime_repo(server, repo)
+        relation_store, relation = _seed_runtime_inferred_relation(repo, state_dir, site_line=5)
+
+        response = send_request(
+            server.port,
+            build_request("list_imports", str(repo), {"file": "module.py"}),
+        )
+
+        assert response["ok"] is True
+        assert len(response["result"]["results"]) == 1
+        assert relation_store.get(
+            source=relation.source,
+            target=relation.target,
+            predicate=relation.predicate,
+            site_file=relation.site_file,
+            site_line=relation.site_line,
+            site_col=relation.site_col,
+        ) == relation
+        assert not relation_store.is_tombstoned(
+            source=relation.source,
+            target=relation.target,
+            predicate=relation.predicate,
+            site_file=relation.site_file,
+            site_line=relation.site_line,
+            site_col=relation.site_col,
+        )
     finally:
         server.shutdown()
 

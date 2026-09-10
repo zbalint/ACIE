@@ -61,7 +61,9 @@ def ensure_fresh(
     rel_path = extract_staleness_target(method, params if isinstance(params, dict) else None, repo_root)
     if rel_path is None:
         return
-    future = write_queue.submit(repo_id, make_reindex_job(repo_root, rel_path))
+    future = write_queue.submit(
+        repo_id, make_reindex_job(repo_root, rel_path, prune_inferred=False),
+    )
     try:
         future.result(timeout=timeout)
     except Exception:  # noqa: BLE001 -- best-effort, see docstring above (covers Future's own TimeoutError too).

@@ -2,11 +2,49 @@ import subprocess
 
 from acie.adapters.python.extract_relations import extract_relations_with_deferred_edges
 from acie.indexer import index_file, unresolved_deferred_sites
-from acie.ir.symbol import Confidence
+from acie.ir.relation import Relation
+from acie.ir.symbol import Confidence, Provenance
 from acie.repo_id import resolve_index_db_path
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
+
+
+def _inferred_relation(
+    *,
+    source="pkg/mod.py:#module",
+    target="pkg/target.py:target#function",
+    site_file="pkg/mod.py",
+    site_line=2,
+    site_col=4,
+):
+    return Relation(
+        source=source,
+        target=target,
+        predicate="calls",
+        site_file=site_file,
+        site_line=site_line,
+        site_col=site_col,
+        confidence=Confidence.INFERRED,
+        provenance=Provenance(
+            provider="basedpyright",
+            version="1.0",
+            observed_at="2026-09-08T00:00:00Z",
+        ),
+    )
+
+
+def _relation_kwargs(relation):
+    return {
+        "source": relation.source,
+        "target": relation.target,
+        "predicate": relation.predicate,
+        "site_file": relation.site_file,
+        "site_line": relation.site_line,
+        "site_col": relation.site_col,
+    }
+
+
 
 
 def test_indexing_a_new_file_upserts_its_symbols_and_relations():
@@ -98,6 +136,203 @@ def test_removing_a_symbol_from_source_tombstones_it_and_its_relations():
     assert relation_store.is_tombstoned(**defines_key)
     assert symbol_store.get(module_id) is not None
 
+
+
+def test_prune_inferred_false_preserves_an_inferred_relation_the_fresh_extraction_cannot_reproduce():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    source = "def caller():\n    pass\n"
+
+    index_file(
+        path="pkg/mod.py",
+        source_text=source,
+        observed_at="2026-09-08T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    relation = _inferred_relation()
+    relation_store.upsert(relation)
+
+    result = index_file(
+        path="pkg/mod.py",
+        source_text=source,
+        observed_at="2026-09-08T00:01:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+        prune_inferred=False,
+    )
+
+    assert result.relations_tombstoned == 0
+    assert relation_store.get(**_relation_kwargs(relation)) == relation
+    assert not relation_store.is_tombstoned(**_relation_kwargs(relation))
+
+
+def test_prune_inferred_true_still_removes_a_stale_inferred_relation_by_default():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    source = "def caller():\n    pass\n"
+
+    index_file(
+        path="pkg/mod.py",
+        source_text=source,
+        observed_at="2026-09-08T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    relation = _inferred_relation()
+    relation_store.upsert(relation)
+
+    result = index_file(
+        path="pkg/mod.py",
+        source_text=source,
+        observed_at="2026-09-08T00:01:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+
+    assert result.relations_tombstoned == 1
+    assert relation_store.get(**_relation_kwargs(relation)) is None
+    assert relation_store.is_tombstoned(**_relation_kwargs(relation))
+
+
+def test_prune_inferred_false_still_tombstones_a_cross_file_relation_whose_target_symbol_was_removed():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    target_source = "def target():\n    pass\n"
+    caller_source = "def caller():\n    pass\n"
+    target_id = "pkg/target.py:target#function"
+
+    index_file(
+        path="pkg/target.py",
+        source_text=target_source,
+        observed_at="2026-09-08T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    index_file(
+        path="pkg/caller.py",
+        source_text=caller_source,
+        observed_at="2026-09-08T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    relation = _inferred_relation(
+        source="pkg/caller.py:#module",
+        target=target_id,
+        site_file="pkg/caller.py",
+    )
+    relation_store.upsert(relation)
+
+    result = index_file(
+        path="pkg/target.py",
+        source_text="",
+        observed_at="2026-09-08T00:01:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+        prune_inferred=False,
+    )
+
+    assert result.relations_tombstoned >= 1
+    assert relation_store.get(**_relation_kwargs(relation)) is None
+    assert relation_store.is_tombstoned(**_relation_kwargs(relation))
+
+
+def test_prune_inferred_false_still_tombstones_a_same_file_relation_whose_target_symbol_was_removed():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    source_with_target = (
+        "def target():\n"
+        "    pass\n\n"
+        "def caller():\n"
+        "    pass\n"
+    )
+    source_without_target = "def caller():\n    pass\n"
+
+    index_file(
+        path="pkg/mod.py",
+        source_text=source_with_target,
+        observed_at="2026-09-08T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    relation = _inferred_relation(
+        source="pkg/mod.py:caller#function",
+        target="pkg/mod.py:target#function",
+        site_file="pkg/mod.py",
+        site_line=5,
+    )
+    relation_store.upsert(relation)
+
+    result = index_file(
+        path="pkg/mod.py",
+        source_text=source_without_target,
+        observed_at="2026-09-08T00:01:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+        prune_inferred=False,
+    )
+
+    assert result.relations_tombstoned >= 2
+    assert relation_store.get(**_relation_kwargs(relation)) is None
+    assert relation_store.is_tombstoned(**_relation_kwargs(relation))
+
+
+def test_prune_inferred_false_still_removes_a_stale_extracted_relation():
+    symbol_store = SymbolStore(":memory:")
+    relation_store = RelationStore(":memory:")
+    index_meta_store = IndexMetaStore(":memory:")
+    source_with_call = (
+        "def callee():\n"
+        "    pass\n\n"
+        "def caller():\n"
+        "    callee()\n"
+    )
+    source_without_call = (
+        "def callee():\n"
+        "    pass\n\n"
+        "def caller():\n"
+        "    pass\n"
+    )
+
+    index_file(
+        path="pkg/mod.py",
+        source_text=source_with_call,
+        observed_at="2026-09-08T00:00:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+    )
+    calls = relation_store.list_by_site_file("pkg/mod.py", predicates={"calls"})
+    assert len(calls) == 1
+    relation = calls[0]
+    assert relation.confidence == Confidence.EXTRACTED
+
+    result = index_file(
+        path="pkg/mod.py",
+        source_text=source_without_call,
+        observed_at="2026-09-08T00:01:00Z",
+        symbol_store=symbol_store,
+        relation_store=relation_store,
+        index_meta_store=index_meta_store,
+        prune_inferred=False,
+    )
+
+    assert result.relations_tombstoned == 1
+    assert relation_store.get(**_relation_kwargs(relation)) is None
+    assert relation_store.is_tombstoned(**_relation_kwargs(relation))
 
 def test_reindexing_malformed_source_skips_and_preserves_prior_state():
     symbol_store = SymbolStore(":memory:")

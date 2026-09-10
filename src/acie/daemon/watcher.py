@@ -59,7 +59,9 @@ _GITIGNORE_FILENAME = ".gitignore"
 _DEBOUNCE_SECONDS = 0.5
 
 
-def make_reindex_job(repo_root: str, rel_path: str) -> Callable[[sqlite3.Connection], None]:
+def make_reindex_job(
+    repo_root: str, rel_path: str, *, prune_inferred: bool = True,
+) -> Callable[[sqlite3.Connection], None]:
     """One write-queue job for one touched repo-relative path.
 
     Same job for a create, an edit, a delete, or either half of a rename --
@@ -137,7 +139,7 @@ def make_reindex_job(repo_root: str, rel_path: str) -> Callable[[sqlite3.Connect
         index_file(
             path=rel_path, source_text=source_text, observed_at=observed_at,
             symbol_store=SymbolStore(conn=conn), relation_store=RelationStore(conn=conn),
-            index_meta_store=IndexMetaStore(conn=conn),
+            index_meta_store=IndexMetaStore(conn=conn), prune_inferred=prune_inferred,
         )
         file_state_store.set(rel_path, mtime_ns=mtime_ns, content_hash=content_hash)
 
