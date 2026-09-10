@@ -258,8 +258,11 @@ predicted this tool would need to decide).
     immediately without iterating edges when it is not configured.
 """
 
+import os
+
 from acie.layer_config import LayerConfig, classify_layers, is_dependency_allowed, load_layer_config
 from acie.module_paths import path_to_dotted
+from acie.repo_id import to_repo_relative
 from acie.storage.index_meta_store import IndexMetaStore
 from acie.storage.relation_store import RelationStore
 from acie.storage.symbol_store import SymbolStore
@@ -333,6 +336,16 @@ def architecture(
     # affected_tests.py (LIVE_MCP_QUALIFICATION_REPORT.md, 2026-09-01).
     if node_cap <= 0:
         raise InvalidArgumentError(f"node_cap must be a positive integer, got {node_cap!r}")
+    if root is not None and os.path.isabs(root):
+        if repo_root is None:
+            raise InvalidArgumentError(
+                "root must be repo-relative: an absolute path was given but no "
+                "repo_root is available to resolve it against"
+            )
+        relative_root = to_repo_relative(root, repo_root)
+        if relative_root is None:
+            raise InvalidArgumentError(f"root {root!r} is outside repo_root {repo_root!r}")
+        root = None if relative_root == "." else relative_root
 
     index_generation = index_meta_store.current_generation()
     dotted_name_index = build_dotted_name_index(symbol_store)
